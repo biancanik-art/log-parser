@@ -238,8 +238,19 @@ mod tests {
         let library = load_builtin_library().unwrap();
 
         assert_eq!(library.library_ids, vec!["mitre_core_v1"]);
-        assert_eq!(library.technique_count(), 42);
-        assert_eq!(library.keyword_count(), 80);
+        // Sanity floors, not exact counts - the built-in library is expected to keep growing as
+        // more MITRE ATT&CK coverage gets added. This just guards against a genuinely broken/
+        // near-empty load, not against legitimate expansion.
+        assert!(
+            library.technique_count() >= 60,
+            "expected at least 60 techniques, got {}",
+            library.technique_count()
+        );
+        assert!(
+            library.keyword_count() >= 300,
+            "expected at least 300 keywords, got {}",
+            library.keyword_count()
+        );
         assert!(!library.library_hash.is_empty());
         assert!(library.custom_library_error.is_none());
     }
