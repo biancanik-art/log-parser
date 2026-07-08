@@ -7,6 +7,8 @@ keyword scanning, a guided natural-language search box, and multi-sheet
 report export. **No network calls, ever** — your data never leaves your
 machine.
 
+See the [wiki](../../wiki) for a full user guide.
+
 ## Features
 
 - Import large Excel (`.xlsx`/`.xls`) or CSV exports from tools like
