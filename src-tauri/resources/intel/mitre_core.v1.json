@@ -130,6 +130,106 @@
             "text_evidence"
           ],
           "score": 80
+        },
+        {
+          "id": "t1059_001_powershell_encodedcommand",
+          "pattern": "powershell -encodedcommand",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 85
+        },
+        {
+          "id": "t1059_001_pwsh_encodedcommand",
+          "pattern": "pwsh -encodedcommand",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 85
+        },
+        {
+          "id": "t1059_001_pwsh_enc",
+          "pattern": "pwsh -enc",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 85
+        },
+        {
+          "id": "t1059_001_iex_new_object",
+          "pattern": "iex (new-object",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 80
+        },
+        {
+          "id": "t1059_001_invoke_expression",
+          "pattern": "invoke-expression",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 75
+        },
+        {
+          "id": "t1059_001_downloadstring",
+          "pattern": "downloadstring(",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 75
+        },
+        {
+          "id": "t1059_001_downloadfile",
+          "pattern": "downloadfile(",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 70
+        },
+        {
+          "id": "t1059_001_invoke_webrequest",
+          "pattern": "invoke-webrequest",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 60
+        },
+        {
+          "id": "t1059_001_reflection_assembly",
+          "pattern": "reflection.assembly",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 75
+        },
+        {
+          "id": "t1059_001_add_type",
+          "pattern": "add-type",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 50
         }
       ]
     },
@@ -236,6 +336,48 @@
             "text_evidence"
           ],
           "score": 80
+        },
+        {
+          "id": "t1047_wmic_exe_node",
+          "pattern": "wmic.exe /node:",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 80
+        },
+        {
+          "id": "t1047_invoke_wmimethod_computername",
+          "pattern": "invoke-wmimethod -computername",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 80
+        },
+        {
+          "id": "t1047_invoke_cimmethod_computername",
+          "pattern": "invoke-cimmethod -computername",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 75
+        },
+        {
+          "id": "t1047_wmiexec_py",
+          "pattern": "wmiexec.py",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "process_name",
+            "file_name",
+            "text_evidence"
+          ],
+          "score": 90
         }
       ]
     },
@@ -292,6 +434,39 @@
             "text_evidence"
           ],
           "score": 80
+        },
+        {
+          "id": "t1218_005_mshta_javascript",
+          "pattern": "mshta javascript:",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "process_name",
+            "text_evidence"
+          ],
+          "score": 85
+        },
+        {
+          "id": "t1218_005_mshta_vbscript",
+          "pattern": "mshta vbscript:",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "process_name",
+            "text_evidence"
+          ],
+          "score": 85
+        },
+        {
+          "id": "t1218_005_mshta_exe_javascript",
+          "pattern": "mshta.exe javascript:",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "process_name",
+            "text_evidence"
+          ],
+          "score": 85
         }
       ]
     },
@@ -320,6 +495,39 @@
             "text_evidence"
           ],
           "score": 90
+        },
+        {
+          "id": "t1218_010_regsvr32_i_http",
+          "pattern": "regsvr32 /s /n /u /i:http",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "process_name",
+            "text_evidence"
+          ],
+          "score": 90
+        },
+        {
+          "id": "t1218_010_regsvr32_scrobj",
+          "pattern": "scrobj.dll",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "process_name",
+            "text_evidence"
+          ],
+          "score": 85
+        },
+        {
+          "id": "t1218_010_regsvr32_scriptlet",
+          "pattern": ".sct",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "file_name",
+            "text_evidence"
+          ],
+          "score": 55
         }
       ]
     },
@@ -348,6 +556,17 @@
             "text_evidence"
           ],
           "score": 90
+        },
+        {
+          "id": "t1218_011_rundll32_advpack",
+          "pattern": "rundll32.exe advpack.dll,launchinfsection",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "process_name",
+            "text_evidence"
+          ],
+          "score": 75
         }
       ]
     },
@@ -393,6 +612,38 @@
             "text_evidence"
           ],
           "score": 70
+        },
+        {
+          "id": "t1053_005_schtasks_exe_create",
+          "pattern": "schtasks.exe /create",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "process_name",
+            "text_evidence"
+          ],
+          "score": 70
+        },
+        {
+          "id": "t1053_005_new_scheduledtaskaction",
+          "pattern": "new-scheduledtaskaction",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 65
+        },
+        {
+          "id": "t1053_005_at_exe",
+          "pattern": "at.exe",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "process_name",
+            "text_evidence"
+          ],
+          "score": 55
         }
       ]
     },
@@ -434,6 +685,47 @@
             "text_evidence"
           ],
           "score": 75
+        },
+        {
+          "id": "t1547_001_hkcu_runonce_key",
+          "pattern": "reg add hkcu\\software\\microsoft\\windows\\currentversion\\runonce",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 75
+        },
+        {
+          "id": "t1547_001_hklm_runonce_key",
+          "pattern": "reg add hklm\\software\\microsoft\\windows\\currentversion\\runonce",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 75
+        },
+        {
+          "id": "t1547_001_appdata_startup_folder",
+          "pattern": "%appdata%\\microsoft\\windows\\start menu\\programs\\startup",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "file_name",
+            "text_evidence"
+          ],
+          "score": 65
+        },
+        {
+          "id": "t1547_001_shell_startup",
+          "pattern": "shell:startup",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 55
         }
       ]
     },
@@ -469,6 +761,36 @@
         {
           "id": "t1543_003_new_service",
           "pattern": "new-service -name",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 70
+        },
+        {
+          "id": "t1543_003_sc_create_no_exe",
+          "pattern": "sc create",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 65
+        },
+        {
+          "id": "t1543_003_new_service_binarypathname",
+          "pattern": "new-service -binarypathname",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 70
+        },
+        {
+          "id": "t1543_003_wmic_service_create",
+          "pattern": "wmic service call create",
           "match": "substring",
           "columns": [
             "command_line",
@@ -645,6 +967,26 @@
             "text_evidence"
           ],
           "score": 85
+        },
+        {
+          "id": "t1070_001_wevtutil_clear_log",
+          "pattern": "wevtutil clear-log",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 85
+        },
+        {
+          "id": "t1070_001_remove_eventlog",
+          "pattern": "remove-eventlog",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 75
         }
       ]
     },
@@ -660,7 +1002,8 @@
       "aliases": [
         "disable defender",
         "impair defenses",
-        "antivirus exclusion"
+        "antivirus exclusion",
+        "amsi bypass"
       ],
       "keywords": [
         {
@@ -686,6 +1029,87 @@
         {
           "id": "t1562_001_stop_windefend",
           "pattern": "sc stop windefend",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 80
+        },
+        {
+          "id": "t1562_001_amsiscanbuffer",
+          "pattern": "amsiscanbuffer",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 80
+        },
+        {
+          "id": "t1562_001_amsi_dll",
+          "pattern": "amsi.dll",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "file_name",
+            "text_evidence"
+          ],
+          "score": 70
+        },
+        {
+          "id": "t1562_001_amsiutils",
+          "pattern": "amsiutils",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 80
+        },
+        {
+          "id": "t1562_001_amsiinitfailed",
+          "pattern": "amsiinitfailed",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 85
+        },
+        {
+          "id": "t1562_001_set_mppreference_disable",
+          "pattern": "set-mppreference -disablerealtimemonitoring",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 85
+        },
+        {
+          "id": "t1562_001_disable_realtime_monitoring",
+          "pattern": "disablerealtimemonitoring",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 75
+        },
+        {
+          "id": "t1562_001_add_mppreference_exclusionprocess",
+          "pattern": "add-mppreference -exclusionprocess",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 80
+        },
+        {
+          "id": "t1562_001_add_mppreference_exclusionextension",
+          "pattern": "add-mppreference -exclusionextension",
           "match": "substring",
           "columns": [
             "command_line",
@@ -729,6 +1153,36 @@
             "text_evidence"
           ],
           "score": 75
+        },
+        {
+          "id": "t1027_encodedcommand_flag",
+          "pattern": "-encodedcommand",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 80
+        },
+        {
+          "id": "t1027_enc_flag",
+          "pattern": "-enc",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 65
+        },
+        {
+          "id": "t1027_base64_decode",
+          "pattern": "base64 -d",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 60
         }
       ]
     },
@@ -743,6 +1197,8 @@
       ],
       "aliases": [
         "credential dumping",
+        "credentials dumping",
+        "dump credentials",
         "lsass dumping",
         "mimikatz"
       ],
@@ -789,6 +1245,60 @@
             "text_evidence"
           ],
           "score": 90
+        },
+        {
+          "id": "t1003_001_sekurlsa_module",
+          "pattern": "sekurlsa::",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 90
+        },
+        {
+          "id": "t1003_001_procdump64_lsass",
+          "pattern": "procdump64.exe -ma lsass",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "process_name",
+            "text_evidence"
+          ],
+          "score": 90
+        },
+        {
+          "id": "t1003_001_comsvcs_minidump_nospace",
+          "pattern": "comsvcs.dll,minidump",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 90
+        },
+        {
+          "id": "t1003_001_rundll32_comsvcs_minidump",
+          "pattern": "rundll32.exe comsvcs.dll",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "process_name",
+            "text_evidence"
+          ],
+          "score": 90
+        },
+        {
+          "id": "t1003_001_nanodump",
+          "pattern": "nanodump.exe",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "process_name",
+            "file_name",
+            "text_evidence"
+          ],
+          "score": 90
         }
       ]
     },
@@ -804,7 +1314,8 @@
       "aliases": [
         "ntds dump",
         "ntdsutil",
-        "domain credential dumping"
+        "domain credential dumping",
+        "domain credentials dumping"
       ],
       "keywords": [
         {
@@ -816,6 +1327,40 @@
             "text_evidence"
           ],
           "score": 85
+        },
+        {
+          "id": "t1003_003_ntds_dit",
+          "pattern": "ntds.dit",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "file_name",
+            "text_evidence"
+          ],
+          "score": 85
+        },
+        {
+          "id": "t1003_003_ntdsutil_exe",
+          "pattern": "ntdsutil.exe",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "process_name",
+            "file_name",
+            "text_evidence"
+          ],
+          "score": 75
+        },
+        {
+          "id": "t1003_003_esentutl_copy",
+          "pattern": "esentutl.exe /y",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "process_name",
+            "text_evidence"
+          ],
+          "score": 75
         }
       ]
     },
@@ -831,7 +1376,8 @@
       "aliases": [
         "dcsync",
         "secretsdump",
-        "replication credential dumping"
+        "replication credential dumping",
+        "replication credentials dumping"
       ],
       "keywords": [
         {
@@ -870,6 +1416,8 @@
       "aliases": [
         "password store",
         "browser credential theft",
+        "browser credentials theft",
+        "stored credentials",
         "lazagne"
       ],
       "keywords": [
@@ -911,6 +1459,69 @@
             "text_evidence"
           ],
           "score": 55
+        },
+        {
+          "id": "t1033_whoami_priv",
+          "pattern": "whoami /priv",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 55
+        },
+        {
+          "id": "t1033_whoami_groups",
+          "pattern": "whoami /groups",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 50
+        },
+        {
+          "id": "t1033_whoami_word",
+          "pattern": "whoami",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "process_name",
+            "text_evidence"
+          ],
+          "score": 45
+        },
+        {
+          "id": "t1033_quser",
+          "pattern": "quser",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "process_name",
+            "text_evidence"
+          ],
+          "score": 45
+        },
+        {
+          "id": "t1033_qwinsta",
+          "pattern": "qwinsta",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "process_name",
+            "text_evidence"
+          ],
+          "score": 45
+        },
+        {
+          "id": "t1033_query_user",
+          "pattern": "query user",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 45
         }
       ]
     },
@@ -926,7 +1537,9 @@
       "aliases": [
         "account discovery",
         "domain account discovery",
-        "domain admins discovery"
+        "domain admins discovery",
+        "ldap user enumeration",
+        "active directory user discovery"
       ],
       "keywords": [
         {
@@ -948,6 +1561,100 @@
             "text_evidence"
           ],
           "score": 65
+        },
+        {
+          "id": "t1087_002_net_exe_user_domain",
+          "pattern": "net.exe user /domain",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "process_name",
+            "text_evidence"
+          ],
+          "score": 60
+        },
+        {
+          "id": "t1087_002_net1_user_domain",
+          "pattern": "net1 user /domain",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "process_name",
+            "text_evidence"
+          ],
+          "score": 60
+        },
+        {
+          "id": "t1087_002_get_aduser",
+          "pattern": "get-aduser",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 55
+        },
+        {
+          "id": "t1087_002_dsquery_user",
+          "pattern": "dsquery user",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "process_name",
+            "text_evidence"
+          ],
+          "score": 55
+        },
+        {
+          "id": "t1087_002_adsisearcher",
+          "pattern": "[adsisearcher]",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 60
+        },
+        {
+          "id": "t1087_002_directorysearcher",
+          "pattern": "directorysearcher",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 55
+        },
+        {
+          "id": "t1087_002_ldapsearch",
+          "pattern": "ldapsearch",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "process_name",
+            "text_evidence"
+          ],
+          "score": 55
+        },
+        {
+          "id": "t1087_002_objectclass_filter",
+          "pattern": "(objectclass=",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 45
+        },
+        {
+          "id": "t1087_002_objectcategory_filter",
+          "pattern": "(&(objectcategory=",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 45
         }
       ]
     },
@@ -975,6 +1682,71 @@
             "text_evidence"
           ],
           "score": 65
+        },
+        {
+          "id": "t1482_nltest_exe_domain_trusts",
+          "pattern": "nltest.exe /domain_trusts",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "process_name",
+            "text_evidence"
+          ],
+          "score": 65
+        },
+        {
+          "id": "t1482_get_netforest",
+          "pattern": "get-netforest",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 60
+        },
+        {
+          "id": "t1482_get_netdomain",
+          "pattern": "get-netdomain",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 60
+        },
+        {
+          "id": "t1482_bloodhound",
+          "pattern": "bloodhound",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "process_name",
+            "file_name",
+            "text_evidence"
+          ],
+          "score": 90
+        },
+        {
+          "id": "t1482_sharphound",
+          "pattern": "sharphound",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "process_name",
+            "file_name",
+            "text_evidence"
+          ],
+          "score": 90
+        },
+        {
+          "id": "t1482_invoke_bloodhound",
+          "pattern": "invoke-bloodhound",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 90
         }
       ]
     },
@@ -1012,6 +1784,38 @@
             "text_evidence"
           ],
           "score": 50
+        },
+        {
+          "id": "t1016_arp_a",
+          "pattern": "arp -a",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 45
+        },
+        {
+          "id": "t1016_tracert",
+          "pattern": "tracert",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "process_name",
+            "text_evidence"
+          ],
+          "score": 40
+        },
+        {
+          "id": "t1016_nslookup",
+          "pattern": "nslookup",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "process_name",
+            "text_evidence"
+          ],
+          "score": 40
         }
       ]
     },
@@ -1080,6 +1884,30 @@
             "text_evidence"
           ],
           "score": 90
+        },
+        {
+          "id": "t1021_002_psexec_py",
+          "pattern": "psexec.py",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "process_name",
+            "file_name",
+            "text_evidence"
+          ],
+          "score": 90
+        },
+        {
+          "id": "t1021_002_impacket_psexec",
+          "pattern": "impacket-psexec",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "process_name",
+            "file_name",
+            "text_evidence"
+          ],
+          "score": 90
         }
       ]
     },
@@ -1119,6 +1947,48 @@
             "text_evidence"
           ],
           "score": 75
+        },
+        {
+          "id": "t1021_006_invoke_command_computername",
+          "pattern": "invoke-command -computername",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 75
+        },
+        {
+          "id": "t1021_006_new_pssession_computername",
+          "pattern": "new-pssession -computername",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 75
+        },
+        {
+          "id": "t1021_006_winrs_remote",
+          "pattern": "winrs -r:",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "process_name",
+            "text_evidence"
+          ],
+          "score": 70
+        },
+        {
+          "id": "t1021_006_winrs_exe_remote",
+          "pattern": "winrs.exe -r:",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "process_name",
+            "text_evidence"
+          ],
+          "score": 70
         }
       ]
     },
@@ -1162,6 +2032,28 @@
             "text_evidence"
           ],
           "score": 80
+        },
+        {
+          "id": "t1569_002_remote_sc_no_exe",
+          "pattern": "sc \\\\",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 65
+        },
+        {
+          "id": "t1569_002_at_exec",
+          "pattern": "atexec.py",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "process_name",
+            "file_name",
+            "text_evidence"
+          ],
+          "score": 90
         }
       ]
     },
@@ -1201,6 +2093,60 @@
             "text_evidence"
           ],
           "score": 75
+        },
+        {
+          "id": "t1560_001_7z_archive",
+          "pattern": "7z.exe a",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "process_name",
+            "text_evidence"
+          ],
+          "score": 60
+        },
+        {
+          "id": "t1560_001_7za_archive",
+          "pattern": "7za.exe a",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "process_name",
+            "text_evidence"
+          ],
+          "score": 60
+        },
+        {
+          "id": "t1560_001_rar_archive",
+          "pattern": "rar.exe a",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "process_name",
+            "text_evidence"
+          ],
+          "score": 60
+        },
+        {
+          "id": "t1560_001_winrar_archive",
+          "pattern": "winrar.exe a",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "process_name",
+            "text_evidence"
+          ],
+          "score": 60
+        },
+        {
+          "id": "t1560_001_compress_archive_path",
+          "pattern": "compress-archive -path",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 55
         }
       ]
     },
@@ -1256,6 +2202,38 @@
             "text_evidence"
           ],
           "score": 75
+        },
+        {
+          "id": "t1113_copyfromscreen",
+          "pattern": "copyfromscreen",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 70
+        },
+        {
+          "id": "t1113_psr_start",
+          "pattern": "psr.exe /start",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "process_name",
+            "text_evidence"
+          ],
+          "score": 65
+        },
+        {
+          "id": "t1113_nircmd_savescreenshotfull",
+          "pattern": "nircmd.exe savescreenshotfull",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "process_name",
+            "text_evidence"
+          ],
+          "score": 75
         }
       ]
     },
@@ -1303,6 +2281,58 @@
             "text_evidence"
           ],
           "score": 70
+        },
+        {
+          "id": "t1105_certutil_exe_urlcache_http",
+          "pattern": "certutil.exe -urlcache -f http",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "process_name",
+            "text_evidence"
+          ],
+          "score": 85
+        },
+        {
+          "id": "t1105_certutil_urlcache_split",
+          "pattern": "certutil -urlcache -split -f",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 80
+        },
+        {
+          "id": "t1105_bitsadmin_exe_transfer",
+          "pattern": "bitsadmin.exe /transfer",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "process_name",
+            "text_evidence"
+          ],
+          "score": 80
+        },
+        {
+          "id": "t1105_start_bitstransfer",
+          "pattern": "start-bitstransfer",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 70
+        },
+        {
+          "id": "t1105_iwr_http",
+          "pattern": "iwr http",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 40
         }
       ]
     },
@@ -1422,6 +2452,141 @@
             "text_evidence"
           ],
           "score": 85
+        },
+        {
+          "id": "t1567_002_rclone_exe",
+          "pattern": "rclone.exe",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "process_name",
+            "file_name",
+            "text_evidence"
+          ],
+          "score": 85
+        },
+        {
+          "id": "t1567_002_rclone_exe_copy",
+          "pattern": "rclone.exe copy",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "process_name",
+            "text_evidence"
+          ],
+          "score": 85
+        },
+        {
+          "id": "t1567_002_rclone_exe_sync",
+          "pattern": "rclone.exe sync",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "process_name",
+            "text_evidence"
+          ],
+          "score": 85
+        },
+        {
+          "id": "t1567_002_azcopy_exe",
+          "pattern": "azcopy.exe",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "process_name",
+            "file_name",
+            "text_evidence"
+          ],
+          "score": 70
+        },
+        {
+          "id": "t1567_002_azcopy_copy",
+          "pattern": "azcopy copy",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "process_name",
+            "text_evidence"
+          ],
+          "score": 70
+        },
+        {
+          "id": "t1567_002_aws_s3_cp",
+          "pattern": "aws s3 cp",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 70
+        },
+        {
+          "id": "t1567_002_aws_s3_sync",
+          "pattern": "aws s3 sync",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 70
+        },
+        {
+          "id": "t1567_002_s3_uri",
+          "pattern": "s3://",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 55
+        },
+        {
+          "id": "t1567_002_megasync_exe",
+          "pattern": "megasync.exe",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "process_name",
+            "file_name",
+            "text_evidence"
+          ],
+          "score": 60
+        },
+        {
+          "id": "t1567_002_dropbox_exe",
+          "pattern": "dropbox.exe",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "process_name",
+            "file_name",
+            "text_evidence"
+          ],
+          "score": 50
+        },
+        {
+          "id": "t1567_002_onedrive_exe",
+          "pattern": "onedrive.exe",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "process_name",
+            "file_name",
+            "text_evidence"
+          ],
+          "score": 45
+        },
+        {
+          "id": "t1567_002_googledrivefs_exe",
+          "pattern": "googledrivefs.exe",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "process_name",
+            "file_name",
+            "text_evidence"
+          ],
+          "score": 50
         }
       ]
     },
@@ -1472,6 +2637,96 @@
             "text_evidence"
           ],
           "score": 75
+        },
+        {
+          "id": "t1048_003_curl_upload_file",
+          "pattern": "curl.exe --upload-file",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "process_name",
+            "text_evidence"
+          ],
+          "score": 75
+        },
+        {
+          "id": "t1048_003_curl_no_exe_upload_file",
+          "pattern": "curl --upload-file",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 70
+        },
+        {
+          "id": "t1048_003_curl_no_exe_t",
+          "pattern": "curl -t",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 70
+        },
+        {
+          "id": "t1048_003_scp_exe",
+          "pattern": "scp.exe",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "process_name",
+            "file_name",
+            "text_evidence"
+          ],
+          "score": 65
+        },
+        {
+          "id": "t1048_003_pscp_exe",
+          "pattern": "pscp.exe",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "process_name",
+            "file_name",
+            "text_evidence"
+          ],
+          "score": 70
+        },
+        {
+          "id": "t1048_003_winscp_exe",
+          "pattern": "winscp.exe",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "process_name",
+            "file_name",
+            "text_evidence"
+          ],
+          "score": 65
+        },
+        {
+          "id": "t1048_003_ftp_script",
+          "pattern": "ftp.exe -s:",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "process_name",
+            "text_evidence"
+          ],
+          "score": 65
+        },
+        {
+          "id": "t1048_003_sftp_exe",
+          "pattern": "sftp.exe",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "process_name",
+            "file_name",
+            "text_evidence"
+          ],
+          "score": 60
         }
       ]
     },
@@ -1583,6 +2838,1839 @@
             "text_evidence"
           ],
           "score": 75
+        }
+      ]
+    },
+    {
+      "techniqueId": "T1082",
+      "name": "System Information Discovery",
+      "tactics": [
+        {
+          "id": "TA0007",
+          "name": "Discovery"
+        }
+      ],
+      "aliases": [
+        "system information discovery",
+        "systeminfo",
+        "hostname discovery",
+        "environment variable discovery",
+        "seatbelt",
+        "winpeas"
+      ],
+      "keywords": [
+        {
+          "id": "t1082_systeminfo",
+          "pattern": "systeminfo",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "process_name",
+            "text_evidence"
+          ],
+          "score": 45
+        },
+        {
+          "id": "t1082_hostname",
+          "pattern": "hostname",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "process_name",
+            "text_evidence"
+          ],
+          "score": 40
+        },
+        {
+          "id": "t1082_cmd_set",
+          "pattern": "cmd.exe /c set",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 40
+        },
+        {
+          "id": "t1082_cmd_noexe_set",
+          "pattern": "cmd /c set",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 35
+        },
+        {
+          "id": "t1082_seatbelt",
+          "pattern": "seatbelt.exe",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "process_name",
+            "file_name",
+            "text_evidence"
+          ],
+          "score": 90
+        },
+        {
+          "id": "t1082_winpeas",
+          "pattern": "winpeas",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "process_name",
+            "file_name",
+            "text_evidence"
+          ],
+          "score": 90
+        }
+      ]
+    },
+    {
+      "techniqueId": "T1087.001",
+      "name": "Account Discovery: Local Account",
+      "tactics": [
+        {
+          "id": "TA0007",
+          "name": "Discovery"
+        }
+      ],
+      "aliases": [
+        "local account discovery",
+        "local user discovery",
+        "net user",
+        "local users"
+      ],
+      "keywords": [
+        {
+          "id": "t1087_001_net_user",
+          "pattern": "net user",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "process_name",
+            "text_evidence"
+          ],
+          "score": 45
+        },
+        {
+          "id": "t1087_001_net_exe_user",
+          "pattern": "net.exe user",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "process_name",
+            "text_evidence"
+          ],
+          "score": 45
+        },
+        {
+          "id": "t1087_001_net1_user",
+          "pattern": "net1 user",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "process_name",
+            "text_evidence"
+          ],
+          "score": 45
+        },
+        {
+          "id": "t1087_001_get_localuser",
+          "pattern": "get-localuser",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 45
+        }
+      ]
+    },
+    {
+      "techniqueId": "T1069.001",
+      "name": "Permission Groups Discovery: Local Groups",
+      "tactics": [
+        {
+          "id": "TA0007",
+          "name": "Discovery"
+        }
+      ],
+      "aliases": [
+        "local group discovery",
+        "local groups",
+        "net localgroup"
+      ],
+      "keywords": [
+        {
+          "id": "t1069_001_net_localgroup",
+          "pattern": "net localgroup",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "process_name",
+            "text_evidence"
+          ],
+          "score": 45
+        },
+        {
+          "id": "t1069_001_net_exe_localgroup",
+          "pattern": "net.exe localgroup",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "process_name",
+            "text_evidence"
+          ],
+          "score": 45
+        },
+        {
+          "id": "t1069_001_get_localgroup",
+          "pattern": "get-localgroup",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 45
+        }
+      ]
+    },
+    {
+      "techniqueId": "T1069.002",
+      "name": "Permission Groups Discovery: Domain Groups",
+      "tactics": [
+        {
+          "id": "TA0007",
+          "name": "Discovery"
+        }
+      ],
+      "aliases": [
+        "domain group discovery",
+        "domain groups",
+        "active directory group discovery",
+        "domain admins"
+      ],
+      "keywords": [
+        {
+          "id": "t1069_002_net_group_domain",
+          "pattern": "net group /domain",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "process_name",
+            "text_evidence"
+          ],
+          "score": 55
+        },
+        {
+          "id": "t1069_002_net_exe_group_domain",
+          "pattern": "net.exe group /domain",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "process_name",
+            "text_evidence"
+          ],
+          "score": 55
+        },
+        {
+          "id": "t1069_002_enterprise_admins",
+          "pattern": "net group \"enterprise admins\" /domain",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 65
+        },
+        {
+          "id": "t1069_002_get_adgroup",
+          "pattern": "get-adgroup",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 55
+        },
+        {
+          "id": "t1069_002_dsquery_group",
+          "pattern": "dsquery group",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "process_name",
+            "text_evidence"
+          ],
+          "score": 55
+        }
+      ]
+    },
+    {
+      "techniqueId": "T1018",
+      "name": "Remote System Discovery",
+      "tactics": [
+        {
+          "id": "TA0007",
+          "name": "Discovery"
+        }
+      ],
+      "aliases": [
+        "remote system discovery",
+        "host discovery",
+        "computer discovery",
+        "domain controller discovery"
+      ],
+      "keywords": [
+        {
+          "id": "t1018_net_view",
+          "pattern": "net view",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "process_name",
+            "text_evidence"
+          ],
+          "score": 45
+        },
+        {
+          "id": "t1018_nltest_dclist",
+          "pattern": "nltest /dclist",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 55
+        },
+        {
+          "id": "t1018_nltest_exe_dclist",
+          "pattern": "nltest.exe /dclist",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "process_name",
+            "text_evidence"
+          ],
+          "score": 55
+        },
+        {
+          "id": "t1018_get_adcomputer",
+          "pattern": "get-adcomputer",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 55
+        },
+        {
+          "id": "t1018_dsquery_computer",
+          "pattern": "dsquery computer",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "process_name",
+            "text_evidence"
+          ],
+          "score": 55
+        },
+        {
+          "id": "t1018_adfind_exe",
+          "pattern": "adfind.exe",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "process_name",
+            "file_name",
+            "text_evidence"
+          ],
+          "score": 85
+        },
+        {
+          "id": "t1018_adfind_sc_computers",
+          "pattern": "adfind -sc computers",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 80
+        }
+      ]
+    },
+    {
+      "techniqueId": "T1135",
+      "name": "Network Share Discovery",
+      "tactics": [
+        {
+          "id": "TA0007",
+          "name": "Discovery"
+        }
+      ],
+      "aliases": [
+        "network share discovery",
+        "share discovery",
+        "net share"
+      ],
+      "keywords": [
+        {
+          "id": "t1135_net_share",
+          "pattern": "net share",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "process_name",
+            "text_evidence"
+          ],
+          "score": 45
+        },
+        {
+          "id": "t1135_net_exe_share",
+          "pattern": "net.exe share",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "process_name",
+            "text_evidence"
+          ],
+          "score": 45
+        },
+        {
+          "id": "t1135_net_view_unc",
+          "pattern": "net view \\\\",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 50
+        }
+      ]
+    },
+    {
+      "techniqueId": "T1003.002",
+      "name": "OS Credential Dumping: Security Account Manager",
+      "tactics": [
+        {
+          "id": "TA0006",
+          "name": "Credential Access"
+        }
+      ],
+      "aliases": [
+        "sam dump",
+        "sam hive dump",
+        "registry hive credential dumping",
+        "registry hive credentials dumping"
+      ],
+      "keywords": [
+        {
+          "id": "t1003_002_reg_save_hklm_sam",
+          "pattern": "reg save hklm\\sam",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 90
+        },
+        {
+          "id": "t1003_002_reg_save_hklm_security",
+          "pattern": "reg save hklm\\security",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 85
+        },
+        {
+          "id": "t1003_002_reg_save_hklm_system",
+          "pattern": "reg save hklm\\system",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 75
+        },
+        {
+          "id": "t1003_002_hklm_sam",
+          "pattern": "hklm\\sam",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 65
+        },
+        {
+          "id": "t1003_002_hklm_security",
+          "pattern": "hklm\\security",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 60
+        }
+      ]
+    },
+    {
+      "techniqueId": "T1558.001",
+      "name": "Steal or Forge Kerberos Tickets: Golden Ticket",
+      "tactics": [
+        {
+          "id": "TA0006",
+          "name": "Credential Access"
+        }
+      ],
+      "aliases": [
+        "golden ticket",
+        "kerberos golden ticket",
+        "forge kerberos ticket",
+        "forged kerberos credentials"
+      ],
+      "keywords": [
+        {
+          "id": "t1558_001_golden_ticket",
+          "pattern": "golden ticket",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 85
+        },
+        {
+          "id": "t1558_001_kerberos_golden",
+          "pattern": "kerberos::golden",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 95
+        },
+        {
+          "id": "t1558_001_ticketer_py",
+          "pattern": "ticketer.py",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "process_name",
+            "file_name",
+            "text_evidence"
+          ],
+          "score": 90
+        }
+      ]
+    },
+    {
+      "techniqueId": "T1558.002",
+      "name": "Steal or Forge Kerberos Tickets: Silver Ticket",
+      "tactics": [
+        {
+          "id": "TA0006",
+          "name": "Credential Access"
+        }
+      ],
+      "aliases": [
+        "silver ticket",
+        "kerberos silver ticket",
+        "forged service ticket",
+        "forged kerberos credentials"
+      ],
+      "keywords": [
+        {
+          "id": "t1558_002_silver_ticket",
+          "pattern": "silver ticket",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 85
+        },
+        {
+          "id": "t1558_002_kerberos_golden_service",
+          "pattern": "kerberos::golden /service:",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 90
+        }
+      ]
+    },
+    {
+      "techniqueId": "T1558.003",
+      "name": "Steal or Forge Kerberos Tickets: Kerberoasting",
+      "tactics": [
+        {
+          "id": "TA0006",
+          "name": "Credential Access"
+        }
+      ],
+      "aliases": [
+        "kerberoasting",
+        "kerberoast",
+        "service ticket roasting",
+        "kerberos credentials"
+      ],
+      "keywords": [
+        {
+          "id": "t1558_003_kerberoast",
+          "pattern": "kerberoast",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "process_name",
+            "file_name",
+            "text_evidence"
+          ],
+          "score": 85
+        },
+        {
+          "id": "t1558_003_getuserspns",
+          "pattern": "getuserspns.py",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "process_name",
+            "file_name",
+            "text_evidence"
+          ],
+          "score": 90
+        },
+        {
+          "id": "t1558_003_invoke_kerberoast",
+          "pattern": "invoke-kerberoast",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 90
+        },
+        {
+          "id": "t1558_003_rubeus_kerberoast",
+          "pattern": "rubeus kerberoast",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 90
+        },
+        {
+          "id": "t1558_003_rubeus_exe_kerberoast",
+          "pattern": "rubeus.exe kerberoast",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "process_name",
+            "text_evidence"
+          ],
+          "score": 90
+        }
+      ]
+    },
+    {
+      "techniqueId": "T1558.004",
+      "name": "Steal or Forge Kerberos Tickets: AS-REP Roasting",
+      "tactics": [
+        {
+          "id": "TA0006",
+          "name": "Credential Access"
+        }
+      ],
+      "aliases": [
+        "as-rep roasting",
+        "asrep roasting",
+        "asreproast",
+        "kerberos credentials"
+      ],
+      "keywords": [
+        {
+          "id": "t1558_004_asreproast",
+          "pattern": "asreproast",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "process_name",
+            "file_name",
+            "text_evidence"
+          ],
+          "score": 85
+        },
+        {
+          "id": "t1558_004_getnpusers",
+          "pattern": "getnpusers.py",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "process_name",
+            "file_name",
+            "text_evidence"
+          ],
+          "score": 90
+        },
+        {
+          "id": "t1558_004_rubeus_asreproast",
+          "pattern": "rubeus asreproast",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 90
+        },
+        {
+          "id": "t1558_004_rubeus_exe_asreproast",
+          "pattern": "rubeus.exe asreproast",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "process_name",
+            "text_evidence"
+          ],
+          "score": 90
+        }
+      ]
+    },
+    {
+      "techniqueId": "T1098",
+      "name": "Account Manipulation",
+      "tactics": [
+        {
+          "id": "TA0003",
+          "name": "Persistence"
+        },
+        {
+          "id": "TA0004",
+          "name": "Privilege Escalation"
+        }
+      ],
+      "aliases": [
+        "account manipulation",
+        "shadow credential",
+        "msds key credential link",
+        "key credential link"
+      ],
+      "keywords": [
+        {
+          "id": "t1098_whisker",
+          "pattern": "whisker.exe",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "process_name",
+            "file_name",
+            "text_evidence"
+          ],
+          "score": 95
+        },
+        {
+          "id": "t1098_pywhisker",
+          "pattern": "pywhisker",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "process_name",
+            "file_name",
+            "text_evidence"
+          ],
+          "score": 95
+        },
+        {
+          "id": "t1098_msds_keycredentiallink",
+          "pattern": "msds-keycredentiallink",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 95
+        },
+        {
+          "id": "t1098_shadow_credential_phrase",
+          "pattern": "shadow credential",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 90
+        },
+        {
+          "id": "t1098_certipy_shadow",
+          "pattern": "certipy shadow",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 90
+        }
+      ]
+    },
+    {
+      "techniqueId": "T1649",
+      "name": "Steal or Forge Authentication Certificates",
+      "tactics": [
+        {
+          "id": "TA0006",
+          "name": "Credential Access"
+        }
+      ],
+      "aliases": [
+        "authentication certificate abuse",
+        "certificate credentials",
+        "adcs abuse",
+        "pkinit abuse",
+        "certipy"
+      ],
+      "keywords": [
+        {
+          "id": "t1649_certipy",
+          "pattern": "certipy",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "process_name",
+            "file_name",
+            "text_evidence"
+          ],
+          "score": 85
+        },
+        {
+          "id": "t1649_certipy_find",
+          "pattern": "certipy find",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 80
+        },
+        {
+          "id": "t1649_certipy_req",
+          "pattern": "certipy req",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 85
+        },
+        {
+          "id": "t1649_certipy_auth",
+          "pattern": "certipy auth",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 85
+        },
+        {
+          "id": "t1649_certreq_f",
+          "pattern": "certreq /f",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 55
+        },
+        {
+          "id": "t1649_newrequest",
+          "pattern": "-newrequest",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 55
+        },
+        {
+          "id": "t1649_gettgtpkinit",
+          "pattern": "gettgtpkinit.py",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "process_name",
+            "file_name",
+            "text_evidence"
+          ],
+          "score": 90
+        },
+        {
+          "id": "t1649_pkinittools",
+          "pattern": "pkinittools",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "process_name",
+            "file_name",
+            "text_evidence"
+          ],
+          "score": 85
+        },
+        {
+          "id": "t1649_pkinit",
+          "pattern": "pkinit",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 55
+        },
+        {
+          "id": "t1649_esc1",
+          "pattern": "esc1",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 55
+        },
+        {
+          "id": "t1649_esc2",
+          "pattern": "esc2",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 55
+        },
+        {
+          "id": "t1649_esc3",
+          "pattern": "esc3",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 55
+        },
+        {
+          "id": "t1649_esc4",
+          "pattern": "esc4",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 55
+        },
+        {
+          "id": "t1649_esc5",
+          "pattern": "esc5",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 55
+        },
+        {
+          "id": "t1649_esc6",
+          "pattern": "esc6",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 55
+        },
+        {
+          "id": "t1649_esc7",
+          "pattern": "esc7",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 55
+        },
+        {
+          "id": "t1649_esc8",
+          "pattern": "esc8",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 55
+        }
+      ]
+    },
+    {
+      "techniqueId": "T1546.003",
+      "name": "Event Triggered Execution: Windows Management Instrumentation Event Subscription",
+      "tactics": [
+        {
+          "id": "TA0003",
+          "name": "Persistence"
+        },
+        {
+          "id": "TA0004",
+          "name": "Privilege Escalation"
+        }
+      ],
+      "aliases": [
+        "wmi event subscription",
+        "wmi persistence",
+        "event filter persistence",
+        "commandlineeventconsumer"
+      ],
+      "keywords": [
+        {
+          "id": "t1546_003_eventfilter",
+          "pattern": "__eventfilter",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 85
+        },
+        {
+          "id": "t1546_003_eventconsumer",
+          "pattern": "__eventconsumer",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 85
+        },
+        {
+          "id": "t1546_003_filtertoconsumerbinding",
+          "pattern": "__filtertoconsumerbinding",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 90
+        },
+        {
+          "id": "t1546_003_commandlineeventconsumer",
+          "pattern": "commandlineeventconsumer",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 90
+        },
+        {
+          "id": "t1546_003_set_wmi_root_subscription",
+          "pattern": "set-wmiinstance -namespace root\\subscription",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 90
+        },
+        {
+          "id": "t1546_003_wmic_root_subscription",
+          "pattern": "wmic /namespace:\\\\root\\subscription",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 85
+        }
+      ]
+    },
+    {
+      "techniqueId": "T1484.001",
+      "name": "Domain Policy Modification: Group Policy Modification",
+      "tactics": [
+        {
+          "id": "TA0004",
+          "name": "Privilege Escalation"
+        },
+        {
+          "id": "TA0005",
+          "name": "Defense Evasion"
+        }
+      ],
+      "aliases": [
+        "gpo abuse",
+        "group policy abuse",
+        "group policy modification",
+        "sharpgpoabuse"
+      ],
+      "keywords": [
+        {
+          "id": "t1484_001_sharpgpoabuse",
+          "pattern": "sharpgpoabuse",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "process_name",
+            "file_name",
+            "text_evidence"
+          ],
+          "score": 95
+        },
+        {
+          "id": "t1484_001_new_gpo",
+          "pattern": "new-gpo",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 55
+        },
+        {
+          "id": "t1484_001_set_gpregistryvalue",
+          "pattern": "set-gpregistryvalue",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 60
+        },
+        {
+          "id": "t1484_001_new_gplink",
+          "pattern": "new-gplink",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 55
+        },
+        {
+          "id": "t1484_001_sysvol_gpt",
+          "pattern": "\\sysvol\\",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "file_name",
+            "text_evidence"
+          ],
+          "score": 35
+        }
+      ]
+    },
+    {
+      "techniqueId": "T1546.012",
+      "name": "Event Triggered Execution: Image File Execution Options Injection",
+      "tactics": [
+        {
+          "id": "TA0003",
+          "name": "Persistence"
+        },
+        {
+          "id": "TA0004",
+          "name": "Privilege Escalation"
+        }
+      ],
+      "aliases": [
+        "ifeo",
+        "ifeo debugger hijack",
+        "image file execution options",
+        "debugger hijacking"
+      ],
+      "keywords": [
+        {
+          "id": "t1546_012_image_file_execution_options",
+          "pattern": "image file execution options",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 80
+        },
+        {
+          "id": "t1546_012_ifeo_registry",
+          "pattern": "windows nt\\currentversion\\image file execution options",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 85
+        },
+        {
+          "id": "t1546_012_ifeo_debugger",
+          "pattern": "\\image file execution options\\",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 80
+        },
+        {
+          "id": "t1546_012_silentprocessexit",
+          "pattern": "silentprocessexit",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 80
+        },
+        {
+          "id": "t1546_012_globalflag",
+          "pattern": "globalflag",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 65
+        }
+      ]
+    },
+    {
+      "techniqueId": "T1546.015",
+      "name": "Event Triggered Execution: Component Object Model Hijacking",
+      "tactics": [
+        {
+          "id": "TA0003",
+          "name": "Persistence"
+        },
+        {
+          "id": "TA0004",
+          "name": "Privilege Escalation"
+        }
+      ],
+      "aliases": [
+        "com hijacking",
+        "com hijack",
+        "component object model hijacking",
+        "clsid hijack"
+      ],
+      "keywords": [
+        {
+          "id": "t1546_015_inprocserver32",
+          "pattern": "inprocserver32",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 65
+        },
+        {
+          "id": "t1546_015_localserver32",
+          "pattern": "localserver32",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 65
+        },
+        {
+          "id": "t1546_015_treatas",
+          "pattern": "treatas",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 65
+        },
+        {
+          "id": "t1546_015_clsid_registry",
+          "pattern": "\\software\\classes\\clsid\\",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 65
+        }
+      ]
+    },
+    {
+      "techniqueId": "T1218.004",
+      "name": "Signed Binary Proxy Execution: InstallUtil",
+      "tactics": [
+        {
+          "id": "TA0005",
+          "name": "Defense Evasion"
+        }
+      ],
+      "aliases": [
+        "installutil",
+        "installutil proxy execution",
+        "signed binary proxy execution"
+      ],
+      "keywords": [
+        {
+          "id": "t1218_004_installutil_exe",
+          "pattern": "installutil.exe",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "process_name",
+            "file_name",
+            "text_evidence"
+          ],
+          "score": 70
+        },
+        {
+          "id": "t1218_004_installutil_u",
+          "pattern": "installutil.exe /u",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "process_name",
+            "text_evidence"
+          ],
+          "score": 80
+        },
+        {
+          "id": "t1218_004_installutil_logfile",
+          "pattern": "installutil.exe /logfile=",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "process_name",
+            "text_evidence"
+          ],
+          "score": 80
+        },
+        {
+          "id": "t1218_004_installutil_logtoconsole_false",
+          "pattern": "installutil.exe /logtoconsole=false",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "process_name",
+            "text_evidence"
+          ],
+          "score": 80
+        }
+      ]
+    },
+    {
+      "techniqueId": "T1218.003",
+      "name": "Signed Binary Proxy Execution: CMSTP",
+      "tactics": [
+        {
+          "id": "TA0005",
+          "name": "Defense Evasion"
+        }
+      ],
+      "aliases": [
+        "cmstp",
+        "cmstp proxy execution",
+        "connection manager profile installer"
+      ],
+      "keywords": [
+        {
+          "id": "t1218_003_cmstp_exe",
+          "pattern": "cmstp.exe",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "process_name",
+            "file_name",
+            "text_evidence"
+          ],
+          "score": 65
+        },
+        {
+          "id": "t1218_003_cmstp_s",
+          "pattern": "cmstp.exe /s",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "process_name",
+            "text_evidence"
+          ],
+          "score": 80
+        },
+        {
+          "id": "t1218_003_cmstp_au",
+          "pattern": "cmstp.exe /au",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "process_name",
+            "text_evidence"
+          ],
+          "score": 80
+        }
+      ]
+    },
+    {
+      "techniqueId": "T1202",
+      "name": "Indirect Command Execution",
+      "tactics": [
+        {
+          "id": "TA0005",
+          "name": "Defense Evasion"
+        }
+      ],
+      "aliases": [
+        "indirect command execution",
+        "forfiles",
+        "forfiles execution"
+      ],
+      "keywords": [
+        {
+          "id": "t1202_forfiles_cmd",
+          "pattern": "forfiles /p",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "process_name",
+            "text_evidence"
+          ],
+          "score": 65
+        },
+        {
+          "id": "t1202_forfiles_c_cmd",
+          "pattern": "forfiles.exe /p",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "process_name",
+            "text_evidence"
+          ],
+          "score": 65
+        },
+        {
+          "id": "t1202_forfiles_cmd_c",
+          "pattern": "forfiles /m",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "process_name",
+            "text_evidence"
+          ],
+          "score": 60
+        }
+      ]
+    },
+    {
+      "techniqueId": "T1021.001",
+      "name": "Remote Services: Remote Desktop Protocol",
+      "tactics": [
+        {
+          "id": "TA0008",
+          "name": "Lateral Movement"
+        }
+      ],
+      "aliases": [
+        "rdp",
+        "remote desktop",
+        "remote desktop protocol",
+        "mstsc"
+      ],
+      "keywords": [
+        {
+          "id": "t1021_001_mstsc_v",
+          "pattern": "mstsc /v:",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "process_name",
+            "text_evidence"
+          ],
+          "score": 60
+        },
+        {
+          "id": "t1021_001_mstsc_exe_v",
+          "pattern": "mstsc.exe /v:",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "process_name",
+            "text_evidence"
+          ],
+          "score": 60
+        },
+        {
+          "id": "t1021_001_cmdkey_termsrv",
+          "pattern": "cmdkey /add:termsrv/",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 70
+        },
+        {
+          "id": "t1021_001_xfreerdp",
+          "pattern": "xfreerdp /v:",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "process_name",
+            "text_evidence"
+          ],
+          "score": 70
+        }
+      ]
+    },
+    {
+      "techniqueId": "T1021.003",
+      "name": "Remote Services: Distributed Component Object Model",
+      "tactics": [
+        {
+          "id": "TA0008",
+          "name": "Lateral Movement"
+        }
+      ],
+      "aliases": [
+        "dcom",
+        "dcom lateral movement",
+        "distributed component object model",
+        "dcomexec"
+      ],
+      "keywords": [
+        {
+          "id": "t1021_003_dcomexec",
+          "pattern": "dcomexec.py",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "process_name",
+            "file_name",
+            "text_evidence"
+          ],
+          "score": 90
+        },
+        {
+          "id": "t1021_003_invoke_dcom",
+          "pattern": "invoke-dcom",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 85
+        },
+        {
+          "id": "t1021_003_mmc20_application",
+          "pattern": "mmc20.application",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 85
+        },
+        {
+          "id": "t1021_003_shellwindows",
+          "pattern": "shellwindows",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 75
+        },
+        {
+          "id": "t1021_003_shellbrowserwindow",
+          "pattern": "shellbrowserwindow",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 75
+        }
+      ]
+    },
+    {
+      "techniqueId": "T1021",
+      "name": "Remote Services",
+      "tactics": [
+        {
+          "id": "TA0008",
+          "name": "Lateral Movement"
+        }
+      ],
+      "aliases": [
+        "remote services",
+        "remote registry",
+        "rpc lateral movement",
+        "rpc tools"
+      ],
+      "keywords": [
+        {
+          "id": "t1021_reg_query_remote",
+          "pattern": "reg query \\\\",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 60
+        },
+        {
+          "id": "t1021_reg_add_remote",
+          "pattern": "reg add \\\\",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 65
+        },
+        {
+          "id": "t1021_remote_registry",
+          "pattern": "remote registry",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 50
+        },
+        {
+          "id": "t1021_rpcdump",
+          "pattern": "rpcdump.py",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "process_name",
+            "file_name",
+            "text_evidence"
+          ],
+          "score": 75
+        },
+        {
+          "id": "t1021_rpcclient_c",
+          "pattern": "rpcclient -c",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "process_name",
+            "text_evidence"
+          ],
+          "score": 60
+        }
+      ]
+    },
+    {
+      "techniqueId": "T1555.003",
+      "name": "Credentials from Password Stores: Credentials from Web Browsers",
+      "tactics": [
+        {
+          "id": "TA0006",
+          "name": "Credential Access"
+        }
+      ],
+      "aliases": [
+        "browser credential theft",
+        "browser credentials theft",
+        "browser password store",
+        "chrome login data",
+        "firefox credentials"
+      ],
+      "keywords": [
+        {
+          "id": "t1555_003_login_data",
+          "pattern": "login data",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "file_name",
+            "text_evidence"
+          ],
+          "score": 55
+        },
+        {
+          "id": "t1555_003_chrome_login_data_path",
+          "pattern": "\\user data\\default\\login data",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "file_name",
+            "text_evidence"
+          ],
+          "score": 70
+        },
+        {
+          "id": "t1555_003_edge_user_data",
+          "pattern": "\\microsoft\\edge\\user data\\",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "file_name",
+            "text_evidence"
+          ],
+          "score": 65
+        },
+        {
+          "id": "t1555_003_chrome_user_data",
+          "pattern": "\\google\\chrome\\user data\\",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "file_name",
+            "text_evidence"
+          ],
+          "score": 65
+        },
+        {
+          "id": "t1555_003_firefox_profiles",
+          "pattern": "\\mozilla\\firefox\\profiles\\",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "file_name",
+            "text_evidence"
+          ],
+          "score": 65
+        },
+        {
+          "id": "t1555_003_cookies_sqlite",
+          "pattern": "cookies.sqlite",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "file_name",
+            "text_evidence"
+          ],
+          "score": 65
+        },
+        {
+          "id": "t1555_003_logins_json",
+          "pattern": "logins.json",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "file_name",
+            "text_evidence"
+          ],
+          "score": 70
+        },
+        {
+          "id": "t1555_003_key4_db",
+          "pattern": "key4.db",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "file_name",
+            "text_evidence"
+          ],
+          "score": 70
+        }
+      ]
+    },
+    {
+      "techniqueId": "T1115",
+      "name": "Clipboard Data",
+      "tactics": [
+        {
+          "id": "TA0009",
+          "name": "Collection"
+        }
+      ],
+      "aliases": [
+        "clipboard data",
+        "clipboard collection",
+        "get clipboard"
+      ],
+      "keywords": [
+        {
+          "id": "t1115_get_clipboard",
+          "pattern": "get-clipboard",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 60
+        },
+        {
+          "id": "t1115_powershell_get_clipboard",
+          "pattern": "powershell get-clipboard",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 60
+        }
+      ]
+    },
+    {
+      "techniqueId": "T1114.001",
+      "name": "Email Collection: Local Email Collection",
+      "tactics": [
+        {
+          "id": "TA0009",
+          "name": "Collection"
+        }
+      ],
+      "aliases": [
+        "local email collection",
+        "pst collection",
+        "outlook pst",
+        "pst files"
+      ],
+      "keywords": [
+        {
+          "id": "t1114_001_pst_extension",
+          "pattern": ".pst",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "file_name",
+            "text_evidence"
+          ],
+          "score": 45
+        },
+        {
+          "id": "t1114_001_outlook_pst",
+          "pattern": "outlook.pst",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "file_name",
+            "text_evidence"
+          ],
+          "score": 60
+        },
+        {
+          "id": "t1114_001_outlook_files",
+          "pattern": "\\documents\\outlook files\\",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "file_name",
+            "text_evidence"
+          ],
+          "score": 55
+        },
+        {
+          "id": "t1114_001_get_childitem_pst",
+          "pattern": "get-childitem *.pst",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 55
         }
       ]
     }
