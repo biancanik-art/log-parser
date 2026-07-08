@@ -179,6 +179,19 @@ fn parse_with_context(
             sort,
         }
     } else if has_suspicious_intent || has_attack_timeline_intent {
+        // A bare "attack"/"activity"/"timeline" word is enough to ask for a broad scan - but if
+        // the query also names something specific we don't recognize ("shadow credentials
+        // attack"), silently broadening to the same generic scan would look like a real targeted
+        // result when it isn't one. Ask instead of guessing.
+        if let Some(message) = unrecognized_technique_message(trimmed) {
+            return clarification(
+                &message,
+                &[
+                    "Try a known technique or keyword, such as mimikatz or credential dumping",
+                    "Or add this as a custom category to the library first",
+                ],
+            );
+        }
         GuidedIntent::SuspiciousScan {
             tactic_ids: Vec::new(),
             technique_ids: Vec::new(),
@@ -511,6 +524,32 @@ fn ambiguous_token_message(
     }
 
     None
+}
+
+/// Called only when `select_techniques` found zero matches at all. Distinguishes a genuinely
+/// generic query ("find suspicious activity", "show attack timeline" - no significant content
+/// words, intentionally broad) from a query that names something specific we don't recognize
+/// ("shadow credentials attack" - "shadow"/"credentials" are real content words with no match in
+/// the library). The latter must never silently fall back to a broad suspicious-activity scan:
+/// that would look like a real targeted result to the examiner when it's actually the same
+/// generic scan they'd get from typing nothing specific at all.
+fn unrecognized_technique_message(query_text: &str) -> Option<String> {
+    let significant: Vec<String> = raw_tokens(query_text)
+        .into_iter()
+        .map(|token| normalize_phrase(&token))
+        .filter(|norm| norm.len() >= 4 && !is_noise_word(norm) && !is_intent_word(norm))
+        .collect();
+
+    if significant.is_empty() {
+        return None;
+    }
+
+    let mut unique = significant;
+    unique.dedup();
+    Some(format!(
+        "I don't recognize '{}' as a known technique, tactic, category, or keyword in the library.",
+        unique.join(" ")
+    ))
 }
 
 fn extract_user(query_text: &str, selection: &TechniqueSelection) -> UserExtraction {
@@ -1023,5 +1062,19 @@ mod tests {
         let (preview, intent) = parse_intent("show attacks of this user");
         assert!(preview.needs_clarification);
         assert!(matches!(intent, GuidedIntent::Unknown { .. }));
+    }
+
+    #[test]
+    fn unrecognized_specific_term_does_not_silently_fall_back_to_broad_scan() {
+        // "attack" alone would normally trigger a broad SuspiciousScan fallback - but "shadow"
+        // and "credentials" are real content words the library doesn't recognize, so this must
+        // ask for clarification instead of quietly returning the same results as a bare
+        // "find suspicious activity" query would.
+        let (preview, intent) = parse_intent("shadow credentials attack");
+        assert!(preview.needs_clarification);
+        assert!(matches!(intent, GuidedIntent::Unknown { .. }));
+        let message = preview.clarification_message.unwrap_or_default();
+        assert!(message.contains("shadow"), "message was: {message}");
+        assert!(message.contains("credentials"), "message was: {message}");
     }
 }

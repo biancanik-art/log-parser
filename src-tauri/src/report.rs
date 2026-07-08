@@ -498,29 +498,58 @@ where
 
     let ident = db::quote_ident(&role_column.sql_name);
     let sql = format!(
-        "SELECT MIN(row_num), {ident}, COUNT(*)
+        "SELECT row_num, {ident}
          FROM rows
          WHERE {ident} IS NOT NULL AND TRIM({ident}) != ''
-         GROUP BY {ident}
-         ORDER BY LOWER({ident}) ASC, {ident} ASC"
+         ORDER BY row_num ASC"
     );
     let mut stmt = conn.prepare(&sql)?;
     let mut rows = stmt.query([])?;
-    let mut wrote_any = false;
+
+    // Fold by lowercase so the same real-world entity (e.g. a hostname or username that shows
+    // up with inconsistent casing across log sources - Windows identities are case-insensitive)
+    // isn't counted and listed as two different "distinct" values. The display casing shown is
+    // whichever exact casing occurred most often for that folded value.
+    struct Folded {
+        first_row_num: i64,
+        total_count: i64,
+        casing_counts: BTreeMap<String, i64>,
+    }
+    let mut folded: BTreeMap<String, Folded> = BTreeMap::new();
     while let Some(row) = rows.next()? {
-        wrote_any = true;
         let row_num: i64 = row.get(0)?;
         let value: String = row.get(1)?;
-        let count: i64 = row.get(2)?;
+        let fold_key = value.to_ascii_lowercase();
+        let entry = folded.entry(fold_key).or_insert_with(|| Folded {
+            first_row_num: row_num,
+            total_count: 0,
+            casing_counts: BTreeMap::new(),
+        });
+        entry.total_count += 1;
+        entry.first_row_num = entry.first_row_num.min(row_num);
+        *entry.casing_counts.entry(value).or_insert(0) += 1;
+    }
+
+    let mut wrote_any = false;
+    for folded_entry in folded.values() {
+        wrote_any = true;
+        let mut display_value = String::new();
+        let mut best_count = -1i64;
+        for (casing, count) in &folded_entry.casing_counts {
+            if *count > best_count || (*count == best_count && casing < &display_value) {
+                best_count = *count;
+                display_value = casing.clone();
+            }
+        }
         writer.write_cells_with_count(
-            row_num,
+            folded_entry.first_row_num,
             &[
                 section,
                 role_column.original_name.as_str(),
-                value.as_str(),
+                display_value.as_str(),
                 "Distinct confirmed role value observed in the source data.",
             ],
-            count,
+            folded_entry.total_count,
         )?;
     }
 
@@ -1537,6 +1566,91 @@ mod tests {
 
         let err = export_report(&conn, &columns, &path, |_, _| {}).unwrap_err();
         assert!(err.to_string().contains("run normalize_timestamp_column"));
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn general_sheet_case_folds_host_values_before_dedup() {
+        // Windows hostnames are case-insensitive - "WKSTN-01.corp.local" and
+        // "wkstn-01.corp.local" are the same machine, and must roll up into one General-sheet
+        // entry, not two "distinct" hosts.
+        let conn = Connection::open_in_memory().unwrap();
+        let columns = vec![
+            ColumnMeta {
+                sql_name: "timegenerated".into(),
+                original_name: "TimeGenerated".into(),
+                col_index: 0,
+                inferred_type: "timestamp".into(),
+            },
+            ColumnMeta {
+                sql_name: "device_name".into(),
+                original_name: "DeviceName".into(),
+                col_index: 1,
+                inferred_type: "text".into(),
+            },
+        ];
+        db::create_schema(&conn, &columns).unwrap();
+        conn.execute(
+            "INSERT INTO rows (row_num, timegenerated, device_name) VALUES
+                (1, '2026-01-01T00:01:00Z', 'WKSTN-01.corp.local'),
+                (2, '2026-01-01T00:02:00Z', 'wkstn-01.corp.local'),
+                (3, '2026-01-01T00:03:00Z', 'WKSTN-01.corp.local')",
+            [],
+        )
+        .unwrap();
+
+        db::create_column_roles_table(&conn).unwrap();
+        for (role, sql_name) in [("timestamp", "timegenerated"), ("host", "device_name")] {
+            conn.execute(
+                "INSERT INTO _column_roles (role, sql_name, confidence, status, reasons_json)
+                 VALUES (?1, ?2, 1.0, 'confirmed', '[]')",
+                params![role, sql_name],
+            )
+            .unwrap();
+        }
+
+        db::create_row_time_table(&conn).unwrap();
+        for (row_num, epoch_ms, utc_text) in [
+            (1i64, 1_767_225_660_000i64, "2026-01-01T00:01:00Z"),
+            (2, 1_767_225_720_000, "2026-01-01T00:02:00Z"),
+            (3, 1_767_225_780_000, "2026-01-01T00:03:00Z"),
+        ] {
+            conn.execute(
+                "INSERT INTO _row_time (row_num, epoch_ms, utc_text, source_text, parse_status)
+                 VALUES (?1, ?2, ?3, ?3, 'explicit_offset')",
+                params![row_num, epoch_ms, utc_text],
+            )
+            .unwrap();
+        }
+
+        db::create_intel_schema(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO _intel_scan_info (library_hash, role_hash, completed_at)
+             VALUES ('test-library', 'test-roles', '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+
+        let path = temp_report_path("case-fold-hosts");
+        export_report(&conn, &columns, &path, |_, _| {}).unwrap();
+
+        let mut workbook: calamine::Sheets<std::io::BufReader<std::fs::File>> =
+            calamine::open_workbook_auto(&path).unwrap();
+        let general = workbook
+            .worksheet_range("General")
+            .expect("General sheet should exist");
+        let host_rows: Vec<_> = general
+            .rows()
+            .skip(1)
+            .filter(|row| row[1] == "Hosts")
+            .collect();
+        assert_eq!(
+            host_rows.len(),
+            1,
+            "expected one case-folded Hosts row, got {host_rows:?}"
+        );
+        assert_eq!(cell_to_i64(&host_rows[0][5]), 3, "total observed_count across all casings");
 
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }

@@ -3,6 +3,7 @@ use crate::intel::time::{classify_timestamp_text, TimestampValueKind};
 use anyhow::{anyhow, Result};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::net::IpAddr;
 
 const SAMPLE_LIMIT: i64 = 500;
@@ -86,11 +87,51 @@ pub fn detect_column_roles(
     db::create_column_roles_table(conn)?;
     let samples = sample_column_values(conn, columns)?;
 
-    for role in ROLES {
-        if let Some(candidate) = best_candidate(role, columns, &samples) {
-            if candidate.confidence >= threshold_for(role) {
-                upsert_suggestion(conn, &candidate)?;
+    // Score every role against every column independently first (each role's candidates sorted
+    // best-first), then assign roles to columns greedily by confidence: the strongest signal
+    // across all (role, column) pairs wins its column, that column is removed from consideration
+    // for every other role, and so on. Without this, two roles that both score highest on the
+    // same column (e.g. "process_name" and "file_name" both liking the same wide "process image
+    // name" column) would silently both claim it - two roles pointing at one column with no
+    // indication to the examiner that the other candidate columns were never actually compared.
+    let role_candidates: Vec<Vec<Candidate>> = ROLES
+        .iter()
+        .map(|&role| all_candidates(role, columns, &samples))
+        .collect();
+
+    let mut claimed_columns: HashSet<String> = HashSet::new();
+    let mut resolved = vec![false; role_candidates.len()];
+
+    for _ in 0..role_candidates.len() {
+        let mut best: Option<(usize, usize, f64)> = None; // (role index, candidate index, confidence)
+        for (role_idx, candidates) in role_candidates.iter().enumerate() {
+            if resolved[role_idx] {
+                continue;
             }
+            let Some((cand_idx, candidate)) = candidates
+                .iter()
+                .enumerate()
+                .find(|(_, c)| !claimed_columns.contains(&c.sql_name))
+            else {
+                resolved[role_idx] = true; // no unclaimed candidate left for this role at all
+                continue;
+            };
+            let is_better = match best {
+                None => true,
+                Some((_, _, best_confidence)) => candidate.confidence > best_confidence,
+            };
+            if is_better {
+                best = Some((role_idx, cand_idx, candidate.confidence));
+            }
+        }
+        let Some((role_idx, cand_idx, _)) = best else {
+            break;
+        };
+        resolved[role_idx] = true;
+        let candidate = &role_candidates[role_idx][cand_idx];
+        if candidate.confidence >= threshold_for(candidate.role) {
+            claimed_columns.insert(candidate.sql_name.clone());
+            upsert_suggestion(conn, candidate)?;
         }
     }
 
@@ -259,16 +300,21 @@ fn sample_column_values(conn: &Connection, columns: &[ColumnMeta]) -> Result<Vec
     Ok(samples)
 }
 
-fn best_candidate(
+/// Every column that scores at all for this role, best-first, so the caller can walk past an
+/// already-claimed top choice to the next-best distinct column instead of just taking the
+/// single winner in isolation.
+fn all_candidates(
     role: &'static str,
     columns: &[ColumnMeta],
     samples: &[Vec<String>],
-) -> Option<Candidate> {
-    columns
+) -> Vec<Candidate> {
+    let mut candidates: Vec<Candidate> = columns
         .iter()
         .zip(samples.iter())
         .filter_map(|(column, values)| score_column(role, column, values))
-        .max_by(|left, right| left.confidence.total_cmp(&right.confidence))
+        .collect();
+    candidates.sort_by(|left, right| right.confidence.total_cmp(&left.confidence));
+    candidates
 }
 
 fn score_column(role: &'static str, column: &ColumnMeta, values: &[String]) -> Option<Candidate> {
@@ -885,5 +931,76 @@ mod tests {
         assert_eq!(confirmed.role, "command_line");
         assert_eq!(confirmed.sql_name, "processcommandline");
         assert_eq!(confirmed.status, "confirmed");
+    }
+
+    #[test]
+    fn different_roles_never_claim_the_same_column() {
+        // "initiatingprocessfilename" is deliberately ambiguous - short .exe/.dll basenames like
+        // "powershell.exe" satisfy both the process_name and file_name content heuristics, and
+        // the header contains both "process" and "filename" keywords. Real-world wide exports
+        // (100+ columns) hit this constantly. process_name and file_name must each end up
+        // pointing at a distinct column, never silently sharing one.
+        let conn = Connection::open_in_memory().unwrap();
+        let columns = vec![
+            ColumnMeta {
+                sql_name: "timegenerated".into(),
+                original_name: "TimeGenerated".into(),
+                col_index: 0,
+                inferred_type: "text".into(),
+            },
+            ColumnMeta {
+                sql_name: "initiatingprocessfilename".into(),
+                original_name: "InitiatingProcessFileName".into(),
+                col_index: 1,
+                inferred_type: "text".into(),
+            },
+            ColumnMeta {
+                sql_name: "targetfilename".into(),
+                original_name: "TargetFileName".into(),
+                col_index: 2,
+                inferred_type: "text".into(),
+            },
+            ColumnMeta {
+                sql_name: "parentprocessname".into(),
+                original_name: "ParentProcessName".into(),
+                col_index: 3,
+                inferred_type: "text".into(),
+            },
+        ];
+        db::create_schema(&conn, &columns).unwrap();
+        let rows = [
+            (
+                "2026-01-01T02:30:00+02:00",
+                "powershell.exe",
+                r#"C:\Windows\Temp\dropped1.dat"#,
+                "explorer.exe",
+            ),
+            (
+                "2026-01-01T03:00:00+02:00",
+                "cmd.exe",
+                r#"C:\Windows\Temp\dropped2.dat"#,
+                "svchost.exe",
+            ),
+        ];
+        for (idx, row) in rows.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO rows (row_num, timegenerated, initiatingprocessfilename, targetfilename, parentprocessname)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![(idx as i64) + 1, row.0, row.1, row.2, row.3],
+            )
+            .unwrap();
+        }
+
+        let suggestions = detect_column_roles(&conn, &columns).unwrap();
+        let process_name = suggestions.iter().find(|row| row.role == "process_name");
+        let file_name = suggestions.iter().find(|row| row.role == "file_name");
+
+        if let (Some(process_name), Some(file_name)) = (process_name, file_name) {
+            assert_ne!(
+                process_name.sql_name, file_name.sql_name,
+                "process_name and file_name both claimed the same column: {}",
+                process_name.sql_name
+            );
+        }
     }
 }
