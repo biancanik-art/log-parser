@@ -1,0 +1,274 @@
+{
+  "schemaVersion": 1,
+  "generatedNote": "Static offline curated snapshot for a rough hosting/VPN/proxy-egress heuristic. This file was not generated from live reputation data, is not authoritative or complete, and will go stale. A match means the source IP falls inside a known cloud, hosting, CDN/proxy, or VPN-adjacent allocation; it does not prove VPN use or malicious activity.",
+  "ranges": [
+    {
+      "cidr": "173.245.48.0/20",
+      "label": "Cloudflare proxy/CDN edge"
+    },
+    {
+      "cidr": "103.21.244.0/22",
+      "label": "Cloudflare proxy/CDN edge"
+    },
+    {
+      "cidr": "103.22.200.0/22",
+      "label": "Cloudflare proxy/CDN edge"
+    },
+    {
+      "cidr": "103.31.4.0/22",
+      "label": "Cloudflare proxy/CDN edge"
+    },
+    {
+      "cidr": "141.101.64.0/18",
+      "label": "Cloudflare proxy/CDN edge"
+    },
+    {
+      "cidr": "108.162.192.0/18",
+      "label": "Cloudflare proxy/CDN edge"
+    },
+    {
+      "cidr": "190.93.240.0/20",
+      "label": "Cloudflare proxy/CDN edge"
+    },
+    {
+      "cidr": "188.114.96.0/20",
+      "label": "Cloudflare proxy/CDN edge"
+    },
+    {
+      "cidr": "197.234.240.0/22",
+      "label": "Cloudflare proxy/CDN edge"
+    },
+    {
+      "cidr": "198.41.128.0/17",
+      "label": "Cloudflare proxy/CDN edge"
+    },
+    {
+      "cidr": "162.158.0.0/15",
+      "label": "Cloudflare proxy/CDN edge"
+    },
+    {
+      "cidr": "104.16.0.0/13",
+      "label": "Cloudflare proxy/CDN edge"
+    },
+    {
+      "cidr": "104.24.0.0/14",
+      "label": "Cloudflare proxy/CDN edge"
+    },
+    {
+      "cidr": "172.64.0.0/13",
+      "label": "Cloudflare proxy/CDN edge"
+    },
+    {
+      "cidr": "131.0.72.0/22",
+      "label": "Cloudflare proxy/CDN edge"
+    },
+    {
+      "cidr": "151.101.0.0/16",
+      "label": "Fastly CDN/proxy edge"
+    },
+    {
+      "cidr": "104.131.0.0/16",
+      "label": "DigitalOcean hosting/VPS"
+    },
+    {
+      "cidr": "159.203.0.0/16",
+      "label": "DigitalOcean hosting/VPS"
+    },
+    {
+      "cidr": "167.71.0.0/16",
+      "label": "DigitalOcean hosting/VPS"
+    },
+    {
+      "cidr": "134.209.0.0/16",
+      "label": "DigitalOcean hosting/VPS"
+    },
+    {
+      "cidr": "178.128.0.0/16",
+      "label": "DigitalOcean hosting/VPS"
+    },
+    {
+      "cidr": "206.189.0.0/16",
+      "label": "DigitalOcean hosting/VPS"
+    },
+    {
+      "cidr": "5.9.0.0/16",
+      "label": "Hetzner hosting/VPS"
+    },
+    {
+      "cidr": "46.4.0.0/16",
+      "label": "Hetzner hosting/VPS"
+    },
+    {
+      "cidr": "78.46.0.0/15",
+      "label": "Hetzner hosting/VPS"
+    },
+    {
+      "cidr": "88.198.0.0/16",
+      "label": "Hetzner hosting/VPS"
+    },
+    {
+      "cidr": "138.201.0.0/16",
+      "label": "Hetzner hosting/VPS"
+    },
+    {
+      "cidr": "144.76.0.0/16",
+      "label": "Hetzner hosting/VPS"
+    },
+    {
+      "cidr": "159.69.0.0/16",
+      "label": "Hetzner hosting/VPS"
+    },
+    {
+      "cidr": "51.68.0.0/16",
+      "label": "OVHcloud hosting/VPS"
+    },
+    {
+      "cidr": "51.75.0.0/16",
+      "label": "OVHcloud hosting/VPS"
+    },
+    {
+      "cidr": "51.77.0.0/16",
+      "label": "OVHcloud hosting/VPS"
+    },
+    {
+      "cidr": "54.36.0.0/16",
+      "label": "OVHcloud hosting/VPS"
+    },
+    {
+      "cidr": "91.121.0.0/16",
+      "label": "OVHcloud hosting/VPS"
+    },
+    {
+      "cidr": "149.202.0.0/16",
+      "label": "OVHcloud hosting/VPS"
+    },
+    {
+      "cidr": "188.165.0.0/16",
+      "label": "OVHcloud hosting/VPS"
+    },
+    {
+      "cidr": "45.32.0.0/16",
+      "label": "Vultr/Choopa hosting/VPS"
+    },
+    {
+      "cidr": "45.63.0.0/16",
+      "label": "Vultr/Choopa hosting/VPS"
+    },
+    {
+      "cidr": "108.61.0.0/16",
+      "label": "Vultr/Choopa hosting/VPS"
+    },
+    {
+      "cidr": "149.28.0.0/16",
+      "label": "Vultr/Choopa hosting/VPS"
+    },
+    {
+      "cidr": "207.246.64.0/18",
+      "label": "Vultr/Choopa hosting/VPS"
+    },
+    {
+      "cidr": "45.33.0.0/16",
+      "label": "Linode/Akamai cloud hosting"
+    },
+    {
+      "cidr": "45.56.0.0/16",
+      "label": "Linode/Akamai cloud hosting"
+    },
+    {
+      "cidr": "96.126.96.0/19",
+      "label": "Linode/Akamai cloud hosting"
+    },
+    {
+      "cidr": "173.255.192.0/18",
+      "label": "Linode/Akamai cloud hosting"
+    },
+    {
+      "cidr": "198.58.96.0/19",
+      "label": "Linode/Akamai cloud hosting"
+    },
+    {
+      "cidr": "35.184.0.0/13",
+      "label": "Google Cloud hosting"
+    },
+    {
+      "cidr": "35.192.0.0/12",
+      "label": "Google Cloud hosting"
+    },
+    {
+      "cidr": "35.208.0.0/12",
+      "label": "Google Cloud hosting"
+    },
+    {
+      "cidr": "35.224.0.0/12",
+      "label": "Google Cloud hosting"
+    },
+    {
+      "cidr": "104.196.0.0/14",
+      "label": "Google Cloud hosting"
+    },
+    {
+      "cidr": "130.211.0.0/22",
+      "label": "Google Cloud hosting"
+    },
+    {
+      "cidr": "34.192.0.0/10",
+      "label": "AWS hosting/cloud"
+    },
+    {
+      "cidr": "35.160.0.0/13",
+      "label": "AWS hosting/cloud"
+    },
+    {
+      "cidr": "52.84.0.0/15",
+      "label": "AWS CloudFront/cloud edge"
+    },
+    {
+      "cidr": "52.216.0.0/15",
+      "label": "AWS S3/cloud"
+    },
+    {
+      "cidr": "54.240.0.0/12",
+      "label": "AWS hosting/cloud"
+    },
+    {
+      "cidr": "13.64.0.0/11",
+      "label": "Microsoft Azure hosting/cloud approximate broad block"
+    },
+    {
+      "cidr": "40.64.0.0/10",
+      "label": "Microsoft Azure hosting/cloud approximate broad block"
+    },
+    {
+      "cidr": "52.224.0.0/11",
+      "label": "Microsoft Azure hosting/cloud approximate broad block"
+    },
+    {
+      "cidr": "104.40.0.0/13",
+      "label": "Microsoft Azure hosting/cloud approximate broad block"
+    },
+    {
+      "cidr": "5.79.0.0/16",
+      "label": "Leaseweb hosting/VPS"
+    },
+    {
+      "cidr": "37.48.64.0/18",
+      "label": "Leaseweb hosting/VPS"
+    },
+    {
+      "cidr": "85.17.0.0/16",
+      "label": "Leaseweb hosting/VPS"
+    },
+    {
+      "cidr": "95.211.0.0/16",
+      "label": "Leaseweb hosting/VPS"
+    },
+    {
+      "cidr": "178.162.128.0/17",
+      "label": "Leaseweb hosting/VPS"
+    },
+    {
+      "cidr": "89.187.160.0/19",
+      "label": "M247 hosting/VPN-adjacent infrastructure"
+    }
+  ]
+}

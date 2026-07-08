@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>log-parser</title>
+  <link rel="stylesheet" href="vendor/tabulator/tabulator.min.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div id="app">
+    <header id="toolbar">
+      <button id="open-file-btn" class="btn btn-primary">Open File…</button>
+      <div id="file-info" class="file-info">No file loaded</div>
+      <div class="toolbar-spacer"></div>
+      <input id="search-box" type="search" placeholder="Search all columns…" disabled />
+      <form id="guided-search-form" class="guided-search-form">
+        <label for="guided-search-box" class="guided-search-label">Ask (offline, no AI)</label>
+        <input id="guided-search-box" type="search" placeholder="show credential access for alice chronologically" disabled />
+        <button id="guided-search-submit" class="btn" disabled>Preview</button>
+      </form>
+      <button id="report-export-btn" class="btn" disabled>Generate Report</button>
+      <button id="export-csv-btn" class="btn" disabled>Export CSV</button>
+      <button id="export-xlsx-btn" class="btn" disabled>Export Excel</button>
+    </header>
+
+    <div id="progress-bar-wrap" class="hidden">
+      <div id="progress-bar"><div id="progress-fill"></div></div>
+      <div id="progress-label"></div>
+    </div>
+
+    <section id="guided-query-panel" class="intel-panel hidden">
+      <div class="intel-panel-header">
+        <strong>Guided search preview</strong>
+        <button id="guided-panel-close" class="btn btn-small" title="Dismiss preview">&times;</button>
+      </div>
+      <div id="guided-preview-text" class="intel-panel-body"></div>
+      <div id="guided-clarification" class="intel-panel-note hidden"></div>
+      <div class="intel-panel-actions">
+        <button id="guided-run-btn" class="btn btn-primary hidden">Run</button>
+        <button id="guided-reset-btn" class="btn hidden">Return to filters</button>
+      </div>
+    </section>
+
+    <section id="role-review-panel" class="intel-panel hidden">
+      <div class="intel-panel-header">
+        <strong>Column role review</strong>
+        <button id="role-panel-close" class="btn btn-small" title="Dismiss role review">&times;</button>
+      </div>
+      <div id="role-list" class="role-list"></div>
+      <div id="role-panel-status" class="intel-panel-note"></div>
+    </section>
+
+    <section id="timezone-panel" class="intel-panel hidden">
+      <div class="intel-panel-header">
+        <strong>Timestamp timezone</strong>
+        <button id="timezone-panel-close" class="btn btn-small" title="Dismiss timezone prompt">&times;</button>
+      </div>
+      <div id="timezone-summary" class="intel-panel-body"></div>
+      <div id="timezone-samples" class="intel-panel-note hidden"></div>
+      <div class="timezone-controls">
+        <input id="timezone-input" type="text" placeholder="UTC offset or IANA timezone, e.g. +02:00 or Europe/Bucharest" />
+        <button id="timezone-utc-btn" class="btn">Already UTC</button>
+        <button id="timezone-normalize-btn" class="btn btn-primary">Normalize</button>
+      </div>
+    </section>
+
+    <section id="report-summary-panel" class="intel-panel hidden">
+      <div class="intel-panel-header">
+        <strong>Report export</strong>
+        <button id="report-summary-close" class="btn btn-small" title="Dismiss report summary">&times;</button>
+      </div>
+      <div id="report-summary-text" class="intel-panel-body"></div>
+    </section>
+
+    <div id="sheet-picker" class="hidden">
+      <label for="sheet-select">This workbook has multiple sheets — pick one:</label>
+      <select id="sheet-select"></select>
+      <button id="sheet-load-btn" class="btn btn-primary">Load Sheet</button>
+    </div>
+
+    <main id="main-area">
+      <aside id="sidebar">
+        <div class="sidebar-section">
+          <h3>Sort</h3>
+          <select id="sort-column"><option value="">(row order)</option></select>
+          <select id="sort-direction">
+            <option value="asc">Ascending</option>
+            <option value="desc">Descending</option>
+          </select>
+        </div>
+
+        <div class="sidebar-section">
+          <h3>Filters</h3>
+          <div id="filter-list"></div>
+          <button id="add-filter-btn" class="btn btn-small" disabled>+ Add filter</button>
+        </div>
+
+        <div class="sidebar-section">
+          <button id="apply-btn" class="btn btn-primary" disabled>Apply</button>
+          <button id="clear-btn" class="btn" disabled>Clear all</button>
+        </div>
+
+        <div class="sidebar-section">
+          <h3>Intel</h3>
+          <button id="suspicious-scan-btn" class="btn btn-primary" disabled>Scan suspicious</button>
+          <div id="evidence-columns-label" class="sidebar-note">Confirm evidence roles first.</div>
+          <div id="intel-scan-summary" class="scan-summary"></div>
+        </div>
+      </aside>
+
+      <section id="grid-area">
+        <div id="grid"></div>
+        <footer id="status-bar">
+          <span id="row-count-label">—</span>
+          <div class="toolbar-spacer"></div>
+          <button id="prev-page-btn" class="btn btn-small" disabled>&laquo; Prev</button>
+          <span id="page-label"></span>
+          <button id="next-page-btn" class="btn btn-small" disabled>Next &raquo;</button>
+        </footer>
+      </section>
+    </main>
+  </div>
+
+  <template id="filter-row-template">
+    <div class="filter-row">
+      <select class="filter-column"></select>
+      <select class="filter-op">
+        <option value="contains">contains</option>
+        <option value="notContains">doesn't contain</option>
+        <option value="equals">equals</option>
+        <option value="notEquals">not equals</option>
+        <option value="startsWith">starts with</option>
+        <option value="endsWith">ends with</option>
+        <option value="greaterThan">&gt; (numeric)</option>
+        <option value="lessThan">&lt; (numeric)</option>
+        <option value="isEmpty">is empty</option>
+        <option value="isNotEmpty">is not empty</option>
+      </select>
+      <input class="filter-value" type="text" placeholder="value" />
+      <button class="btn btn-small filter-remove-btn" title="Remove filter">&times;</button>
+    </div>
+  </template>
+
+  <script src="vendor/tabulator/tabulator.min.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

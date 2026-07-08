@@ -1,0 +1,7 @@
+/src-tauri/target/
+/testdata/*.xlsx
+!/testdata/sentinel_sample_120k.xlsx
+!/testdata/multi_sheet_sample.xlsx
+
+*.md
+!/README.md

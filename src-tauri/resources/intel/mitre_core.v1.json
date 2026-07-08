@@ -1,0 +1,1590 @@
+{
+  "schemaVersion": 1,
+  "libraryId": "mitre_core_v1",
+  "techniques": [
+    {
+      "techniqueId": "T1566.001",
+      "name": "Phishing: Spearphishing Attachment",
+      "tactics": [
+        {
+          "id": "TA0001",
+          "name": "Initial Access"
+        }
+      ],
+      "aliases": [
+        "phishing attachment",
+        "malicious attachment",
+        "spearphishing attachment"
+      ],
+      "keywords": [
+        {
+          "id": "t1566_001_lnk_zone_identifier",
+          "pattern": ".lnk:zone.identifier",
+          "match": "substring",
+          "columns": [
+            "file_name",
+            "text_evidence"
+          ],
+          "score": 70
+        },
+        {
+          "id": "t1566_001_iso_zone_identifier",
+          "pattern": ".iso:zone.identifier",
+          "match": "substring",
+          "columns": [
+            "file_name",
+            "text_evidence"
+          ],
+          "score": 70
+        }
+      ]
+    },
+    {
+      "techniqueId": "T1566.002",
+      "name": "Phishing: Spearphishing Link",
+      "tactics": [
+        {
+          "id": "TA0001",
+          "name": "Initial Access"
+        }
+      ],
+      "aliases": [
+        "phishing link",
+        "malicious link",
+        "spearphishing link"
+      ],
+      "keywords": [
+        {
+          "id": "t1566_002_msdt_uri",
+          "pattern": "ms-msdt:/id pcwdiagnostic",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 85
+        },
+        {
+          "id": "t1566_002_search_ms_uri",
+          "pattern": "search-ms:query=",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 75
+        }
+      ]
+    },
+    {
+      "techniqueId": "T1059.001",
+      "name": "Command and Scripting Interpreter: PowerShell",
+      "tactics": [
+        {
+          "id": "TA0002",
+          "name": "Execution"
+        }
+      ],
+      "aliases": [
+        "powershell",
+        "encoded powershell",
+        "powershell download cradle"
+      ],
+      "keywords": [
+        {
+          "id": "t1059_001_powershell_enc",
+          "pattern": "powershell -enc",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 85
+        },
+        {
+          "id": "t1059_001_powershell_exe_enc",
+          "pattern": "powershell.exe -enc",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 85
+        },
+        {
+          "id": "t1059_001_encodedcommand",
+          "pattern": "powershell.exe -encodedcommand",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 85
+        },
+        {
+          "id": "t1059_001_webclient_downloadstring",
+          "pattern": "new-object net.webclient).downloadstring",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 80
+        }
+      ]
+    },
+    {
+      "techniqueId": "T1059.003",
+      "name": "Command and Scripting Interpreter: Windows Command Shell",
+      "tactics": [
+        {
+          "id": "TA0002",
+          "name": "Execution"
+        }
+      ],
+      "aliases": [
+        "cmd",
+        "windows command shell",
+        "cmd shell"
+      ],
+      "keywords": [
+        {
+          "id": "t1059_003_cmd_powershell_chain",
+          "pattern": "cmd.exe /c powershell",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 65
+        }
+      ]
+    },
+    {
+      "techniqueId": "T1059.005",
+      "name": "Command and Scripting Interpreter: Visual Basic",
+      "tactics": [
+        {
+          "id": "TA0002",
+          "name": "Execution"
+        }
+      ],
+      "aliases": [
+        "vbscript",
+        "wscript",
+        "cscript"
+      ],
+      "keywords": [
+        {
+          "id": "t1059_005_wscript_vbscript_engine",
+          "pattern": "wscript.exe //e:vbscript",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "process_name",
+            "text_evidence"
+          ],
+          "score": 70
+        }
+      ]
+    },
+    {
+      "techniqueId": "T1047",
+      "name": "Windows Management Instrumentation",
+      "tactics": [
+        {
+          "id": "TA0002",
+          "name": "Execution"
+        },
+        {
+          "id": "TA0008",
+          "name": "Lateral Movement"
+        }
+      ],
+      "aliases": [
+        "wmi execution",
+        "wmic remote execution",
+        "wmic process create"
+      ],
+      "keywords": [
+        {
+          "id": "t1047_wmic_process_call_create",
+          "pattern": "wmic process call create",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 80
+        },
+        {
+          "id": "t1047_wmic_exe_process_call_create",
+          "pattern": "wmic.exe process call create",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 80
+        },
+        {
+          "id": "t1047_wmic_node_process_create",
+          "pattern": "wmic /node:",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 80
+        }
+      ]
+    },
+    {
+      "techniqueId": "T1204.002",
+      "name": "User Execution: Malicious File",
+      "tactics": [
+        {
+          "id": "TA0002",
+          "name": "Execution"
+        }
+      ],
+      "aliases": [
+        "malicious file execution",
+        "user execution",
+        "office dde"
+      ],
+      "keywords": [
+        {
+          "id": "t1204_002_excel_dde",
+          "pattern": "excel.exe /dde",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "process_name",
+            "text_evidence"
+          ],
+          "score": 60
+        }
+      ]
+    },
+    {
+      "techniqueId": "T1218.005",
+      "name": "Signed Binary Proxy Execution: Mshta",
+      "tactics": [
+        {
+          "id": "TA0005",
+          "name": "Defense Evasion"
+        }
+      ],
+      "aliases": [
+        "mshta",
+        "mshta execution",
+        "html application proxy execution"
+      ],
+      "keywords": [
+        {
+          "id": "t1218_005_mshta_http",
+          "pattern": "mshta.exe http",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "process_name",
+            "text_evidence"
+          ],
+          "score": 80
+        }
+      ]
+    },
+    {
+      "techniqueId": "T1218.010",
+      "name": "Signed Binary Proxy Execution: Regsvr32",
+      "tactics": [
+        {
+          "id": "TA0005",
+          "name": "Defense Evasion"
+        }
+      ],
+      "aliases": [
+        "regsvr32",
+        "squiblydoo",
+        "regsvr32 scriptlet"
+      ],
+      "keywords": [
+        {
+          "id": "t1218_010_regsvr32_remote_scriptlet",
+          "pattern": "regsvr32.exe /s /n /u /i:http",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "process_name",
+            "text_evidence"
+          ],
+          "score": 90
+        }
+      ]
+    },
+    {
+      "techniqueId": "T1218.011",
+      "name": "Signed Binary Proxy Execution: Rundll32",
+      "tactics": [
+        {
+          "id": "TA0005",
+          "name": "Defense Evasion"
+        }
+      ],
+      "aliases": [
+        "rundll32",
+        "rundll32 javascript",
+        "rundll32 proxy execution"
+      ],
+      "keywords": [
+        {
+          "id": "t1218_011_rundll32_javascript",
+          "pattern": "rundll32.exe javascript:",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "process_name",
+            "text_evidence"
+          ],
+          "score": 90
+        }
+      ]
+    },
+    {
+      "techniqueId": "T1053.005",
+      "name": "Scheduled Task/Job: Scheduled Task",
+      "tactics": [
+        {
+          "id": "TA0002",
+          "name": "Execution"
+        },
+        {
+          "id": "TA0003",
+          "name": "Persistence"
+        },
+        {
+          "id": "TA0004",
+          "name": "Privilege Escalation"
+        }
+      ],
+      "aliases": [
+        "scheduled task",
+        "schtasks persistence",
+        "scheduled job"
+      ],
+      "keywords": [
+        {
+          "id": "t1053_005_schtasks_create",
+          "pattern": "schtasks /create",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 70
+        },
+        {
+          "id": "t1053_005_register_scheduledtask",
+          "pattern": "register-scheduledtask",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 70
+        }
+      ]
+    },
+    {
+      "techniqueId": "T1547.001",
+      "name": "Boot or Logon Autostart Execution: Registry Run Keys / Startup Folder",
+      "tactics": [
+        {
+          "id": "TA0003",
+          "name": "Persistence"
+        },
+        {
+          "id": "TA0004",
+          "name": "Privilege Escalation"
+        }
+      ],
+      "aliases": [
+        "run key",
+        "registry run key",
+        "startup folder persistence"
+      ],
+      "keywords": [
+        {
+          "id": "t1547_001_hkcu_run_key",
+          "pattern": "reg add hkcu\\software\\microsoft\\windows\\currentversion\\run",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 75
+        },
+        {
+          "id": "t1547_001_hklm_run_key",
+          "pattern": "reg add hklm\\software\\microsoft\\windows\\currentversion\\run",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 75
+        }
+      ]
+    },
+    {
+      "techniqueId": "T1543.003",
+      "name": "Create or Modify System Process: Windows Service",
+      "tactics": [
+        {
+          "id": "TA0003",
+          "name": "Persistence"
+        },
+        {
+          "id": "TA0004",
+          "name": "Privilege Escalation"
+        }
+      ],
+      "aliases": [
+        "windows service",
+        "new service",
+        "service persistence"
+      ],
+      "keywords": [
+        {
+          "id": "t1543_003_sc_create",
+          "pattern": "sc.exe create",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 70
+        },
+        {
+          "id": "t1543_003_new_service",
+          "pattern": "new-service -name",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 70
+        }
+      ]
+    },
+    {
+      "techniqueId": "T1548.002",
+      "name": "Abuse Elevation Control Mechanism: Bypass User Account Control",
+      "tactics": [
+        {
+          "id": "TA0004",
+          "name": "Privilege Escalation"
+        },
+        {
+          "id": "TA0005",
+          "name": "Defense Evasion"
+        }
+      ],
+      "aliases": [
+        "uac bypass",
+        "fodhelper bypass",
+        "bypass user account control"
+      ],
+      "keywords": [
+        {
+          "id": "t1548_002_fodhelper_ms_settings",
+          "pattern": "hkcu\\software\\classes\\ms-settings\\shell\\open\\command",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 85
+        },
+        {
+          "id": "t1548_002_delegateexecute",
+          "pattern": "delegateexecute",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 70
+        }
+      ]
+    },
+    {
+      "techniqueId": "T1134.001",
+      "name": "Access Token Manipulation: Token Impersonation/Theft",
+      "tactics": [
+        {
+          "id": "TA0004",
+          "name": "Privilege Escalation"
+        },
+        {
+          "id": "TA0005",
+          "name": "Defense Evasion"
+        }
+      ],
+      "aliases": [
+        "token impersonation",
+        "potato exploit",
+        "printspoofer"
+      ],
+      "keywords": [
+        {
+          "id": "t1134_001_printspoofer",
+          "pattern": "printspoofer.exe",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "process_name",
+            "file_name",
+            "text_evidence"
+          ],
+          "score": 95
+        },
+        {
+          "id": "t1134_001_juicypotato",
+          "pattern": "juicypotato.exe",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "process_name",
+            "file_name",
+            "text_evidence"
+          ],
+          "score": 90
+        }
+      ]
+    },
+    {
+      "techniqueId": "T1140",
+      "name": "Deobfuscate/Decode Files or Information",
+      "tactics": [
+        {
+          "id": "TA0005",
+          "name": "Defense Evasion"
+        }
+      ],
+      "aliases": [
+        "decode",
+        "certutil decode",
+        "deobfuscate"
+      ],
+      "keywords": [
+        {
+          "id": "t1140_certutil_decode",
+          "pattern": "certutil -decode",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 75
+        },
+        {
+          "id": "t1140_certutil_exe_decode",
+          "pattern": "certutil.exe -decode",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 75
+        },
+        {
+          "id": "t1140_certutil_decodehex",
+          "pattern": "certutil -decodehex",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 75
+        }
+      ]
+    },
+    {
+      "techniqueId": "T1070.001",
+      "name": "Indicator Removal on Host: Clear Windows Event Logs",
+      "tactics": [
+        {
+          "id": "TA0005",
+          "name": "Defense Evasion"
+        }
+      ],
+      "aliases": [
+        "clear event logs",
+        "wevtutil clear",
+        "event log clearing"
+      ],
+      "keywords": [
+        {
+          "id": "t1070_001_wevtutil_cl",
+          "pattern": "wevtutil cl",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 85
+        },
+        {
+          "id": "t1070_001_clear_eventlog",
+          "pattern": "clear-eventlog",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 85
+        }
+      ]
+    },
+    {
+      "techniqueId": "T1562.001",
+      "name": "Impair Defenses: Disable or Modify Tools",
+      "tactics": [
+        {
+          "id": "TA0005",
+          "name": "Defense Evasion"
+        }
+      ],
+      "aliases": [
+        "disable defender",
+        "impair defenses",
+        "antivirus exclusion"
+      ],
+      "keywords": [
+        {
+          "id": "t1562_001_defender_disable_realtime",
+          "pattern": "set-mppreference -disablerealtimemonitoring $true",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 90
+        },
+        {
+          "id": "t1562_001_defender_exclusion",
+          "pattern": "add-mppreference -exclusionpath",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 80
+        },
+        {
+          "id": "t1562_001_stop_windefend",
+          "pattern": "sc stop windefend",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 80
+        }
+      ]
+    },
+    {
+      "techniqueId": "T1027",
+      "name": "Obfuscated Files or Information",
+      "tactics": [
+        {
+          "id": "TA0005",
+          "name": "Defense Evasion"
+        }
+      ],
+      "aliases": [
+        "obfuscation",
+        "encoded command",
+        "invoke obfuscation"
+      ],
+      "keywords": [
+        {
+          "id": "t1027_powershell_hidden_encoded",
+          "pattern": "-nop -w hidden -enc",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 90
+        },
+        {
+          "id": "t1027_frombase64string",
+          "pattern": "frombase64string(",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 75
+        }
+      ]
+    },
+    {
+      "techniqueId": "T1003.001",
+      "name": "OS Credential Dumping: LSASS Memory",
+      "tactics": [
+        {
+          "id": "TA0006",
+          "name": "Credential Access"
+        }
+      ],
+      "aliases": [
+        "credential dumping",
+        "lsass dumping",
+        "mimikatz"
+      ],
+      "keywords": [
+        {
+          "id": "t1003_001_mimikatz",
+          "pattern": "mimikatz",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "process_name",
+            "file_name",
+            "text_evidence"
+          ],
+          "score": 95
+        },
+        {
+          "id": "t1003_001_sekurlsa_logonpasswords",
+          "pattern": "sekurlsa::logonpasswords",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 95
+        },
+        {
+          "id": "t1003_001_procdump_lsass",
+          "pattern": "procdump.exe -ma lsass",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "process_name",
+            "text_evidence"
+          ],
+          "score": 90
+        },
+        {
+          "id": "t1003_001_comsvcs_minidump",
+          "pattern": "comsvcs.dll, minidump",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 90
+        }
+      ]
+    },
+    {
+      "techniqueId": "T1003.003",
+      "name": "OS Credential Dumping: NTDS",
+      "tactics": [
+        {
+          "id": "TA0006",
+          "name": "Credential Access"
+        }
+      ],
+      "aliases": [
+        "ntds dump",
+        "ntdsutil",
+        "domain credential dumping"
+      ],
+      "keywords": [
+        {
+          "id": "t1003_003_ntdsutil_ifm",
+          "pattern": "ntdsutil ifm",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 85
+        }
+      ]
+    },
+    {
+      "techniqueId": "T1003.006",
+      "name": "OS Credential Dumping: DCSync",
+      "tactics": [
+        {
+          "id": "TA0006",
+          "name": "Credential Access"
+        }
+      ],
+      "aliases": [
+        "dcsync",
+        "secretsdump",
+        "replication credential dumping"
+      ],
+      "keywords": [
+        {
+          "id": "t1003_006_lsadump_dcsync",
+          "pattern": "lsadump::dcsync",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 95
+        },
+        {
+          "id": "t1003_006_secretsdump",
+          "pattern": "secretsdump.py",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "process_name",
+            "file_name",
+            "text_evidence"
+          ],
+          "score": 90
+        }
+      ]
+    },
+    {
+      "techniqueId": "T1555",
+      "name": "Credentials from Password Stores",
+      "tactics": [
+        {
+          "id": "TA0006",
+          "name": "Credential Access"
+        }
+      ],
+      "aliases": [
+        "password store",
+        "browser credential theft",
+        "lazagne"
+      ],
+      "keywords": [
+        {
+          "id": "t1555_lazagne",
+          "pattern": "lazagne.exe",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "process_name",
+            "file_name",
+            "text_evidence"
+          ],
+          "score": 90
+        }
+      ]
+    },
+    {
+      "techniqueId": "T1033",
+      "name": "System Owner/User Discovery",
+      "tactics": [
+        {
+          "id": "TA0007",
+          "name": "Discovery"
+        }
+      ],
+      "aliases": [
+        "user discovery",
+        "whoami",
+        "current user"
+      ],
+      "keywords": [
+        {
+          "id": "t1033_whoami_all",
+          "pattern": "whoami /all",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 55
+        }
+      ]
+    },
+    {
+      "techniqueId": "T1087.002",
+      "name": "Account Discovery: Domain Account",
+      "tactics": [
+        {
+          "id": "TA0007",
+          "name": "Discovery"
+        }
+      ],
+      "aliases": [
+        "account discovery",
+        "domain account discovery",
+        "domain admins discovery"
+      ],
+      "keywords": [
+        {
+          "id": "t1087_002_net_user_domain",
+          "pattern": "net user /domain",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 60
+        },
+        {
+          "id": "t1087_002_domain_admins",
+          "pattern": "net group \"domain admins\" /domain",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 65
+        }
+      ]
+    },
+    {
+      "techniqueId": "T1482",
+      "name": "Domain Trust Discovery",
+      "tactics": [
+        {
+          "id": "TA0007",
+          "name": "Discovery"
+        }
+      ],
+      "aliases": [
+        "domain trust discovery",
+        "nltest trusts",
+        "trust enumeration"
+      ],
+      "keywords": [
+        {
+          "id": "t1482_nltest_domain_trusts",
+          "pattern": "nltest /domain_trusts",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 65
+        }
+      ]
+    },
+    {
+      "techniqueId": "T1016",
+      "name": "System Network Configuration Discovery",
+      "tactics": [
+        {
+          "id": "TA0007",
+          "name": "Discovery"
+        }
+      ],
+      "aliases": [
+        "network configuration discovery",
+        "ipconfig",
+        "route discovery"
+      ],
+      "keywords": [
+        {
+          "id": "t1016_ipconfig_all",
+          "pattern": "ipconfig /all",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 50
+        },
+        {
+          "id": "t1016_route_print",
+          "pattern": "route print",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 50
+        }
+      ]
+    },
+    {
+      "techniqueId": "T1049",
+      "name": "System Network Connections Discovery",
+      "tactics": [
+        {
+          "id": "TA0007",
+          "name": "Discovery"
+        }
+      ],
+      "aliases": [
+        "network connections discovery",
+        "netstat",
+        "connection enumeration"
+      ],
+      "keywords": [
+        {
+          "id": "t1049_netstat_ano",
+          "pattern": "netstat -ano",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 50
+        }
+      ]
+    },
+    {
+      "techniqueId": "T1021.002",
+      "name": "Remote Services: SMB/Windows Admin Shares",
+      "tactics": [
+        {
+          "id": "TA0008",
+          "name": "Lateral Movement"
+        }
+      ],
+      "aliases": [
+        "psexec",
+        "admin shares",
+        "smb lateral movement"
+      ],
+      "keywords": [
+        {
+          "id": "t1021_002_psexec",
+          "pattern": "psexec.exe",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "process_name",
+            "file_name",
+            "text_evidence"
+          ],
+          "score": 90
+        },
+        {
+          "id": "t1021_002_smbexec",
+          "pattern": "smbexec.py",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "process_name",
+            "file_name",
+            "text_evidence"
+          ],
+          "score": 90
+        }
+      ]
+    },
+    {
+      "techniqueId": "T1021.006",
+      "name": "Remote Services: Windows Remote Management",
+      "tactics": [
+        {
+          "id": "TA0008",
+          "name": "Lateral Movement"
+        }
+      ],
+      "aliases": [
+        "winrm",
+        "evil-winrm",
+        "remote powershell"
+      ],
+      "keywords": [
+        {
+          "id": "t1021_006_evil_winrm",
+          "pattern": "evil-winrm",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "process_name",
+            "file_name",
+            "text_evidence"
+          ],
+          "score": 90
+        },
+        {
+          "id": "t1021_006_enter_pssession",
+          "pattern": "enter-pssession -computername",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 75
+        }
+      ]
+    },
+    {
+      "techniqueId": "T1569.002",
+      "name": "System Services: Service Execution",
+      "tactics": [
+        {
+          "id": "TA0002",
+          "name": "Execution"
+        },
+        {
+          "id": "TA0008",
+          "name": "Lateral Movement"
+        }
+      ],
+      "aliases": [
+        "service execution",
+        "remote service execution",
+        "psexesvc"
+      ],
+      "keywords": [
+        {
+          "id": "t1569_002_remote_sc_create",
+          "pattern": "sc.exe \\\\",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 70
+        },
+        {
+          "id": "t1569_002_psexesvc",
+          "pattern": "psexesvc",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "process_name",
+            "file_name",
+            "text_evidence"
+          ],
+          "score": 80
+        }
+      ]
+    },
+    {
+      "techniqueId": "T1560.001",
+      "name": "Archive Collected Data: Archive via Utility",
+      "tactics": [
+        {
+          "id": "TA0009",
+          "name": "Collection"
+        }
+      ],
+      "aliases": [
+        "archive collected data",
+        "7zip staging",
+        "rar staging"
+      ],
+      "keywords": [
+        {
+          "id": "t1560_001_7z_password_archive",
+          "pattern": "7z.exe a -p",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "process_name",
+            "text_evidence"
+          ],
+          "score": 75
+        },
+        {
+          "id": "t1560_001_rar_password_archive",
+          "pattern": "rar.exe a -hp",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "process_name",
+            "text_evidence"
+          ],
+          "score": 75
+        }
+      ]
+    },
+    {
+      "techniqueId": "T1119",
+      "name": "Automated Collection",
+      "tactics": [
+        {
+          "id": "TA0009",
+          "name": "Collection"
+        }
+      ],
+      "aliases": [
+        "automated collection",
+        "bulk file collection",
+        "robocopy collection"
+      ],
+      "keywords": [
+        {
+          "id": "t1119_robocopy_mir",
+          "pattern": "robocopy /mir",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 55
+        }
+      ]
+    },
+    {
+      "techniqueId": "T1113",
+      "name": "Screen Capture",
+      "tactics": [
+        {
+          "id": "TA0009",
+          "name": "Collection"
+        }
+      ],
+      "aliases": [
+        "screen capture",
+        "screenshot",
+        "nircmd screenshot"
+      ],
+      "keywords": [
+        {
+          "id": "t1113_nircmd_savescreenshot",
+          "pattern": "nircmd.exe savescreenshot",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "process_name",
+            "text_evidence"
+          ],
+          "score": 75
+        }
+      ]
+    },
+    {
+      "techniqueId": "T1105",
+      "name": "Ingress Tool Transfer",
+      "tactics": [
+        {
+          "id": "TA0011",
+          "name": "Command and Control"
+        }
+      ],
+      "aliases": [
+        "tool transfer",
+        "download cradle",
+        "certutil download"
+      ],
+      "keywords": [
+        {
+          "id": "t1105_certutil_urlcache",
+          "pattern": "urlcache -f http",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 85
+        },
+        {
+          "id": "t1105_bitsadmin_http_transfer",
+          "pattern": "bitsadmin /transfer http",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 80
+        },
+        {
+          "id": "t1105_invoke_webrequest_http",
+          "pattern": "invoke-webrequest http",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 70
+        }
+      ]
+    },
+    {
+      "techniqueId": "T1071.001",
+      "name": "Application Layer Protocol: Web Protocols",
+      "tactics": [
+        {
+          "id": "TA0011",
+          "name": "Command and Control"
+        }
+      ],
+      "aliases": [
+        "web c2",
+        "http c2",
+        "cobalt strike"
+      ],
+      "keywords": [
+        {
+          "id": "t1071_001_cobalt_strike",
+          "pattern": "cobalt strike",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "process_name",
+            "file_name",
+            "text_evidence"
+          ],
+          "score": 95
+        },
+        {
+          "id": "t1071_001_beacon_exe",
+          "pattern": "beacon.exe",
+          "match": "word",
+          "columns": [
+            "command_line",
+            "process_name",
+            "file_name",
+            "text_evidence"
+          ],
+          "score": 85
+        }
+      ]
+    },
+    {
+      "techniqueId": "T1572",
+      "name": "Protocol Tunneling",
+      "tactics": [
+        {
+          "id": "TA0011",
+          "name": "Command and Control"
+        }
+      ],
+      "aliases": [
+        "tunneling",
+        "chisel",
+        "ngrok tunnel"
+      ],
+      "keywords": [
+        {
+          "id": "t1572_chisel_client",
+          "pattern": "chisel.exe client",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "process_name",
+            "text_evidence"
+          ],
+          "score": 85
+        },
+        {
+          "id": "t1572_ngrok_tcp",
+          "pattern": "ngrok.exe tcp",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "process_name",
+            "text_evidence"
+          ],
+          "score": 75
+        }
+      ]
+    },
+    {
+      "techniqueId": "T1567.002",
+      "name": "Exfiltration Over Web Service: Exfiltration to Cloud Storage",
+      "tactics": [
+        {
+          "id": "TA0010",
+          "name": "Exfiltration"
+        }
+      ],
+      "aliases": [
+        "cloud exfiltration",
+        "rclone exfiltration",
+        "cloud storage exfil"
+      ],
+      "keywords": [
+        {
+          "id": "t1567_002_rclone_copy",
+          "pattern": "rclone copy",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "process_name",
+            "text_evidence"
+          ],
+          "score": 85
+        },
+        {
+          "id": "t1567_002_rclone_sync",
+          "pattern": "rclone sync",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "process_name",
+            "text_evidence"
+          ],
+          "score": 85
+        }
+      ]
+    },
+    {
+      "techniqueId": "T1048.003",
+      "name": "Exfiltration Over Alternative Protocol: Exfiltration Over Unencrypted Non-C2 Protocol",
+      "tactics": [
+        {
+          "id": "TA0010",
+          "name": "Exfiltration"
+        }
+      ],
+      "aliases": [
+        "curl upload",
+        "wget post file",
+        "winscp exfiltration"
+      ],
+      "keywords": [
+        {
+          "id": "t1048_003_curl_upload",
+          "pattern": "curl.exe -t",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "process_name",
+            "text_evidence"
+          ],
+          "score": 75
+        },
+        {
+          "id": "t1048_003_wget_post_file",
+          "pattern": "wget --post-file",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "process_name",
+            "text_evidence"
+          ],
+          "score": 75
+        },
+        {
+          "id": "t1048_003_winscp_script",
+          "pattern": "winscp.com /script",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "process_name",
+            "text_evidence"
+          ],
+          "score": 75
+        }
+      ]
+    },
+    {
+      "techniqueId": "T1490",
+      "name": "Inhibit System Recovery",
+      "tactics": [
+        {
+          "id": "TA0040",
+          "name": "Impact"
+        }
+      ],
+      "aliases": [
+        "delete shadows",
+        "backup deletion",
+        "inhibit recovery"
+      ],
+      "keywords": [
+        {
+          "id": "t1490_vssadmin_delete_shadows",
+          "pattern": "delete shadows /all /quiet",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 95
+        },
+        {
+          "id": "t1490_wmic_shadowcopy_delete",
+          "pattern": "shadowcopy delete",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 90
+        },
+        {
+          "id": "t1490_wbadmin_delete_catalog",
+          "pattern": "delete catalog -quiet",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 90
+        }
+      ]
+    },
+    {
+      "techniqueId": "T1486",
+      "name": "Data Encrypted for Impact",
+      "tactics": [
+        {
+          "id": "TA0040",
+          "name": "Impact"
+        }
+      ],
+      "aliases": [
+        "ransomware",
+        "data encryption",
+        "ransom note"
+      ],
+      "keywords": [
+        {
+          "id": "t1486_ryuk_readme",
+          "pattern": "ryukreadme.txt",
+          "match": "word",
+          "columns": [
+            "file_name",
+            "text_evidence"
+          ],
+          "score": 85
+        },
+        {
+          "id": "t1486_decrypt_files_note",
+          "pattern": "decrypt-files.txt",
+          "match": "word",
+          "columns": [
+            "file_name",
+            "text_evidence"
+          ],
+          "score": 75
+        }
+      ]
+    },
+    {
+      "techniqueId": "T1489",
+      "name": "Service Stop",
+      "tactics": [
+        {
+          "id": "TA0040",
+          "name": "Impact"
+        }
+      ],
+      "aliases": [
+        "service stop",
+        "stop database services",
+        "ransomware service stop"
+      ],
+      "keywords": [
+        {
+          "id": "t1489_taskkill_sqlservr",
+          "pattern": "taskkill /f /im sqlservr.exe",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 75
+        }
+      ]
+    }
+  ]
+}
