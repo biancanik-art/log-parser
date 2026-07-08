@@ -74,6 +74,16 @@ Rust + [Tauri v2](https://v2.tauri.app/) · [calamine](https://github.com/tafia/
 Pre-built installers for Windows, macOS (Apple Silicon and Intel), and
 Linux are published on the [Releases](../../releases) page.
 
+## Credits
+
+log-parser is a team effort: concept, requirements, and product direction
+by [biancanik-art](https://github.com/biancanik-art); engineering by
+[Claude](https://www.anthropic.com/claude) (Anthropic) and
+[Codex](https://openai.com/index/introducing-codex/) (OpenAI), working as
+independent AI engineers/reviewers throughout the build — implementing
+features in parallel, cross-checking each other's work, and running live
+end-to-end verification against the real app.
+
 ## License
 
 Apache License 2.0 — see [LICENSE](LICENSE).
