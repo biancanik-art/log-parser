@@ -70,6 +70,13 @@ struct ValueRollup {
 }
 
 #[derive(Debug)]
+struct Ipv4SubnetRollup {
+    first_row_num: i64,
+    distinct_count: i64,
+    total_count: i64,
+}
+
+#[derive(Debug)]
 struct AssociationRollup {
     first_row_num: i64,
     row_count: i64,
@@ -630,21 +637,56 @@ where
         return Ok(());
     }
 
+    let mut vpn_match_rows: Vec<(String, ValueRollup, String)> = Vec::new();
+    let mut other_individual_rows: Vec<(String, ValueRollup, String)> = Vec::new();
+    let mut private_buckets: BTreeMap<u32, Ipv4SubnetRollup> = BTreeMap::new();
+
     for (ip_text, rollup) in rollups {
         let ip: IpAddr = ip_text
             .parse()
             .with_context(|| format!("re-parsing normalized IP {ip_text}"))?;
-        let detail = match ip {
-            IpAddr::V4(ipv4) => match classify_ipv4(ipv4, ranges) {
-                Some(label) => format!(
-                    "possible VPN/hosting: {label}; best-effort offline heuristic, not authoritative"
-                ),
-                None => "no match in bundled offline VPN/hosting ranges".to_string(),
-            },
-            IpAddr::V6(_) => {
-                "not checked; bundled VPN/hosting range dataset is IPv4-only".to_string()
+        match ip {
+            IpAddr::V4(ipv4) => {
+                if let Some(label) = classify_ipv4(ipv4, ranges) {
+                    vpn_match_rows.push((
+                        ip_text,
+                        rollup,
+                        format!(
+                            "possible VPN/hosting: {label}; best-effort offline heuristic, not authoritative"
+                        ),
+                    ));
+                } else if is_groupable_private_or_reserved_ipv4(ipv4) {
+                    let network = ipv4_24_network(ipv4);
+                    let entry =
+                        private_buckets
+                            .entry(network)
+                            .or_insert_with(|| Ipv4SubnetRollup {
+                                first_row_num: rollup.first_row_num,
+                                distinct_count: 0,
+                                total_count: 0,
+                            });
+                    entry.first_row_num = entry.first_row_num.min(rollup.first_row_num);
+                    entry.distinct_count += 1;
+                    entry.total_count += rollup.count;
+                } else {
+                    other_individual_rows.push((
+                        ip_text,
+                        rollup,
+                        "no match in bundled offline VPN/hosting ranges".to_string(),
+                    ));
+                }
             }
-        };
+            IpAddr::V6(_) => {
+                other_individual_rows.push((
+                    ip_text,
+                    rollup,
+                    "not checked; bundled VPN/hosting range dataset is IPv4-only".to_string(),
+                ));
+            }
+        }
+    }
+
+    for (ip_text, rollup, detail) in vpn_match_rows.into_iter().chain(other_individual_rows) {
         writer.write_cells_with_count(
             rollup.first_row_num,
             &[
@@ -654,6 +696,24 @@ where
                 detail.as_str(),
             ],
             rollup.count,
+        )?;
+    }
+
+    for (network, rollup) in private_buckets {
+        let network_text = format!("{}/24 (private/reserved range)", ipv4_from_u32(network));
+        let detail = format!(
+            "Distinct private/reserved IPs in this /24: {}; total observations: {}; no VPN/hosting match for any of them; best-effort offline heuristic",
+            rollup.distinct_count, rollup.total_count
+        );
+        writer.write_cells_with_count(
+            rollup.first_row_num,
+            &[
+                "IP addresses",
+                role_column.original_name.as_str(),
+                network_text.as_str(),
+                detail.as_str(),
+            ],
+            rollup.total_count,
         )?;
     }
     Ok(())
@@ -1279,6 +1339,21 @@ fn classify_ipv4(ip: Ipv4Addr, ranges: &[CompiledVpnRange]) -> Option<&str> {
         .map(|range| range.label.as_str())
 }
 
+fn is_groupable_private_or_reserved_ipv4(ip: Ipv4Addr) -> bool {
+    matches!(
+        ip.octets(),
+        [10, _, _, _] | [172, 16..=31, _, _] | [192, 168, _, _] | [127, _, _, _] | [169, 254, _, _]
+    )
+}
+
+fn ipv4_24_network(ip: Ipv4Addr) -> u32 {
+    ipv4_to_u32(ip) & prefix_mask(24)
+}
+
+fn ipv4_from_u32(raw: u32) -> Ipv4Addr {
+    Ipv4Addr::from(raw.to_be_bytes())
+}
+
 pub fn ipv4_in_cidr(ip: Ipv4Addr, cidr: &str) -> Result<bool> {
     let (network, prefix) = parse_ipv4_cidr(cidr)?;
     let mask = prefix_mask(prefix);
@@ -1491,6 +1566,210 @@ mod tests {
             .skip(1)
             .map(|row| cell_to_i64(&row[0]))
             .collect()
+    }
+
+    fn setup_ip_rollup_fixture(ip_values: &[&str]) -> (Connection, RoleColumn) {
+        let conn = Connection::open_in_memory().unwrap();
+        let columns = vec![ColumnMeta {
+            sql_name: "source_ip".into(),
+            original_name: "SourceIP".into(),
+            col_index: 0,
+            inferred_type: "text".into(),
+        }];
+        db::create_schema(&conn, &columns).unwrap();
+        for (idx, value) in ip_values.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO rows (row_num, source_ip) VALUES (?1, ?2)",
+                params![(idx as i64) + 1, value],
+            )
+            .unwrap();
+        }
+
+        (
+            conn,
+            RoleColumn {
+                sql_name: "source_ip".into(),
+                original_name: "SourceIP".into(),
+            },
+        )
+    }
+
+    fn write_ip_rollup_sheet(
+        ip_values: &[&str],
+        ranges: &[CompiledVpnRange],
+        name: &str,
+    ) -> std::path::PathBuf {
+        let (conn, role_column) = setup_ip_rollup_fixture(ip_values);
+        let path = temp_report_path(name);
+        let mut workbook = Workbook::new();
+        {
+            let worksheet = workbook.add_worksheet_with_constant_memory();
+            worksheet.set_name("General").unwrap();
+            write_headers(
+                worksheet,
+                &[
+                    "row_num",
+                    "section",
+                    "item",
+                    "value",
+                    "detail",
+                    "observed_count",
+                ],
+            )
+            .unwrap();
+            let mut source_rows = HashSet::new();
+            let mut total_rows_written = 0i64;
+            let mut progress = |_: i64, _: &str| {};
+            let mut writer = RowWriter::new(
+                worksheet,
+                "General",
+                &mut source_rows,
+                &mut total_rows_written,
+                &mut progress,
+            );
+            write_ip_rollups(&conn, &mut writer, Some(&role_column), ranges).unwrap();
+            writer.finish_sheet();
+        }
+        workbook.save(&path).unwrap();
+        path
+    }
+
+    #[derive(Debug)]
+    struct IpRollupRow {
+        row_num: i64,
+        item: String,
+        value: String,
+        detail: String,
+        count: i64,
+    }
+
+    fn ip_rollup_rows(path: &Path) -> Vec<IpRollupRow> {
+        let mut workbook: calamine::Sheets<std::io::BufReader<std::fs::File>> =
+            calamine::open_workbook_auto(path).unwrap();
+        let general = workbook
+            .worksheet_range("General")
+            .expect("General sheet should exist");
+        general
+            .rows()
+            .skip(1)
+            .filter(|row| row[1] == "IP addresses")
+            .map(|row| IpRollupRow {
+                row_num: cell_to_i64(&row[0]),
+                item: row[2].to_string(),
+                value: row[3].to_string(),
+                detail: row[4].to_string(),
+                count: cell_to_i64(&row[5]),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn general_sheet_groups_unmatched_private_ipv4s_by_24() {
+        let path = write_ip_rollup_sheet(
+            &["10.20.30.1", "10.20.30.2", "10.20.30.1", "10.20.30.200"],
+            &[],
+            "ip-private-one-bucket",
+        );
+
+        let rows = ip_rollup_rows(&path);
+        assert_eq!(rows.len(), 1, "expected one /24 bucket row, got {rows:?}");
+        assert_eq!(rows[0].row_num, 1);
+        assert_eq!(rows[0].item, "SourceIP");
+        assert_eq!(rows[0].value, "10.20.30.0/24 (private/reserved range)");
+        assert_eq!(rows[0].count, 4);
+        assert!(
+            rows[0]
+                .detail
+                .contains("Distinct private/reserved IPs in this /24: 3"),
+            "detail should report distinct IP count, got: {}",
+            rows[0].detail
+        );
+        assert!(
+            rows[0].detail.contains("total observations: 4"),
+            "detail should report total observations, got: {}",
+            rows[0].detail
+        );
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn general_sheet_keeps_private_vpn_matches_individual() {
+        let ranges = vec![compile_vpn_range("10.10.42.8/32", "Test private VPN").unwrap()];
+        let path = write_ip_rollup_sheet(
+            &["10.10.42.8", "10.10.42.9"],
+            &ranges,
+            "ip-private-match-individual",
+        );
+
+        let rows = ip_rollup_rows(&path);
+        assert_eq!(
+            rows.len(),
+            2,
+            "expected one matched individual row and one private bucket row, got {rows:?}"
+        );
+        assert_eq!(rows[0].row_num, 1);
+        assert_eq!(rows[0].value, "10.10.42.8");
+        assert_eq!(rows[0].count, 1);
+        assert!(
+            rows[0]
+                .detail
+                .contains("possible VPN/hosting: Test private VPN"),
+            "matched private IP should keep the individual VPN detail, got: {}",
+            rows[0].detail
+        );
+        assert_eq!(rows[1].row_num, 2);
+        assert_eq!(rows[1].value, "10.10.42.0/24 (private/reserved range)");
+        assert_eq!(rows[1].count, 1);
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn general_sheet_keeps_unmatched_public_ipv4_individual() {
+        let path = write_ip_rollup_sheet(&["8.8.8.8", "8.8.8.8"], &[], "ip-public-individual");
+
+        let rows = ip_rollup_rows(&path);
+        assert_eq!(rows.len(), 1, "expected one individual public IP row");
+        assert_eq!(rows[0].row_num, 1);
+        assert_eq!(rows[0].value, "8.8.8.8");
+        assert_eq!(
+            rows[0].detail,
+            "no match in bundled offline VPN/hosting ranges"
+        );
+        assert_eq!(rows[0].count, 2);
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn general_sheet_splits_private_ipv4s_across_24_buckets() {
+        let path = write_ip_rollup_sheet(
+            &["10.1.1.1", "10.1.1.2", "10.1.2.1", "10.1.2.5", "10.1.1.1"],
+            &[],
+            "ip-private-two-buckets",
+        );
+
+        let rows = ip_rollup_rows(&path);
+        assert_eq!(
+            rows.len(),
+            2,
+            "expected two separate /24 buckets, got {rows:?}"
+        );
+        assert_eq!(rows[0].row_num, 1);
+        assert_eq!(rows[0].value, "10.1.1.0/24 (private/reserved range)");
+        assert_eq!(rows[0].count, 3);
+        assert!(rows[0]
+            .detail
+            .contains("Distinct private/reserved IPs in this /24: 2"));
+        assert_eq!(rows[1].row_num, 3);
+        assert_eq!(rows[1].value, "10.1.2.0/24 (private/reserved range)");
+        assert_eq!(rows[1].count, 2);
+        assert!(rows[1]
+            .detail
+            .contains("Distinct private/reserved IPs in this /24: 2"));
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]
