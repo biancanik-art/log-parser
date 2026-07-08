@@ -11,6 +11,7 @@
   <div id="app">
     <header id="toolbar">
       <button id="open-file-btn" class="btn btn-primary">Open File…</button>
+      <button id="remove-file-btn" class="btn" disabled>Remove File</button>
       <div id="file-info" class="file-info">No file loaded</div>
       <div class="toolbar-spacer"></div>
       <input id="search-box" type="search" placeholder="Search all columns…" disabled />
@@ -104,6 +105,7 @@
         <div class="sidebar-section">
           <h3>Intel</h3>
           <button id="suspicious-scan-btn" class="btn btn-primary" disabled>Scan suspicious</button>
+          <button id="review-roles-btn" class="btn btn-small" disabled>Review column roles</button>
           <div id="evidence-columns-label" class="sidebar-note">Confirm evidence roles first.</div>
           <div id="intel-scan-summary" class="scan-summary"></div>
         </div>

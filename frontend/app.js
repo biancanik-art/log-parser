@@ -4,6 +4,7 @@
 
   // -- element refs -----------------------------------------------------
   const openFileBtn = document.getElementById("open-file-btn");
+  const removeFileBtn = document.getElementById("remove-file-btn");
   const fileInfo = document.getElementById("file-info");
   const searchBox = document.getElementById("search-box");
   const guidedSearchForm = document.getElementById("guided-search-form");
@@ -53,6 +54,7 @@
   const clearBtn = document.getElementById("clear-btn");
   const filterRowTemplate = document.getElementById("filter-row-template");
   const suspiciousScanBtn = document.getElementById("suspicious-scan-btn");
+  const reviewRolesBtn = document.getElementById("review-roles-btn");
   const evidenceColumnsLabel = document.getElementById("evidence-columns-label");
   const intelScanSummary = document.getElementById("intel-scan-summary");
 
@@ -100,6 +102,7 @@
   // -- helpers --------------------------------------------------------------
 
   function setControlsEnabled(enabled) {
+    removeFileBtn.disabled = !enabled;
     searchBox.disabled = !enabled;
     guidedSearchBox.disabled = !enabled;
     guidedSearchSubmit.disabled = !enabled;
@@ -109,6 +112,7 @@
     addFilterBtn.disabled = !enabled;
     applyBtn.disabled = !enabled;
     clearBtn.disabled = !enabled;
+    reviewRolesBtn.disabled = !enabled;
     if (enabled) {
       updateEvidenceColumnsUi();
     } else {
@@ -208,9 +212,9 @@
 
   function renderRoleSuggestions() {
     roleList.innerHTML = "";
-    roleReviewPanel.classList.remove("hidden");
 
     if (columnRoleSuggestions.length === 0) {
+      roleReviewPanel.classList.remove("hidden");
       rolePanelStatus.textContent = roleDetectionInFlight
         ? "Detecting column roles..."
         : roleDetectionError
@@ -290,6 +294,12 @@
         ? "Command-line evidence is not trusted until confirmed."
         : "Confirmed evidence roles can be scanned for suspicious matches.";
     updateEvidenceColumnsUi();
+
+    // Once every suggestion has been explicitly confirmed or rejected, there's nothing
+    // left for the examiner to decide — collapse the panel automatically so the sheet
+    // gets full screen room. "Review column roles" in the sidebar brings it back.
+    const allResolved = columnRoleSuggestions.every((row) => row.status !== "suggested");
+    roleReviewPanel.classList.toggle("hidden", allResolved);
   }
 
   function renderScanSummary(summary) {
@@ -454,6 +464,7 @@
     // stale nextCursor — the button is unclickable for the whole round trip either way.
     prevPageBtn.disabled = true;
     nextPageBtn.disabled = true;
+    showProgress(queryMode === "guided" ? "Running guided query..." : "Filtering...", 0.5);
     try {
       const page =
         queryMode === "guided"
@@ -475,6 +486,7 @@
     } finally {
       prevPageBtn.disabled = cursorStack.length === 0;
       nextPageBtn.disabled = !hasMore;
+      hideProgress();
     }
   }
 
@@ -606,6 +618,7 @@
     guidedPreviewText.textContent = "Parsing guided query...";
     guidedClarification.classList.add("hidden");
     guidedRunBtn.classList.add("hidden");
+    showProgress("Parsing guided query...", 0.3);
     try {
       const result = await invoke("parse_guided_query", { queryText: trimmed });
       renderGuidedPreview(result);
@@ -616,6 +629,7 @@
       throw err;
     } finally {
       guidedSearchSubmit.disabled = columns.length === 0;
+      hideProgress();
     }
   }
 
@@ -746,6 +760,26 @@
     });
   }
 
+  function removeFile() {
+    if (table) {
+      table.destroy();
+      table = null;
+    }
+    columns = [];
+    currentPath = null;
+    currentSheet = null;
+    fileInfo.textContent = "No file loaded";
+    sortColumn.innerHTML = '<option value="">(row order)</option>';
+    filterList.innerHTML = "";
+    searchBox.value = "";
+    spec = { search: null, filters: [], sort: null, cursor: null, limit: PAGE_SIZE };
+    resetPagination();
+    resetIntelUiState();
+    setControlsEnabled(false);
+    rowCountLabel.textContent = "—";
+    pageLabel.textContent = "";
+  }
+
   // -- export flow --------------------------------------------------------------
 
   async function doExport(format) {
@@ -790,6 +824,14 @@
 
   openFileBtn.addEventListener("click", () => {
     pickAndOpenFile().catch((err) => alert(`Error: ${err}`));
+  });
+
+  removeFileBtn.addEventListener("click", () => {
+    removeFile();
+  });
+
+  reviewRolesBtn.addEventListener("click", () => {
+    roleReviewPanel.classList.remove("hidden");
   });
 
   sheetLoadBtn.addEventListener("click", () => {
@@ -960,6 +1002,9 @@
     },
     generateReportForTest(destPath) {
       return generateReport(destPath);
+    },
+    removeFileForTest() {
+      removeFile();
     },
   });
 })();
