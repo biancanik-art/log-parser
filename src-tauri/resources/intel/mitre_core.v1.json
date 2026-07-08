@@ -230,6 +230,46 @@
             "text_evidence"
           ],
           "score": 50
+        },
+        {
+          "id": "t1059_001_powershell_exe_nop",
+          "pattern": "powershell.exe -nop",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 75
+        },
+        {
+          "id": "t1059_001_powershell_nop",
+          "pattern": "powershell -nop",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 75
+        },
+        {
+          "id": "t1059_001_windowstyle_hidden",
+          "pattern": "-windowstyle hidden",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 60
+        },
+        {
+          "id": "t1059_001_w_hidden",
+          "pattern": "-w hidden",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 55
         }
       ]
     },
@@ -987,6 +1027,16 @@
             "text_evidence"
           ],
           "score": 75
+        },
+        {
+          "id": "t1070_001_wevtutil_exe_cl",
+          "pattern": "wevtutil.exe cl",
+          "match": "substring",
+          "columns": [
+            "command_line",
+            "text_evidence"
+          ],
+          "score": 85
         }
       ]
     },

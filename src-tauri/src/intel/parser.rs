@@ -596,36 +596,14 @@ fn extract_user(query_text: &str, selection: &TechniqueSelection) -> UserExtract
         }
     }
 
-    if !selection.technique_ids.is_empty() || contains_suspicious_intent(query_text) {
-        let mut leftovers = Vec::new();
-        let matched_tokens: HashSet<&str> = selection
-            .matched_terms
-            .iter()
-            .flat_map(|term| term.split_whitespace())
-            .collect();
-        for token in &tokens {
-            let norm = normalize_phrase(token);
-            if norm.is_empty()
-                || matched_tokens.contains(norm.as_str())
-                || is_noise_word(&norm)
-                || is_intent_word(&norm)
-            {
-                continue;
-            }
-            if is_simple_user(token) {
-                leftovers.push(token.clone());
-            }
-        }
-        leftovers.sort();
-        leftovers.dedup();
-        if leftovers.len() == 1 {
-            return UserExtraction {
-                value: leftovers.into_iter().next(),
-                unresolved_this_user,
-            };
-        }
-    }
-
+    // Deliberately no "guess a leftover word is the username" fallback here. Every documented/
+    // supported phrasing ("for alice", "of user alice", "user alice", DOMAIN\user, UPN, SID)
+    // anchors on an explicit signal above. Guessing that any single unmatched word must be a
+    // username silently misread real queries like "show LSASS memory dumping" (treating
+    // "dumping" as a user) and "show powershell downloaders" (treating "downloaders" as a
+    // user), both returning a confident-looking but empty/wrong result instead of the correct
+    // TechniqueTimeline for the whole matched technique. No user found here is the right,
+    // honest answer - the caller falls through to a technique-only or clarification path.
     UserExtraction {
         value: None,
         unresolved_this_user,
@@ -1016,6 +994,30 @@ mod tests {
             } => {
                 assert_eq!(user_value, r"CORP\alice");
                 assert_eq!(technique_ids, vec!["T1003.001"]);
+            }
+            other => panic!("unexpected intent: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bare_technique_query_without_a_user_anchor_never_guesses_a_username() {
+        // "dumping" and "downloaders" are not usernames - with no "for"/"of"/"user" anchor,
+        // these must resolve to a technique-only timeline covering everyone, not a
+        // (silently wrong, confidently empty) search for a nonexistent user.
+        let (preview, intent) = parse_intent("show LSASS memory dumping");
+        assert!(!preview.needs_clarification);
+        match intent {
+            GuidedIntent::TechniqueTimeline { technique_ids, .. } => {
+                assert!(technique_ids.contains(&"T1003.001".to_string()));
+            }
+            other => panic!("unexpected intent: {other:?}"),
+        }
+
+        let (preview, intent) = parse_intent("show powershell downloaders");
+        assert!(!preview.needs_clarification);
+        match intent {
+            GuidedIntent::TechniqueTimeline { technique_ids, .. } => {
+                assert!(technique_ids.contains(&"T1059.001".to_string()));
             }
             other => panic!("unexpected intent: {other:?}"),
         }

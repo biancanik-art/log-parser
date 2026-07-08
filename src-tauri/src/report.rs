@@ -192,7 +192,7 @@ pub fn export_report(
         used_sheet_names.insert("general".to_string());
 
         if intel_match_count(conn)? > 0 {
-            sheets_written.push(write_timeline_sheet(conn, &roles, &mut write_state)?);
+            sheets_written.push(write_timeline_sheet(conn, columns, &roles, &mut write_state)?);
             used_sheet_names.insert("timeline".to_string());
         }
 
@@ -841,6 +841,7 @@ where
 
 fn write_timeline_sheet<F>(
     conn: &Connection,
+    columns: &[ColumnMeta],
     roles: &ConfirmedRoles,
     state: &mut ReportWriteState<'_, F>,
 ) -> Result<String>
@@ -851,6 +852,11 @@ where
     let worksheet = state.workbook.add_worksheet_with_constant_memory();
     worksheet.set_name(&sheet_name)?;
 
+    // Every event on this sheet is a keyword match, so the same source row can legitimately
+    // appear more than once if it matched multiple keywords/techniques - each row here is one
+    // match, not one unique source event. The matched_column/evidence pair (same evidence-
+    // resolution logic the per-tactic sheets already use) means an examiner never has to go back
+    // to the raw grid just to see what text actually triggered the hit.
     let mut headers = vec![
         "row_num",
         "utc_timestamp",
@@ -858,6 +864,8 @@ where
         "technique_id",
         "technique_name",
         "keyword",
+        "matched_column",
+        "evidence",
     ];
     if let Some(user) = &roles.user {
         headers.push(user.original_name.as_str());
@@ -872,7 +880,10 @@ where
     worksheet.set_column_width(3, 16)?;
     worksheet.set_column_width(4, 36)?;
     worksheet.set_column_width(5, 30)?;
+    worksheet.set_column_width(6, 24)?;
+    worksheet.set_column_width(7, 80)?;
 
+    let evidence_expr = evidence_case_expression(columns);
     let mut select_exprs = vec![
         "m.row_num".to_string(),
         "COALESCE(rt.utc_text, '')".to_string(),
@@ -880,6 +891,8 @@ where
         "m.technique_id".to_string(),
         "m.technique_name".to_string(),
         "m.keyword".to_string(),
+        "m.column_name".to_string(),
+        evidence_expr,
     ];
     if let Some(user) = &roles.user {
         select_exprs.push(format!(
@@ -1519,6 +1532,23 @@ mod tests {
 
         let timeline = workbook.worksheet_range("Timeline").unwrap();
         assert_eq!(data_row_nums(&timeline), vec![1, 2]);
+        let timeline_rows: Vec<_> = timeline.rows().collect();
+        assert_eq!(
+            timeline_rows[0][6].to_string(),
+            "matched_column",
+            "Timeline sheet must include a matched_column header"
+        );
+        assert_eq!(
+            timeline_rows[0][7].to_string(),
+            "evidence",
+            "Timeline sheet must include an evidence header"
+        );
+        assert_eq!(timeline_rows[1][6].to_string(), "processcommandline");
+        assert!(
+            timeline_rows[1][7].to_string().contains("powershell"),
+            "evidence cell should contain the actual matched command line, got: {}",
+            timeline_rows[1][7]
+        );
         let credential_access = workbook.worksheet_range("Credential Access").unwrap();
         assert_eq!(data_row_nums(&credential_access), vec![2]);
         let execution = workbook.worksheet_range("Execution").unwrap();

@@ -157,23 +157,30 @@ pub fn set_column_role_status(
         .as_ref()
         .map(|row| row.reasons.clone())
         .unwrap_or_default();
+    let unchanged_repeat = existing.as_ref().is_some_and(|row| {
+        row.sql_name == column.sql_name && row.status == status.as_str()
+    });
     let confidence = match status {
         RoleDecisionStatus::Confirmed => {
-            if existing
-                .as_ref()
-                .is_some_and(|row| row.sql_name == column.sql_name)
-            {
-                reasons.push("examiner confirmed the suggested role assignment".to_string());
-            } else {
-                reasons.push(format!(
-                    "examiner selected '{}' for this role, overriding the suggestion",
-                    column.original_name
-                ));
+            if !unchanged_repeat {
+                if existing
+                    .as_ref()
+                    .is_some_and(|row| row.sql_name == column.sql_name)
+                {
+                    reasons.push("examiner confirmed the suggested role assignment".to_string());
+                } else {
+                    reasons.push(format!(
+                        "examiner selected '{}' for this role, overriding the suggestion",
+                        column.original_name
+                    ));
+                }
             }
             1.0
         }
         RoleDecisionStatus::Rejected => {
-            reasons.push("examiner rejected this role assignment".to_string());
+            if !unchanged_repeat {
+                reasons.push("examiner rejected this role assignment".to_string());
+            }
             existing.as_ref().map_or(0.0, |row| row.confidence)
         }
     };
@@ -931,6 +938,38 @@ mod tests {
         assert_eq!(confirmed.role, "command_line");
         assert_eq!(confirmed.sql_name, "processcommandline");
         assert_eq!(confirmed.status, "confirmed");
+    }
+
+    #[test]
+    fn reconfirming_an_already_confirmed_role_does_not_duplicate_reasons() {
+        let (conn, columns) = setup_fixture();
+        detect_column_roles(&conn, &columns).unwrap();
+
+        let first = set_column_role_status(
+            &conn,
+            &columns,
+            "command_line",
+            "processcommandline",
+            RoleDecisionStatus::Confirmed,
+        )
+        .unwrap();
+        let reason_count_after_first_confirm = first.reasons.len();
+
+        let second = set_column_role_status(
+            &conn,
+            &columns,
+            "command_line",
+            "processcommandline",
+            RoleDecisionStatus::Confirmed,
+        )
+        .unwrap();
+
+        assert_eq!(
+            second.reasons.len(),
+            reason_count_after_first_confirm,
+            "re-confirming the same already-confirmed column should not append another reason: {:?}",
+            second.reasons
+        );
     }
 
     #[test]

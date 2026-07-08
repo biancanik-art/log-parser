@@ -151,12 +151,27 @@ pub(crate) fn build_predicate(columns: &[ColumnMeta], spec: &QuerySpec) -> Resul
             FilterOp::IsNotEmpty => {
                 clauses.push(format!("({ident} IS NOT NULL AND {ident} != '')"));
             }
+            // Numeric filter values compare as numbers (CAST ... AS REAL, as before). Anything
+            // else - most importantly ISO8601 timestamps like "2026-06-30T09:10:00Z" - compares
+            // as plain text instead. SQLite's CAST(text AS REAL) only reads the leading numeric
+            // prefix, so every timestamp in the same year previously collapsed to the same
+            // value (e.g. 2026.0), making a time-window filter always evaluate false. Plain text
+            // comparison is correct for consistently-formatted ISO8601 strings (lexicographic
+            // order matches chronological order) and is what an examiner actually needs here.
             FilterOp::GreaterThan => {
-                clauses.push(format!("CAST({ident} AS REAL) > CAST(? AS REAL)"));
+                if filter.value.trim().parse::<f64>().is_ok() {
+                    clauses.push(format!("CAST({ident} AS REAL) > CAST(? AS REAL)"));
+                } else {
+                    clauses.push(format!("{ident} > ?"));
+                }
                 params.push(Box::new(filter.value.clone()));
             }
             FilterOp::LessThan => {
-                clauses.push(format!("CAST({ident} AS REAL) < CAST(? AS REAL)"));
+                if filter.value.trim().parse::<f64>().is_ok() {
+                    clauses.push(format!("CAST({ident} AS REAL) < CAST(? AS REAL)"));
+                } else {
+                    clauses.push(format!("{ident} < ?"));
+                }
                 params.push(Box::new(filter.value.clone()));
             }
         }
@@ -405,6 +420,64 @@ mod tests {
         });
         let page = query_rows(&conn, &columns, &s).unwrap();
         assert_eq!(page.rows.len(), 1);
+    }
+
+    #[test]
+    fn greater_than_less_than_compare_iso8601_timestamps_as_text_not_numbers() {
+        // CAST(text AS REAL) only reads the leading numeric prefix, so every one of these
+        // same-year timestamps used to collapse to the same value (2026.0) and a time-window
+        // filter always evaluated false. This must compare as text instead.
+        let conn = Connection::open_in_memory().unwrap();
+        let columns = vec![ColumnMeta {
+            sql_name: "ts".into(),
+            original_name: "Timestamp".into(),
+            col_index: 0,
+            inferred_type: "timestamp".into(),
+        }];
+        db::create_schema(&conn, &columns).unwrap();
+        let values = [
+            "2026-06-30T07:00:00Z",
+            "2026-06-30T09:10:00Z",
+            "2026-06-30T11:40:00Z",
+            "2026-07-01T08:00:00Z",
+        ];
+        for (i, value) in values.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO rows (row_num, ts) VALUES (?1, ?2)",
+                rusqlite::params![(i as i64) + 1, value],
+            )
+            .unwrap();
+        }
+        db::populate_fts(&conn, &columns).unwrap();
+        db::record_import_info(
+            &conn,
+            &ImportInfo {
+                source_path: "test.xlsx".into(),
+                sheet_name: "Sheet1".into(),
+                row_count: values.len() as i64,
+                imported_at: "2026-01-01T00:00:00Z".into(),
+            },
+        )
+        .unwrap();
+
+        let mut s = spec();
+        s.filters.push(ColumnFilter {
+            column: "ts".into(),
+            op: FilterOp::GreaterThan,
+            value: "2026-06-30T09:00:00Z".into(),
+        });
+        s.filters.push(ColumnFilter {
+            column: "ts".into(),
+            op: FilterOp::LessThan,
+            value: "2026-06-30T12:00:00Z".into(),
+        });
+        let page = query_rows(&conn, &columns, &s).unwrap();
+        assert_eq!(
+            page.rows.len(),
+            2,
+            "expected the two 06-30 rows inside the window, got {:?}",
+            page.rows
+        );
     }
 
     #[test]
