@@ -74,6 +74,19 @@ Rust + [Tauri v2](https://v2.tauri.app/) · [calamine](https://github.com/tafia/
 Pre-built installers for Windows, macOS (Apple Silicon and Intel), and
 Linux are published on the [Releases](../../releases) page.
 
+**macOS note:** these builds are not yet code-signed/notarized with an
+Apple Developer ID, so Gatekeeper will refuse to open them with a
+"log-parser is damaged and should be moved to the Trash" message — the
+app isn't actually damaged, this is just Gatekeeper blocking an
+unsigned/unnotarized download. After moving `log-parser.app` to
+`/Applications`, clear the quarantine flag once:
+
+```sh
+xattr -cr /Applications/log-parser.app
+```
+
+Then it opens normally.
+
 ## Credits
 
 log-parser is a team effort: concept, requirements, and product direction
