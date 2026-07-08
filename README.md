@@ -69,6 +69,11 @@ Rust + [Tauri v2](https://v2.tauri.app/) · [calamine](https://github.com/tafia/
 (report export) · plain HTML/CSS/vanilla JS frontend
 ([Tabulator.js](https://tabulator.info/) for the grid), no build step.
 
+## Downloads
+
+Pre-built installers for Windows, macOS (Apple Silicon and Intel), and
+Linux are published on the [Releases](../../releases) page.
+
 ## License
 
-No license file yet — all rights reserved by default until one is added.
+Apache License 2.0 — see [LICENSE](LICENSE).
