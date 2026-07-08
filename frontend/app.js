@@ -951,8 +951,22 @@
   window.__logParserDebug = window.__logParserDebug || {};
   Object.assign(window.__logParserDebug, {
     loadSheetForTest(path, sheet) {
+      if (!path) {
+        throw new Error("loadSheetForTest(path, sheet): path is required");
+      }
+      if (!sheet) {
+        throw new Error(
+          "loadSheetForTest(path, sheet): sheet is required - call listSheetsForTest(path) first if you don't know the sheet name"
+        );
+      }
       currentPath = path;
       return loadSheet(sheet);
+    },
+    async listSheetsForTest(path) {
+      if (!path) {
+        throw new Error("listSheetsForTest(path): path is required");
+      }
+      return invoke("list_sheets", { path });
     },
     getState() {
       return { spec, hasMore, pageIndex, totalCount, columns };
