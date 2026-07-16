@@ -24,7 +24,6 @@ pub const TOKENIZER_SHA256: &str =
     "be50c3628f2bf5bb5e3a7f17b1f74611b2561a3a27eeab05e5aa30f411572037";
 pub const CONFIG_SHA256: &str = "953f9c0d463486b10a6871cc2fd59f223b2c70184f49815e7efbcab5d8908b41";
 
-const INDEX_VERSION: &str = "semantic-row-v1";
 pub const V2_INDEX_VERSION: &str = "semantic-document-v2";
 pub const V2_NORMALIZER_VERSION: &str = "dfir-cell-normalizer-v1";
 pub const V2_SOURCE_BATCH_ROWS: usize = 256;
@@ -34,9 +33,6 @@ pub const V2_MAX_DOCUMENT_CANDIDATES: usize = 1_024;
 pub const V2_DEFAULT_MINIMUM_SCORE: f32 = 0.38;
 pub const V2_BROAD_MINIMUM_SCORE: f32 = 0.30;
 const MAX_TOKENS: usize = 256;
-const INDEX_BATCH_SIZE: usize = 32;
-const MAX_DOCUMENT_CHARS: usize = 4_096;
-const MAX_CELL_CHARS: usize = 1_024;
 const MAX_QUERY_CHARS: usize = 4_096;
 const MAX_TOP_K: usize = 1_000;
 const EMBEDDING_DIMENSIONS: usize = 384;
@@ -617,7 +613,8 @@ pub struct SemanticSelectionSummary {
 
 pub fn semantic_schema_hash(columns: &[ColumnMeta]) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(INDEX_VERSION.as_bytes());
+    hasher.update(V2_INDEX_VERSION.as_bytes());
+    hasher.update(V2_NORMALIZER_VERSION.as_bytes());
     for column in columns {
         for value in [
             column.sql_name.as_str(),
@@ -1531,61 +1528,6 @@ pub fn semantic_search(
     Ok(candidates)
 }
 
-fn create_semantic_schema(conn: &Connection) -> rusqlite::Result<()> {
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS _semantic_index (
-            row_num INTEGER PRIMARY KEY,
-            embedding BLOB NOT NULL
-         );
-         CREATE TABLE IF NOT EXISTS _semantic_index_info (
-            schema_hash TEXT NOT NULL,
-            index_version TEXT NOT NULL,
-            model_name TEXT NOT NULL,
-            model_version TEXT NOT NULL,
-            model_sha256 TEXT NOT NULL,
-            rows_indexed INTEGER NOT NULL,
-            dimensions INTEGER NOT NULL,
-            completed_at TEXT NOT NULL
-         );",
-    )
-}
-
-fn row_document(columns: &[ColumnMeta], values: &[Option<String>]) -> String {
-    let mut document = String::new();
-    for (column, value) in columns.iter().zip(values) {
-        let Some(value) = value
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        else {
-            continue;
-        };
-        let value = truncate_chars(value, MAX_CELL_CHARS);
-        let separator_chars = if document.is_empty() { 0 } else { 2 };
-        let label_chars = column.original_name.chars().count() + 2;
-        let remaining = MAX_DOCUMENT_CHARS.saturating_sub(document.chars().count());
-        if remaining <= separator_chars + label_chars {
-            break;
-        }
-        if !document.is_empty() {
-            document.push_str("; ");
-        }
-        document.push_str(&column.original_name);
-        document.push_str(": ");
-        let remaining = MAX_DOCUMENT_CHARS.saturating_sub(document.chars().count());
-        document.push_str(&truncate_chars(&value, remaining));
-    }
-    if document.is_empty() {
-        "empty log row".to_string()
-    } else {
-        document
-    }
-}
-
-fn truncate_chars(value: &str, maximum: usize) -> String {
-    value.chars().take(maximum).collect()
-}
-
 fn vector_to_blob(vector: &[f32]) -> Vec<u8> {
     let mut blob = Vec::with_capacity(vector.len() * std::mem::size_of::<f32>());
     for value in vector {
@@ -1606,34 +1548,6 @@ fn dot_blob(query: &[f32], blob: &[u8]) -> Result<f32> {
             left * right
         })
         .sum())
-}
-
-#[derive(Debug, Clone, Copy)]
-struct ScoredRow {
-    row_num: i64,
-    score: f32,
-}
-
-impl PartialEq for ScoredRow {
-    fn eq(&self, other: &Self) -> bool {
-        self.row_num == other.row_num && self.score.to_bits() == other.score.to_bits()
-    }
-}
-
-impl Eq for ScoredRow {}
-
-impl PartialOrd for ScoredRow {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for ScoredRow {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.score
-            .total_cmp(&other.score)
-            .then_with(|| other.row_num.cmp(&self.row_num))
-    }
 }
 
 fn verify_sha256(path: &Path, expected: &str, label: &str) -> Result<()> {
@@ -1682,6 +1596,125 @@ fn table_exists(conn: &Connection, table: &str) -> rusqlite::Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
+    use std::sync::{Arc, Barrier, Mutex};
+
+    #[derive(Default)]
+    struct FakeEmbedder {
+        calls: AtomicUsize,
+        fail_on_call: Option<usize>,
+        cancel_after_call: Option<Arc<AtomicBool>>,
+        first_call_barrier: Option<Arc<Barrier>>,
+        concurrent_write_path: Option<std::path::PathBuf>,
+        seen: Mutex<Vec<String>>,
+    }
+
+    impl FakeEmbedder {
+        fn vector() -> Vec<f32> {
+            let mut vector = vec![0.0; EMBEDDING_DIMENSIONS];
+            vector[0] = 1.0;
+            vector
+        }
+
+        fn call_count(&self) -> usize {
+            self.calls.load(AtomicOrdering::SeqCst)
+        }
+    }
+
+    impl SemanticEmbedder for FakeEmbedder {
+        fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+            let call = self.calls.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+            if call == 1 {
+                if let Some(barrier) = &self.first_call_barrier {
+                    barrier.wait();
+                }
+                if let Some(path) = &self.concurrent_write_path {
+                    let audit = Connection::open(path)?;
+                    audit.busy_timeout(std::time::Duration::from_millis(500))?;
+                    audit.execute(
+                        "INSERT INTO _semantic_test_audit(note) VALUES ('during inference')",
+                        [],
+                    )?;
+                }
+            }
+            self.seen.lock().unwrap().extend(texts.iter().cloned());
+            if self.fail_on_call == Some(call) {
+                bail!("synthetic embedding interruption on call {call}");
+            }
+            if let Some(cancelled) = &self.cancel_after_call {
+                cancelled.store(true, AtomicOrdering::SeqCst);
+            }
+            Ok(texts.iter().map(|_| Self::vector()).collect())
+        }
+    }
+
+    fn text_column(sql_name: &str, original_name: &str, col_index: usize) -> ColumnMeta {
+        ColumnMeta {
+            sql_name: sql_name.to_string(),
+            original_name: original_name.to_string(),
+            col_index,
+            inferred_type: "text".to_string(),
+        }
+    }
+
+    fn alphabetic_id(mut value: usize) -> String {
+        let mut output = String::new();
+        loop {
+            output.push((b'a' + (value % 26) as u8) as char);
+            value /= 26;
+            if value == 0 {
+                break;
+            }
+        }
+        output
+    }
+
+    fn populate_messages(
+        conn: &mut Connection,
+        columns: &[ColumnMeta],
+        count: usize,
+        unique: bool,
+    ) {
+        db::create_schema(conn, columns).unwrap();
+        let tx = conn.transaction().unwrap();
+        {
+            let mut insert = tx
+                .prepare("INSERT INTO rows(row_num, event_id, message) VALUES (?1, ?2, ?3)")
+                .unwrap();
+            for index in 0..count {
+                let message = if unique {
+                    format!(
+                        "suspicious process execution variant {}",
+                        alphabetic_id(index)
+                    )
+                } else {
+                    "credential dumping process observed".to_string()
+                };
+                insert
+                    .execute(params![index as i64 + 1, format!("evt-{index}"), message])
+                    .unwrap();
+            }
+        }
+        tx.commit().unwrap();
+    }
+
+    fn message_columns() -> Vec<ColumnMeta> {
+        vec![
+            text_column("event_id", "Event ID", 0),
+            text_column("message", "Message", 1),
+        ]
+    }
+
+    fn temporary_database_path(label: &str) -> std::path::PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "log-parser-{label}-{}-{nonce}.sqlite",
+            std::process::id()
+        ))
+    }
 
     fn columns() -> Vec<ColumnMeta> {
         vec![
@@ -1698,20 +1731,6 @@ mod tests {
                 inferred_type: "text".into(),
             },
         ]
-    }
-
-    #[test]
-    fn row_documents_are_labeled_bounded_and_skip_blanks() {
-        let values = vec![
-            Some("2026-01-01T00:00:00Z".into()),
-            Some("  powershell.exe  ".into()),
-        ];
-        let document = row_document(&columns(), &values);
-        assert_eq!(
-            document,
-            "Time Generated: 2026-01-01T00:00:00Z; Message: powershell.exe"
-        );
-        assert!(document.chars().count() <= MAX_DOCUMENT_CHARS);
     }
 
     #[test]
@@ -1763,6 +1782,352 @@ mod tests {
         .unwrap();
         assert_ne!(first, semantic_dataset_hash(&conn, &columns).unwrap());
         assert!(!table_exists(&conn, "_semantic_index").unwrap());
+    }
+
+    #[test]
+    fn v2_normalizer_deduplicates_dynamic_ids_and_never_starves_the_final_column() {
+        let conn = Connection::open_in_memory().unwrap();
+        let columns = vec![
+            text_column("event_id", "Event GUID", 0),
+            text_column("verbose_message", "Message", 1),
+            text_column("final_evidence", "Evidence Description", 2),
+        ];
+        db::create_schema(&conn, &columns).unwrap();
+        let long_prefix = (0..300)
+            .map(|index| format!("background{}", alphabetic_id(index)))
+            .collect::<Vec<_>>()
+            .join(" ");
+        for row_num in 1..=32i64 {
+            conn.execute(
+                "INSERT INTO rows(row_num, event_id, verbose_message, final_evidence)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    row_num,
+                    format!("550e8400-e29b-41d4-a716-{row_num:012}"),
+                    format!("{long_prefix} process {row_num}"),
+                    "credential dumping observed in final field",
+                ],
+            )
+            .unwrap();
+        }
+
+        let plans = classify_columns(&conn, &columns).unwrap();
+        assert_eq!(plans[0].mode, ColumnMode::ExactOnly);
+        let values = vec![
+            Some("550e8400-e29b-41d4-a716-446655440000".to_string()),
+            Some(format!("{long_prefix} process 9384")),
+            Some("credential dumping observed in final field".to_string()),
+        ];
+        let documents = row_documents_v2(&plans, &values);
+        assert_eq!(documents[0].1, "verbose_message");
+        assert_eq!(documents[1].1, "final_evidence");
+        assert_eq!(documents[2].0, "cell_chunk");
+
+        let source_rows = vec![
+            (1, values.clone()),
+            (
+                2,
+                vec![
+                    Some("550e8400-e29b-41d4-a716-446655449999".to_string()),
+                    Some(format!("{long_prefix} process 12001")),
+                    Some("credential dumping observed in final field".to_string()),
+                ],
+            ),
+        ];
+        let deduplicated = collect_normalized_documents(&plans, &source_rows);
+        assert!(deduplicated
+            .values()
+            .all(|document| document.rows.len() == 2));
+        assert!(deduplicated
+            .values()
+            .all(|document| !document.text.contains("9384") && !document.text.contains("12001")));
+    }
+
+    #[test]
+    fn v2_selection_expands_every_mapping_beyond_legacy_row_caps() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        let columns = message_columns();
+        populate_messages(&mut conn, &columns, 1_601, false);
+        let embedder = FakeEmbedder::default();
+
+        let summary =
+            ensure_semantic_index_v2(&mut conn, &columns, &embedder, || false, |_| {}).unwrap();
+        assert_eq!(summary.rows_indexed, 1_601);
+        assert_eq!(summary.documents_indexed, 1);
+        assert_eq!(summary.mappings_written, 1_601);
+
+        embedder.seen.lock().unwrap().clear();
+        let selection = create_semantic_selection(
+            &mut conn,
+            &columns,
+            &embedder,
+            "credential dumping from 10.20.30.40 process 9842",
+            SemanticSearchPolicy {
+                maximum_documents: 1,
+                minimum_score: -1.0,
+            },
+        )
+        .unwrap();
+        assert_eq!(selection.documents_retained, 1);
+        assert_eq!(selection.rows_matched, 1_601);
+        assert!(selection.broad_row_warning);
+        assert!(selection.warnings[0].contains("bounded"));
+        validate_semantic_selection(&conn, &columns, &selection.selection_id).unwrap();
+        let seen = embedder.seen.lock().unwrap();
+        assert_eq!(
+            seen.last().unwrap(),
+            "credential dumping from <ip> process <number>"
+        );
+    }
+
+    #[test]
+    fn v2_cancel_resumes_after_a_short_committed_batch_and_reports_real_totals() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        let columns = message_columns();
+        populate_messages(&mut conn, &columns, 600, false);
+        let embedder = FakeEmbedder::default();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancel_from_progress = Arc::clone(&cancelled);
+        let first = ensure_semantic_index_v2(
+            &mut conn,
+            &columns,
+            &embedder,
+            || cancelled.load(AtomicOrdering::SeqCst),
+            move |progress| {
+                if progress.rows_scanned >= V2_SOURCE_BATCH_ROWS as i64 {
+                    cancel_from_progress.store(true, AtomicOrdering::SeqCst);
+                }
+            },
+        )
+        .unwrap();
+        assert!(first.cancelled);
+        assert_eq!(first.rows_indexed, V2_SOURCE_BATCH_ROWS as i64);
+        assert!(!semantic_index_ready(&conn, &columns).unwrap());
+
+        let progress = Arc::new(Mutex::new(Vec::<SemanticBuildProgress>::new()));
+        let progress_sink = Arc::clone(&progress);
+        let resumed = ensure_semantic_index_v2(
+            &mut conn,
+            &columns,
+            &embedder,
+            || false,
+            move |update| progress_sink.lock().unwrap().push(update),
+        )
+        .unwrap();
+        assert!(resumed.resumed);
+        assert_eq!(resumed.rows_indexed, 600);
+        assert_eq!(resumed.documents_indexed, 1);
+        assert_eq!(resumed.mappings_written, 600);
+        let ready = progress.lock().unwrap().last().unwrap().clone();
+        assert_eq!(ready.phase, "ready");
+        assert_eq!(ready.documents_embedded, 1);
+        assert_eq!(ready.mappings_written, 600);
+    }
+
+    #[test]
+    fn v2_cancellation_after_inference_exits_without_reembedding() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        let columns = message_columns();
+        populate_messages(&mut conn, &columns, 300, true);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let embedder = FakeEmbedder {
+            cancel_after_call: Some(Arc::clone(&cancelled)),
+            ..Default::default()
+        };
+        let summary = ensure_semantic_index_v2(
+            &mut conn,
+            &columns,
+            &embedder,
+            || cancelled.load(AtomicOrdering::SeqCst),
+            |_| {},
+        )
+        .unwrap();
+        assert!(summary.cancelled);
+        assert_eq!(summary.rows_indexed, 0);
+        assert_eq!(embedder.call_count(), 1);
+    }
+
+    #[test]
+    fn v2_embedding_failure_is_persisted_then_resumes_without_duplicate_progress() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        let columns = message_columns();
+        populate_messages(&mut conn, &columns, 300, true);
+        let failing = FakeEmbedder {
+            fail_on_call: Some(17),
+            ..Default::default()
+        };
+        let error =
+            ensure_semantic_index_v2(&mut conn, &columns, &failing, || false, |_| {}).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("synthetic embedding interruption"));
+        let (status, cursor, stored_error): (String, i64, Option<String>) = conn
+            .query_row(
+                "SELECT status, cursor_row_num, error FROM _semantic_v2_build",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "paused");
+        assert_eq!(cursor, V2_SOURCE_BATCH_ROWS as i64);
+        assert!(stored_error
+            .unwrap()
+            .contains("synthetic embedding interruption"));
+        assert!(!semantic_index_ready(&conn, &columns).unwrap());
+
+        let healthy = FakeEmbedder::default();
+        let summary =
+            ensure_semantic_index_v2(&mut conn, &columns, &healthy, || false, |_| {}).unwrap();
+        assert!(summary.resumed);
+        assert_eq!(summary.rows_indexed, 300);
+        assert_eq!(summary.mappings_written, 300);
+
+        let selection = create_semantic_selection(
+            &mut conn,
+            &columns,
+            &healthy,
+            "suspicious process",
+            SemanticSearchPolicy {
+                maximum_documents: 5,
+                minimum_score: -1.0,
+            },
+        )
+        .unwrap();
+        assert_eq!(selection.documents_above_threshold, 300);
+        assert_eq!(selection.documents_retained, 5);
+        assert!(selection.documents_truncated);
+        assert!(selection
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("limited")));
+    }
+
+    #[test]
+    fn semantic_selection_must_belong_to_the_current_active_build_and_dataset() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        let columns = message_columns();
+        populate_messages(&mut conn, &columns, 2, false);
+        let embedder = FakeEmbedder::default();
+        ensure_semantic_index_v2(&mut conn, &columns, &embedder, || false, |_| {}).unwrap();
+        let selection = create_semantic_selection(
+            &mut conn,
+            &columns,
+            &embedder,
+            "credential dumping",
+            SemanticSearchPolicy {
+                maximum_documents: 1,
+                minimum_score: -1.0,
+            },
+        )
+        .unwrap();
+        validate_semantic_selection(&conn, &columns, &selection.selection_id).unwrap();
+
+        let (dataset_hash, schema_hash): (String, String) = conn
+            .query_row(
+                "SELECT dataset_hash, schema_hash FROM _semantic_v2_build",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        conn.execute(
+            "INSERT INTO _semantic_v2_build (
+                dataset_hash, schema_hash, model_sha256, normalizer_version, status,
+                source_rows, cursor_row_num, rows_scanned, started_at, updated_at, completed_at
+             ) VALUES (?1, ?2, ?3, 'different-normalizer', 'ready', 2, 2, 2, ?4, ?4, ?4)",
+            params![
+                dataset_hash,
+                schema_hash,
+                MODEL_SHA256,
+                chrono::Utc::now().to_rfc3339()
+            ],
+        )
+        .unwrap();
+        let replacement = conn.last_insert_rowid();
+        conn.execute(
+            "UPDATE _semantic_v2_active SET build_id = ?1",
+            [replacement],
+        )
+        .unwrap();
+        assert!(validate_semantic_selection(&conn, &columns, &selection.selection_id).is_err());
+
+        conn.execute("DELETE FROM rows WHERE row_num = 2", [])
+            .unwrap();
+        assert!(validate_semantic_selection(&conn, &columns, &selection.selection_id).is_err());
+        assert!(validate_semantic_selection(&conn, &columns, "forged").is_err());
+    }
+
+    #[test]
+    fn overlapping_v2_builders_claim_each_batch_once() {
+        let path = temporary_database_path("semantic-overlap");
+        let columns = message_columns();
+        {
+            let mut conn = Connection::open(&path).unwrap();
+            populate_messages(&mut conn, &columns, 520, true);
+        }
+        let barrier = Arc::new(Barrier::new(2));
+        let mut workers = Vec::new();
+        for _ in 0..2 {
+            let path = path.clone();
+            let columns = columns.clone();
+            let barrier = Arc::clone(&barrier);
+            workers.push(std::thread::spawn(move || {
+                let mut conn = Connection::open(path).unwrap();
+                let embedder = FakeEmbedder {
+                    first_call_barrier: Some(barrier),
+                    ..Default::default()
+                };
+                ensure_semantic_index_v2(&mut conn, &columns, &embedder, || false, |_| {})
+            }));
+        }
+        for worker in workers {
+            worker.join().unwrap().unwrap();
+        }
+
+        let conn = Connection::open(&path).unwrap();
+        let (builds, rows_scanned, mappings): (i64, i64, i64) = conn
+            .query_row(
+                "SELECT COUNT(*), MAX(rows_scanned), MAX(mappings_written)
+                 FROM _semantic_v2_build",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(builds, 1);
+        assert_eq!(rows_scanned, 520);
+        assert_eq!(mappings, 520);
+        let mapped: i64 = conn
+            .query_row("SELECT COUNT(*) FROM _semantic_v2_mapping", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(mapped, 520);
+        drop(conn);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn v2_model_inference_does_not_hold_a_database_write_lock() {
+        let path = temporary_database_path("semantic-audit-write");
+        let columns = message_columns();
+        let mut conn = Connection::open(&path).unwrap();
+        populate_messages(&mut conn, &columns, 300, true);
+        conn.execute_batch("CREATE TABLE _semantic_test_audit(note TEXT NOT NULL);")
+            .unwrap();
+        let embedder = FakeEmbedder {
+            concurrent_write_path: Some(path.clone()),
+            ..Default::default()
+        };
+        let summary =
+            ensure_semantic_index_v2(&mut conn, &columns, &embedder, || false, |_| {}).unwrap();
+        assert_eq!(summary.rows_indexed, 300);
+        let audit_rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM _semantic_test_audit", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(audit_rows, 1);
+        drop(conn);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
