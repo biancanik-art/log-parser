@@ -2301,6 +2301,7 @@ dependencies = [
  "tauri-build",
  "tauri-plugin-dialog",
  "tokenizers 0.23.1",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

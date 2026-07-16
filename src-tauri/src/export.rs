@@ -1,12 +1,13 @@
 use crate::db::ColumnMeta;
 use crate::intel::time;
 use crate::query::{self, QuerySpec};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use rusqlite::Connection;
 use rust_xlsxwriter::Workbook;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::BufWriter;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Debug)]
 pub struct ExportSummary {
@@ -14,6 +15,120 @@ pub struct ExportSummary {
 }
 
 const PROGRESS_EVERY: i64 = 5000;
+static EXPORT_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+struct PendingExport {
+    path: PathBuf,
+    published: bool,
+}
+
+impl Drop for PendingExport {
+    fn drop(&mut self) {
+        if !self.published {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// Writes beside the destination, syncs the complete file, then replaces the destination in one
+/// filesystem operation. A query, encoder, disk, or process failure therefore cannot truncate an
+/// examiner's existing export.
+fn atomic_export(
+    dest_path: &Path,
+    write: impl FnOnce(&Path) -> Result<ExportSummary>,
+) -> Result<ExportSummary> {
+    let parent = dest_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let file_name = dest_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("log-parser-export");
+    let extension = dest_path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| format!(".{value}"))
+        .unwrap_or_default();
+    let sequence = EXPORT_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let temp_path = parent.join(format!(
+        ".{file_name}.log-parser-{}-{sequence}.tmp{extension}",
+        std::process::id()
+    ));
+
+    // Reserve the unique name without following an existing link/file, then let the format
+    // writer reopen it. PID + process-local sequence keeps this collision-free in normal use.
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp_path)
+        .with_context(|| format!("creating temporary export {}", temp_path.display()))?;
+    let mut pending = PendingExport {
+        path: temp_path,
+        published: false,
+    };
+    let summary = write(&pending.path)?;
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&pending.path)?
+        .sync_all()?;
+    atomic_replace(&pending.path, dest_path)?;
+    pending.published = true;
+    sync_parent_directory(parent)?;
+    Ok(summary)
+}
+
+#[cfg(windows)]
+fn atomic_replace(source: &Path, destination: &Path) -> Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{ReplaceFileW, REPLACEFILE_WRITE_THROUGH};
+
+    if !destination.exists() {
+        return std::fs::rename(source, destination).context("publishing completed export");
+    }
+
+    let source = source
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let destination = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let succeeded = unsafe {
+        ReplaceFileW(
+            destination.as_ptr(),
+            source.as_ptr(),
+            std::ptr::null(),
+            REPLACEFILE_WRITE_THROUGH,
+            std::ptr::null(),
+            std::ptr::null(),
+        )
+    };
+    if succeeded == 0 {
+        return Err(std::io::Error::last_os_error()).context("publishing completed export");
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn atomic_replace(source: &Path, destination: &Path) -> Result<()> {
+    std::fs::rename(source, destination).context("publishing completed export")
+}
+
+#[cfg(unix)]
+fn sync_parent_directory(parent: &Path) -> Result<()> {
+    File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_parent_directory(_parent: &Path) -> Result<()> {
+    Ok(())
+}
 
 /// Streams matching rows straight from a `rusqlite` row cursor into the destination file — no
 /// intermediate `Vec`/JSON blob of the whole result set is ever materialized. Reuses
@@ -72,32 +187,34 @@ pub fn export_csv(
     mut on_progress: impl FnMut(i64),
 ) -> Result<ExportSummary> {
     let (sql, predicate) = build_export_query(columns, spec)?;
+    atomic_export(dest_path, |dest_path| {
+        let file = File::create(dest_path)?;
+        let mut writer = csv::Writer::from_writer(BufWriter::new(file));
+        let headers: Vec<&str> = columns.iter().map(|c| c.original_name.as_str()).collect();
+        writer.write_record(&headers)?;
 
-    let file = File::create(dest_path)?;
-    let mut writer = csv::Writer::from_writer(BufWriter::new(file));
-    let headers: Vec<&str> = columns.iter().map(|c| c.original_name.as_str()).collect();
-    writer.write_record(&headers)?;
+        let mut stmt = conn.prepare(&sql)?;
+        let params: Vec<&dyn rusqlite::ToSql> =
+            predicate.params.iter().map(|p| p.as_ref()).collect();
+        let mut rows = stmt.query(params.as_slice())?;
 
-    let mut stmt = conn.prepare(&sql)?;
-    let params: Vec<&dyn rusqlite::ToSql> = predicate.params.iter().map(|p| p.as_ref()).collect();
-    let mut rows = stmt.query(params.as_slice())?;
-
-    let mut row_count: i64 = 0;
-    let mut record: Vec<String> = vec![String::new(); columns.len()];
-    while let Some(row) = rows.next()? {
-        for (i, cell) in record.iter_mut().enumerate() {
-            *cell = row.get(i)?;
+        let mut row_count: i64 = 0;
+        let mut record: Vec<String> = vec![String::new(); columns.len()];
+        while let Some(row) = rows.next()? {
+            for (i, cell) in record.iter_mut().enumerate() {
+                *cell = row.get(i)?;
+            }
+            writer.write_record(&record)?;
+            row_count += 1;
+            if row_count % PROGRESS_EVERY == 0 {
+                on_progress(row_count);
+            }
         }
-        writer.write_record(&record)?;
-        row_count += 1;
-        if row_count % PROGRESS_EVERY == 0 {
-            on_progress(row_count);
-        }
-    }
-    writer.flush()?;
-    on_progress(row_count);
+        writer.flush()?;
+        on_progress(row_count);
 
-    Ok(ExportSummary { row_count })
+        Ok(ExportSummary { row_count })
+    })
 }
 
 pub fn export_csv_normalized_time(
@@ -111,37 +228,38 @@ pub fn export_csv_normalized_time(
 ) -> Result<ExportSummary> {
     let (sql, predicate) =
         build_normalized_time_export_query(conn, columns, spec, source_column, direction)?;
+    atomic_export(dest_path, |dest_path| {
+        let file = File::create(dest_path)?;
+        let mut writer = csv::Writer::from_writer(BufWriter::new(file));
+        let headers: Vec<&str> = columns
+            .iter()
+            .map(|column| column.original_name.as_str())
+            .collect();
+        writer.write_record(&headers)?;
 
-    let file = File::create(dest_path)?;
-    let mut writer = csv::Writer::from_writer(BufWriter::new(file));
-    let headers: Vec<&str> = columns
-        .iter()
-        .map(|column| column.original_name.as_str())
-        .collect();
-    writer.write_record(&headers)?;
-
-    let mut stmt = conn.prepare(&sql)?;
-    let params: Vec<&dyn rusqlite::ToSql> = predicate
-        .params
-        .iter()
-        .map(|param| param.as_ref())
-        .collect();
-    let mut rows = stmt.query(params.as_slice())?;
-    let mut row_count = 0i64;
-    let mut record = vec![String::new(); columns.len()];
-    while let Some(row) = rows.next()? {
-        for (index, cell) in record.iter_mut().enumerate() {
-            *cell = row.get(index)?;
+        let mut stmt = conn.prepare(&sql)?;
+        let params: Vec<&dyn rusqlite::ToSql> = predicate
+            .params
+            .iter()
+            .map(|param| param.as_ref())
+            .collect();
+        let mut rows = stmt.query(params.as_slice())?;
+        let mut row_count = 0i64;
+        let mut record = vec![String::new(); columns.len()];
+        while let Some(row) = rows.next()? {
+            for (index, cell) in record.iter_mut().enumerate() {
+                *cell = row.get(index)?;
+            }
+            writer.write_record(&record)?;
+            row_count += 1;
+            if row_count % PROGRESS_EVERY == 0 {
+                on_progress(row_count);
+            }
         }
-        writer.write_record(&record)?;
-        row_count += 1;
-        if row_count % PROGRESS_EVERY == 0 {
-            on_progress(row_count);
-        }
-    }
-    writer.flush()?;
-    on_progress(row_count);
-    Ok(ExportSummary { row_count })
+        writer.flush()?;
+        on_progress(row_count);
+        Ok(ExportSummary { row_count })
+    })
 }
 
 pub fn export_xlsx(
@@ -152,39 +270,41 @@ pub fn export_xlsx(
     mut on_progress: impl FnMut(i64),
 ) -> Result<ExportSummary> {
     let (sql, predicate) = build_export_query(columns, spec)?;
+    atomic_export(dest_path, |dest_path| {
+        let mut workbook = Workbook::new();
+        // Flushes each completed row to a temp file instead of buffering the whole sheet in RAM —
+        // requires rows to be written in strictly increasing row order, which our
+        // `ORDER BY row_num ASC` query already guarantees.
+        let worksheet = workbook.add_worksheet_with_constant_memory();
 
-    let mut workbook = Workbook::new();
-    // Flushes each completed row to a temp file instead of buffering the whole sheet in RAM —
-    // requires rows to be written in strictly increasing row order, which our
-    // `ORDER BY row_num ASC` query already guarantees.
-    let worksheet = workbook.add_worksheet_with_constant_memory();
-
-    for (col_idx, col) in columns.iter().enumerate() {
-        worksheet.write_string(0, col_idx as u16, col.original_name.as_str())?;
-    }
-
-    let mut stmt = conn.prepare(&sql)?;
-    let params: Vec<&dyn rusqlite::ToSql> = predicate.params.iter().map(|p| p.as_ref()).collect();
-    let mut rows = stmt.query(params.as_slice())?;
-
-    let mut row_count: i64 = 0;
-    let mut excel_row: u32 = 1;
-    while let Some(row) = rows.next()? {
-        for col_idx in 0..columns.len() {
-            let value: String = row.get(col_idx)?;
-            worksheet.write_string(excel_row, col_idx as u16, value.as_str())?;
+        for (col_idx, col) in columns.iter().enumerate() {
+            worksheet.write_string(0, col_idx as u16, col.original_name.as_str())?;
         }
-        excel_row += 1;
-        row_count += 1;
-        if row_count % PROGRESS_EVERY == 0 {
-            on_progress(row_count);
+
+        let mut stmt = conn.prepare(&sql)?;
+        let params: Vec<&dyn rusqlite::ToSql> =
+            predicate.params.iter().map(|p| p.as_ref()).collect();
+        let mut rows = stmt.query(params.as_slice())?;
+
+        let mut row_count: i64 = 0;
+        let mut excel_row: u32 = 1;
+        while let Some(row) = rows.next()? {
+            for col_idx in 0..columns.len() {
+                let value: String = row.get(col_idx)?;
+                worksheet.write_string(excel_row, col_idx as u16, value.as_str())?;
+            }
+            excel_row += 1;
+            row_count += 1;
+            if row_count % PROGRESS_EVERY == 0 {
+                on_progress(row_count);
+            }
         }
-    }
 
-    workbook.save(dest_path)?;
-    on_progress(row_count);
+        workbook.save(dest_path)?;
+        on_progress(row_count);
 
-    Ok(ExportSummary { row_count })
+        Ok(ExportSummary { row_count })
+    })
 }
 
 pub fn export_xlsx_normalized_time(
@@ -198,35 +318,37 @@ pub fn export_xlsx_normalized_time(
 ) -> Result<ExportSummary> {
     let (sql, predicate) =
         build_normalized_time_export_query(conn, columns, spec, source_column, direction)?;
-    let mut workbook = Workbook::new();
-    let worksheet = workbook.add_worksheet_with_constant_memory();
-    for (column_index, column) in columns.iter().enumerate() {
-        worksheet.write_string(0, column_index as u16, column.original_name.as_str())?;
-    }
+    atomic_export(dest_path, |dest_path| {
+        let mut workbook = Workbook::new();
+        let worksheet = workbook.add_worksheet_with_constant_memory();
+        for (column_index, column) in columns.iter().enumerate() {
+            worksheet.write_string(0, column_index as u16, column.original_name.as_str())?;
+        }
 
-    let mut stmt = conn.prepare(&sql)?;
-    let params: Vec<&dyn rusqlite::ToSql> = predicate
-        .params
-        .iter()
-        .map(|param| param.as_ref())
-        .collect();
-    let mut rows = stmt.query(params.as_slice())?;
-    let mut row_count = 0i64;
-    let mut excel_row = 1u32;
-    while let Some(row) = rows.next()? {
-        for column_index in 0..columns.len() {
-            let value: String = row.get(column_index)?;
-            worksheet.write_string(excel_row, column_index as u16, value.as_str())?;
+        let mut stmt = conn.prepare(&sql)?;
+        let params: Vec<&dyn rusqlite::ToSql> = predicate
+            .params
+            .iter()
+            .map(|param| param.as_ref())
+            .collect();
+        let mut rows = stmt.query(params.as_slice())?;
+        let mut row_count = 0i64;
+        let mut excel_row = 1u32;
+        while let Some(row) = rows.next()? {
+            for column_index in 0..columns.len() {
+                let value: String = row.get(column_index)?;
+                worksheet.write_string(excel_row, column_index as u16, value.as_str())?;
+            }
+            excel_row += 1;
+            row_count += 1;
+            if row_count % PROGRESS_EVERY == 0 {
+                on_progress(row_count);
+            }
         }
-        excel_row += 1;
-        row_count += 1;
-        if row_count % PROGRESS_EVERY == 0 {
-            on_progress(row_count);
-        }
-    }
-    workbook.save(dest_path)?;
-    on_progress(row_count);
-    Ok(ExportSummary { row_count })
+        workbook.save(dest_path)?;
+        on_progress(row_count);
+        Ok(ExportSummary { row_count })
+    })
 }
 
 #[cfg(test)]
@@ -362,6 +484,54 @@ mod tests {
         assert!(contents.contains("alice,100"));
         assert!(contents.contains("carol,300"));
         assert!(!contents.contains("bob,200"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn atomic_export_failure_preserves_existing_destination_and_cleans_temp() {
+        let dir = std::env::temp_dir().join(format!(
+            "log-parser-test-atomic-failure-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("evidence.csv");
+        std::fs::write(&path, b"trusted old export").unwrap();
+
+        let error = atomic_export(&path, |temporary| {
+            std::fs::write(temporary, b"partial replacement")?;
+            Err(anyhow::anyhow!("injected encoder failure"))
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("injected encoder failure"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"trusted old export");
+        let leftovers = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".tmp"))
+            .collect::<Vec<_>>();
+        assert!(leftovers.is_empty(), "leftovers={leftovers:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn atomic_export_replaces_existing_destination_after_complete_sync() {
+        let dir = std::env::temp_dir().join(format!(
+            "log-parser-test-atomic-success-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("evidence.csv");
+        std::fs::write(&path, b"old export").unwrap();
+
+        let summary = atomic_export(&path, |temporary| {
+            std::fs::write(temporary, b"complete new export")?;
+            Ok(ExportSummary { row_count: 7 })
+        })
+        .unwrap();
+        assert_eq!(summary.row_count, 7);
+        assert_eq!(std::fs::read(&path).unwrap(), b"complete new export");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
