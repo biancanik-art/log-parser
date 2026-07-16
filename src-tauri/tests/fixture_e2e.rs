@@ -166,6 +166,7 @@ fn large_fixture_import_and_query() {
     let mut spec = query::QuerySpec {
         search: Some(MARKER.to_string()),
         filters: vec![],
+        expression: None,
         sort: None,
         cursor: None,
         limit: 50,
@@ -205,6 +206,7 @@ fn large_fixture_import_and_query() {
             op: query::FilterOp::GreaterThan,
             value: "10000".to_string(),
         }],
+        expression: None,
         sort: None,
         cursor: None,
         limit: 50,
@@ -219,6 +221,7 @@ fn large_fixture_import_and_query() {
     let export_spec = query::QuerySpec {
         search: Some(MARKER.to_string()),
         filters: vec![],
+        expression: None,
         sort: None,
         cursor: None,
         limit: 50,
