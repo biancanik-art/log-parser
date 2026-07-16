@@ -2,7 +2,8 @@
 //! Not run by default `cargo test` — run explicitly:
 //!   cargo test --test fixture_e2e -- --ignored --nocapture
 
-use log_parser_lib::{db, excel_import, export, query};
+use log_parser_lib::{db, excel_import, export, query, semantic};
+use rusqlite::params;
 use rust_xlsxwriter::Workbook;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -234,6 +235,223 @@ fn large_fixture_import_and_query() {
 
     let _ = std::fs::remove_file(&db_path);
     let _ = std::fs::remove_dir_all(&export_dir);
+}
+
+/// Release-only scale benchmark for the pinned all-MiniLM-L6-v2 row index. It always imports the
+/// tracked 120,000-row, 27-column fixture, then copies a bounded sample into an isolated database
+/// before embedding it. The known forensic marker row is retained so retrieval quality is asserted
+/// instead of measuring throughput alone.
+///
+/// Override the default sample with `LOG_PARSER_SEMANTIC_BENCH_ROWS`, up to all 120,000 rows.
+#[test]
+#[ignore = "loads the pinned MiniLM model and builds a real semantic index"]
+fn semantic_fixture_build_and_search_benchmark() {
+    const DEFAULT_BENCH_ROWS: usize = 2_048;
+
+    let requested_rows = std::env::var("LOG_PARSER_SEMANTIC_BENCH_ROWS")
+        .map(|value| {
+            value
+                .parse::<usize>()
+                .expect("LOG_PARSER_SEMANTIC_BENCH_ROWS must be a positive integer")
+        })
+        .unwrap_or(DEFAULT_BENCH_ROWS);
+    assert!(
+        requested_rows > 0,
+        "semantic benchmark needs at least one row"
+    );
+    let bench_rows = requested_rows.min(NUM_ROWS);
+    if requested_rows > NUM_ROWS {
+        println!(
+            "semantic bench row request {requested_rows} exceeds fixture size; clamped to {NUM_ROWS}"
+        );
+    }
+
+    let fixture_path = testdata_dir().join("sentinel_sample_120k.xlsx");
+    generate_large_fixture(&fixture_path, NUM_ROWS);
+
+    let unique = format!("{}-{}", std::process::id(), bench_rows);
+    let temp_dir = std::env::temp_dir();
+    let source_db_path = temp_dir.join(format!("log-parser-semantic-source-{unique}.sqlite3"));
+    let bench_db_path = temp_dir.join(format!("log-parser-semantic-bench-{unique}.sqlite3"));
+    let _ = std::fs::remove_file(&source_db_path);
+    let _ = std::fs::remove_file(&bench_db_path);
+
+    let import_started = Instant::now();
+    let imported =
+        excel_import::import_into_db(&fixture_path, "Sheet1", &source_db_path, |_, _| {})
+            .expect("semantic benchmark fixture import should succeed");
+    let import_elapsed = import_started.elapsed();
+    assert_eq!(imported.row_count, NUM_ROWS as i64);
+    assert_eq!(headers().len(), 27, "fixture declaration changed");
+    assert_eq!(
+        imported.columns.len(),
+        26,
+        "the fixture's deliberately blank trailing column should be omitted"
+    );
+    println!(
+        "semantic bench import: rows={} declared_columns={} searchable_columns={} elapsed_ms={} rows_per_second={:.1}",
+        imported.row_count,
+        headers().len(),
+        imported.columns.len(),
+        import_elapsed.as_millis(),
+        imported.row_count as f64 / import_elapsed.as_secs_f64()
+    );
+
+    // Copy the bounded sample into a clean on-disk database. Keeping the marker and the first
+    // N-1 rows makes the benchmark deterministic while retaining realistic 27-column documents.
+    let mut conn = db::open(&bench_db_path).expect("opening semantic benchmark database");
+    db::create_schema(&conn, &imported.columns).expect("creating semantic benchmark schema");
+    conn.execute(
+        "ATTACH DATABASE ?1 AS source",
+        params![source_db_path.to_string_lossy().as_ref()],
+    )
+    .expect("attaching imported fixture database");
+    let identifiers = imported
+        .columns
+        .iter()
+        .map(|column| db::quote_ident(&column.sql_name))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let insert_prefix = format!("INSERT INTO rows (row_num, {identifiers})");
+    if bench_rows == NUM_ROWS {
+        conn.execute_batch(&format!(
+            "{insert_prefix} SELECT row_num, {identifiers} FROM source.rows ORDER BY row_num"
+        ))
+        .expect("copying complete fixture into semantic benchmark database");
+    } else {
+        conn.execute(
+            &format!(
+                "{insert_prefix} SELECT row_num, {identifiers} FROM source.rows WHERE row_num = ?1"
+            ),
+            [MARKER_ROW as i64],
+        )
+        .expect("copying forensic marker row into semantic benchmark database");
+        if bench_rows > 1 {
+            conn.execute(
+                &format!(
+                    "{insert_prefix}
+                     SELECT row_num, {identifiers} FROM source.rows
+                     WHERE row_num != ?1 ORDER BY row_num LIMIT ?2"
+                ),
+                params![MARKER_ROW as i64, (bench_rows - 1) as i64],
+            )
+            .expect("copying bounded fixture rows into semantic benchmark database");
+        }
+    }
+    conn.execute_batch("DETACH DATABASE source")
+        .expect("detaching imported fixture database");
+    db::populate_fts(&conn, &imported.columns)
+        .expect("populating FTS for a production-shaped benchmark database");
+
+    let copied_rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM rows", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(copied_rows, bench_rows as i64);
+    let marker_account: String = conn
+        .query_row(
+            "SELECT account FROM rows WHERE row_num = ?1",
+            [MARKER_ROW as i64],
+            |row| row.get(0),
+        )
+        .expect("bounded fixture must retain its known evidence row");
+    assert_eq!(marker_account, MARKER);
+
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let resources = manifest.join("resources");
+    let model_started = Instant::now();
+    let model = semantic::SemanticModel::load(
+        &resources.join(semantic::MODEL_RESOURCE_PATH),
+        &resources.join(semantic::TOKENIZER_RESOURCE_PATH),
+        &resources.join(semantic::CONFIG_RESOURCE_PATH),
+    )
+    .expect("loading pinned MiniLM semantic model");
+    println!(
+        "semantic bench model: load_ms={} measured_ms={} name={} version={}",
+        model.load_time_ms,
+        model_started.elapsed().as_millis(),
+        semantic::MODEL_NAME,
+        semantic::MODEL_VERSION
+    );
+
+    let database_bytes_before = std::fs::metadata(&bench_db_path).unwrap().len();
+    let build_started = Instant::now();
+    let summary = semantic::ensure_semantic_index(&mut conn, &imported.columns, &model)
+        .expect("building semantic benchmark index");
+    let build_elapsed = build_started.elapsed();
+    assert_eq!(summary.rows_indexed, bench_rows as i64);
+    assert!(!summary.from_cache);
+
+    let embedding_bytes: i64 = conn
+        .query_row(
+            "SELECT COALESCE(SUM(length(embedding)), 0) FROM _semantic_index",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let database_bytes_after = std::fs::metadata(&bench_db_path).unwrap().len();
+    let index_file_growth_bytes = database_bytes_after.saturating_sub(database_bytes_before);
+    let build_seconds = build_elapsed.as_secs_f64();
+    let build_throughput = summary.rows_indexed as f64 / build_seconds;
+    println!(
+        "semantic bench build: rows={} elapsed_ms={} summary_elapsed_ms={} rows_per_second={:.2} embedding_bytes={} database_growth_bytes={} database_bytes={}",
+        summary.rows_indexed,
+        build_elapsed.as_millis(),
+        summary.elapsed_ms,
+        build_throughput,
+        embedding_bytes,
+        index_file_growth_bytes,
+        database_bytes_after
+    );
+
+    let search_started = Instant::now();
+    let candidates =
+        semantic::semantic_search(&conn, &model, "forensic test marker XYZ evidence", 10, -1.0)
+            .expect("searching semantic benchmark index");
+    let search_elapsed = search_started.elapsed();
+    let marker_candidate = candidates
+        .iter()
+        .find(|candidate| candidate.row_num == MARKER_ROW as i64)
+        .unwrap_or_else(|| {
+            panic!(
+                "known forensic marker row was not retrieved; candidates={:?}",
+                candidates
+                    .iter()
+                    .map(|candidate| (candidate.row_num, candidate.score))
+                    .collect::<Vec<_>>()
+            )
+        });
+    println!(
+        "semantic bench search: elapsed_ms={} candidates={} marker_rank={} marker_score={:.6} top={:?}",
+        search_elapsed.as_millis(),
+        candidates.len(),
+        candidates
+            .iter()
+            .position(|candidate| candidate.row_num == MARKER_ROW as i64)
+            .unwrap()
+            + 1,
+        marker_candidate.score,
+        candidates
+            .iter()
+            .map(|candidate| (candidate.row_num, candidate.score))
+            .collect::<Vec<_>>()
+    );
+
+    let projection_scale = NUM_ROWS as f64 / summary.rows_indexed as f64;
+    let projected_build_seconds = build_seconds * projection_scale;
+    let projected_embedding_bytes = (embedding_bytes as f64 * projection_scale).round() as u64;
+    let projected_database_growth_bytes =
+        (index_file_growth_bytes as f64 * projection_scale).round() as u64;
+    println!(
+        "semantic bench projection_120k: build_seconds={:.2} embedding_bytes={} database_growth_bytes={} scale={:.4}",
+        projected_build_seconds,
+        projected_embedding_bytes,
+        projected_database_growth_bytes,
+        projection_scale
+    );
+
+    drop(conn);
+    let _ = std::fs::remove_file(&source_db_path);
+    let _ = std::fs::remove_file(&bench_db_path);
 }
 
 #[test]
