@@ -1,6 +1,6 @@
 use crate::db::{self, ColumnMeta};
 use crate::intel::library::{self, LoadedLibrary, Technique};
-use crate::intel::llm_parser::{self, ConfirmedRole, LlmContext, LlmParser};
+use crate::intel::llm_parser::{self, LlmContext, LlmParser};
 use crate::query::{
     ColumnFilter, Cursor, FilterOp, QueryExpression, QuerySpec, SortDirection, SortSpec,
 };
@@ -135,7 +135,6 @@ pub enum GuidedSort {
 #[derive(Debug, Clone)]
 struct ParserContext {
     confirmed_user_column: Option<ColumnMeta>,
-    confirmed_roles: Vec<ConfirmedRole>,
     has_normalized_time: bool,
 }
 
@@ -705,39 +704,22 @@ fn clarification(message: &str, suggestions: &[&str]) -> Result<GuidedQueryPrevi
 
 impl ParserContext {
     fn from_db(conn: &Connection, columns: &[ColumnMeta]) -> Result<Self> {
-        let confirmed_roles = if table_exists(conn, "_column_roles")? {
+        let confirmed_user_sql_names = if table_exists(conn, "_column_roles")? {
             let mut stmt = conn.prepare(
-                "SELECT role, sql_name FROM _column_roles
-                 WHERE status = 'confirmed' ORDER BY role, sql_name",
+                "SELECT sql_name FROM _column_roles
+                 WHERE status = 'confirmed' AND role = 'user' ORDER BY sql_name",
             )?;
-            let roles = stmt
-                .query_map([], |row| {
-                    Ok(ConfirmedRole {
-                        role: row.get(0)?,
-                        sql_name: row.get(1)?,
-                    })
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            roles
-                .into_iter()
-                .filter(|role| {
-                    columns
-                        .iter()
-                        .any(|column| column.sql_name == role.sql_name)
-                })
-                .collect()
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
         } else {
             Vec::new()
         };
-        let confirmed_user_column = confirmed_roles
-            .iter()
-            .find(|role| role.role == "user")
-            .and_then(|role| {
-                columns
-                    .iter()
-                    .find(|column| column.sql_name == role.sql_name)
-                    .cloned()
-            });
+        let confirmed_user_column = confirmed_user_sql_names.iter().find_map(|sql_name| {
+            columns
+                .iter()
+                .find(|column| column.sql_name == *sql_name)
+                .cloned()
+        });
 
         let has_normalized_time = if table_exists(conn, "_row_time")? {
             conn.query_row(
@@ -751,7 +733,6 @@ impl ParserContext {
 
         Ok(Self {
             confirmed_user_column,
-            confirmed_roles,
             has_normalized_time,
         })
     }
@@ -1880,10 +1861,6 @@ fn bounded_semantic_shorthand_target(
         .find(|(shorthand, _)| significant == BTreeSet::from([shorthand.to_string()]))
 }
 
-fn is_bounded_semantic_shorthand_request(query_text: &str, grounded_users: &[String]) -> bool {
-    bounded_semantic_shorthand_target(query_text, grounded_users).is_some()
-}
-
 fn select_bounded_semantic_shorthand(
     query_text: &str,
     library: &LoadedLibrary,
@@ -2487,10 +2464,6 @@ mod tests {
     fn context_with_user() -> ParserContext {
         ParserContext {
             confirmed_user_column: Some(account_column()),
-            confirmed_roles: vec![ConfirmedRole {
-                role: "user".into(),
-                sql_name: "account".into(),
-            }],
             has_normalized_time: true,
         }
     }
@@ -3243,7 +3216,6 @@ mod tests {
 
         let no_user_context = ParserContext {
             confirmed_user_column: None,
-            confirmed_roles: vec![],
             has_normalized_time: false,
         };
         let preview =
