@@ -570,6 +570,16 @@ select { font: inherit; }
   font-size: 12px;
 }
 
+.ai-match-reason {
+  overflow: hidden;
+  color: var(--accent);
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.3;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 @media (max-width: 900px) {
   .ai-search-workspace { padding: 12px; }
 

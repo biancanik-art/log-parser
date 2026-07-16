@@ -832,6 +832,17 @@
     pageLabel.textContent = `page ${pageIndex}`;
   }
 
+  function setAiMatchColumnVisible(visible) {
+    if (!table) return;
+    const matchColumn = table.getColumn("__aiMatch");
+    if (!matchColumn) return;
+    if (visible) {
+      matchColumn.show();
+    } else {
+      matchColumn.hide();
+    }
+  }
+
   async function refreshData() {
     // Disabled synchronously (before the first await below) so a rapid double-click on
     // Prev/Next can't fire a second query_rows() while this one is still in flight and read a
@@ -841,6 +852,7 @@
     const isQuerySpecRequest = modeAtStart === "querySpec";
     const isTrackedEvidenceRequest = isGuidedRequest || isQuerySpecRequest;
     if (isTrackedEvidenceRequest && guidedActiveQuery !== null) return null;
+    setAiMatchColumnVisible(isTrackedEvidenceRequest);
 
     const guidedQueryRequest = isTrackedEvidenceRequest
       ? {
@@ -916,6 +928,7 @@
 
   function applyControlsAndReload() {
     queryMode = "normal";
+    setAiMatchColumnVisible(false);
     guidedResetBtn.classList.add("hidden");
     spec.search = searchBox.value.trim() || null;
     spec.filters = currentFilterValues();
@@ -1423,6 +1436,29 @@
 
     const tabulatorColumns = [
       { title: "#", field: "row_num", width: 70, headerSort: false, frozen: true },
+      {
+        title: "Why matched",
+        field: "__aiMatch",
+        width: 250,
+        minWidth: 180,
+        headerSort: false,
+        visible: false,
+        formatter(cell) {
+          const rawReasons = cell.getValue();
+          const reasons = Array.isArray(rawReasons)
+            ? rawReasons.filter((reason) => typeof reason === "string" && reason.trim())
+            : [];
+          const element = document.createElement("div");
+          element.className = "ai-match-reason";
+          if (reasons.length === 0) {
+            element.textContent = "AI search plan match";
+            return element;
+          }
+          element.textContent = reasons.length > 1 ? `${reasons[0]} (+${reasons.length - 1})` : reasons[0];
+          element.title = reasons.join("\n");
+          return element;
+        },
+      },
       ...columns.map((c) => ({
         title: c.originalName,
         field: c.sqlName,
@@ -1704,6 +1740,7 @@
         parseInFlight: guidedActiveParse !== null,
         actionInFlight: guidedActiveAction ? guidedActiveAction.type : null,
         queryInFlight: guidedActiveQuery !== null,
+        aiMatchColumnVisible: Boolean(table && table.getColumn("__aiMatch")?.isVisible()),
         hasMore,
         pageIndex,
         totalCount,
