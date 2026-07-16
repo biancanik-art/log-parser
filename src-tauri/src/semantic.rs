@@ -598,4 +598,67 @@ mod tests {
             "{related} <= {unrelated} + 0.15"
         );
     }
+
+    #[test]
+    #[ignore = "loads the pinned model and builds a real semantic row index"]
+    fn real_semantic_index_retrieves_paraphrased_evidence_from_raw_rows() {
+        let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let resources = manifest.join("resources");
+        let model = SemanticModel::load(
+            &resources.join(MODEL_RESOURCE_PATH),
+            &resources.join(TOKENIZER_RESOURCE_PATH),
+            &resources.join(CONFIG_RESOURCE_PATH),
+        )
+        .unwrap();
+        let mut conn = Connection::open_in_memory().unwrap();
+        let columns = columns();
+        db::create_schema(&conn, &columns).unwrap();
+        for (row_num, timestamp, message) in [
+            (
+                1i64,
+                "2026-01-01T00:00:00Z",
+                "interactive sign-in rejected for alice",
+            ),
+            (2, "2026-01-01T00:01:00Z", "printer toner level is normal"),
+            (
+                3,
+                "2026-01-01T00:02:00Z",
+                "authentication was denied for account alice",
+            ),
+            (4, "2026-01-01T00:03:00Z", "successful backup completed"),
+        ] {
+            conn.execute(
+                "INSERT INTO rows (row_num, timestamp, message) VALUES (?1, ?2, ?3)",
+                params![row_num, timestamp, message],
+            )
+            .unwrap();
+        }
+
+        let summary = ensure_semantic_index(&mut conn, &columns, &model).unwrap();
+        assert_eq!(summary.rows_indexed, 4);
+        assert!(!summary.from_cache);
+        let cached = ensure_semantic_index(&mut conn, &columns, &model).unwrap();
+        assert!(cached.from_cache);
+
+        let candidates = semantic_search(&conn, &model, "failed login for alice", 3, -1.0).unwrap();
+        let related_positions = [1i64, 3i64]
+            .into_iter()
+            .map(|row_num| {
+                candidates
+                    .iter()
+                    .position(|candidate| candidate.row_num == row_num)
+                    .expect("related evidence should be in the top three")
+            })
+            .collect::<Vec<_>>();
+        let printer_position = candidates
+            .iter()
+            .position(|candidate| candidate.row_num == 2);
+        assert!(
+            printer_position.is_none()
+                || related_positions
+                    .iter()
+                    .all(|related| *related < printer_position.unwrap()),
+            "candidates={candidates:?}"
+        );
+    }
 }
