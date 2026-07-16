@@ -915,7 +915,8 @@ mod tests {
              (1, '2026-01-01T03:00:00+02:00', 'evidence marker'),
              (2, '2025-12-31T23:30:00-01:00', 'evidence marker'),
              (3, 'not-a-time', 'evidence marker invalid'),
-             (4, '', 'evidence marker blank')",
+             (4, '', 'evidence marker blank'),
+             (5, '2026-01-01T00:30:00Z', 'evidence marker tied')",
             [],
         )
         .unwrap();
@@ -937,13 +938,40 @@ mod tests {
         let first = run_guided_query(&conn, &columns, &token, None, Some(1)).unwrap();
         assert_eq!(first.rows[0]["row_num"], 2);
         let second = run_guided_query(&conn, &columns, &token, first.next_cursor, Some(1)).unwrap();
-        assert_eq!(second.rows[0]["row_num"], 1);
+        assert_eq!(second.rows[0]["row_num"], 5);
         let third = run_guided_query(&conn, &columns, &token, second.next_cursor, Some(1)).unwrap();
-        assert_eq!(third.rows[0]["row_num"], 3);
-        assert!(third.next_cursor.as_ref().unwrap().sort_value.is_none());
+        assert_eq!(third.rows[0]["row_num"], 1);
         let fourth = run_guided_query(&conn, &columns, &token, third.next_cursor, Some(1)).unwrap();
-        assert_eq!(fourth.rows[0]["row_num"], 4);
-        assert!(!fourth.has_more);
+        assert_eq!(fourth.rows[0]["row_num"], 3);
+        assert!(fourth.next_cursor.as_ref().unwrap().sort_value.is_none());
+        let fifth = run_guided_query(&conn, &columns, &token, fourth.next_cursor, Some(1)).unwrap();
+        assert_eq!(fifth.rows[0]["row_num"], 4);
+        assert!(!fifth.has_more);
+
+        let descending = serde_json::to_string(&GuidedIntent::RawEvidenceSearch {
+            alternatives: vec![RawSearchAlternative {
+                terms: vec!["evidence marker".into()],
+                filters: vec![],
+            }],
+            sort: Some(RawSearchSort {
+                column: "event_time".into(),
+                direction: RawSortDirection::Desc,
+                normalized_time: true,
+            }),
+            semantic_row_ids: vec![],
+        })
+        .unwrap();
+        let mut cursor = None;
+        let mut descending_rows = Vec::new();
+        loop {
+            let page = run_guided_query(&conn, &columns, &descending, cursor, Some(1)).unwrap();
+            descending_rows.push(page.rows[0]["row_num"].as_i64().unwrap());
+            if !page.has_more {
+                break;
+            }
+            cursor = page.next_cursor;
+        }
+        assert_eq!(descending_rows, vec![1, 5, 2, 4, 3]);
     }
 
     #[test]
