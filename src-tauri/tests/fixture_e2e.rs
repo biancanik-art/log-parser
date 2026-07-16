@@ -11,6 +11,8 @@ use std::time::Instant;
 const NUM_ROWS: usize = 120_000;
 const MARKER: &str = "forensic_test_marker_XYZ";
 const MARKER_ROW: usize = 60_000; // 1-indexed data row where the marker appears
+const SEMANTIC_MARKER_TEXT: &str =
+    "LSASS process memory access detected during operating system credential dumping";
 
 fn testdata_dir() -> PathBuf {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("testdata");
@@ -107,7 +109,15 @@ fn generate_large_fixture(path: &Path, num_rows: usize) {
             .write_string(row, 19, if i % 2 == 0 { "TCP" } else { "UDP" })
             .unwrap();
         worksheet
-            .write_string(row, 20, "Synthetic test event description text")
+            .write_string(
+                row,
+                20,
+                if i + 1 == MARKER_ROW {
+                    SEMANTIC_MARKER_TEXT
+                } else {
+                    "Synthetic test event description text"
+                },
+            )
             .unwrap();
         worksheet.write_string(row, 21, "RuleA").unwrap();
         worksheet.write_string(row, 22, "Resolved").unwrap();
@@ -237,16 +247,16 @@ fn large_fixture_import_and_query() {
     let _ = std::fs::remove_dir_all(&export_dir);
 }
 
-/// Release-only scale benchmark for the pinned all-MiniLM-L6-v2 row index. It always imports the
-/// tracked 120,000-row, 27-column fixture, then copies a bounded sample into an isolated database
-/// before embedding it. The known forensic marker row is retained so retrieval quality is asserted
-/// instead of measuring throughput alone.
+/// Release-only scale benchmark for the pinned all-MiniLM-L6-v2 deduplicated document index. It
+/// imports the tracked 120,000-row, 27-column fixture and defaults to the complete dataset. The
+/// known evidence row gets a paraphrasable marker in a real text column so retrieval quality is
+/// asserted independently from exact Account/identifier matching.
 ///
 /// Override the default sample with `LOG_PARSER_SEMANTIC_BENCH_ROWS`, up to all 120,000 rows.
 #[test]
 #[ignore = "loads the pinned MiniLM model and builds a real semantic index"]
 fn semantic_fixture_build_and_search_benchmark() {
-    const DEFAULT_BENCH_ROWS: usize = 2_048;
+    const DEFAULT_BENCH_ROWS: usize = NUM_ROWS;
 
     let requested_rows = std::env::var("LOG_PARSER_SEMANTIC_BENCH_ROWS")
         .map(|value| {
@@ -340,6 +350,13 @@ fn semantic_fixture_build_and_search_benchmark() {
     }
     conn.execute_batch("DETACH DATABASE source")
         .expect("detaching imported fixture database");
+    // Older checked-in/generated fixture copies predate the semantic text marker. Keep the
+    // benchmark deterministic without weakening the independent exact Account marker assertion.
+    conn.execute(
+        "UPDATE rows SET description = ?1 WHERE row_num = ?2",
+        params![SEMANTIC_MARKER_TEXT, MARKER_ROW as i64],
+    )
+    .expect("placing semantic marker in the Description text column");
     db::populate_fts(&conn, &imported.columns)
         .expect("populating FTS for a production-shaped benchmark database");
 
@@ -355,6 +372,24 @@ fn semantic_fixture_build_and_search_benchmark() {
         )
         .expect("bounded fixture must retain its known evidence row");
     assert_eq!(marker_account, MARKER);
+    let semantic_marker: String = conn
+        .query_row(
+            "SELECT description FROM rows WHERE row_num = ?1",
+            [MARKER_ROW as i64],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(semantic_marker, SEMANTIC_MARKER_TEXT);
+    let exact_marker_count = query::count_rows(
+        &conn,
+        &imported.columns,
+        &query::QuerySpec {
+            search: Some(MARKER.to_string()),
+            ..query::QuerySpec::default()
+        },
+    )
+    .expect("exact FTS should remain independently usable");
+    assert_eq!(exact_marker_count, 1);
 
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let resources = manifest.join("resources");
@@ -383,18 +418,30 @@ fn semantic_fixture_build_and_search_benchmark() {
 
     let embedding_bytes: i64 = conn
         .query_row(
-            "SELECT COALESCE(SUM(length(embedding)), 0) FROM _semantic_index",
+            "SELECT COALESCE(SUM(length(embedding)), 0) FROM _semantic_v2_document",
             [],
             |row| row.get(0),
         )
+        .unwrap();
+    let unique_documents: i64 = conn
+        .query_row("SELECT COUNT(*) FROM _semantic_v2_document", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    let mappings: i64 = conn
+        .query_row("SELECT COUNT(*) FROM _semantic_v2_mapping", [], |row| {
+            row.get(0)
+        })
         .unwrap();
     let database_bytes_after = std::fs::metadata(&bench_db_path).unwrap().len();
     let index_file_growth_bytes = database_bytes_after.saturating_sub(database_bytes_before);
     let build_seconds = build_elapsed.as_secs_f64();
     let build_throughput = summary.rows_indexed as f64 / build_seconds;
     println!(
-        "semantic bench build: rows={} elapsed_ms={} summary_elapsed_ms={} rows_per_second={:.2} embedding_bytes={} database_growth_bytes={} database_bytes={}",
+        "semantic bench build: rows={} unique_documents={} mappings={} elapsed_ms={} summary_elapsed_ms={} rows_per_second={:.2} embedding_bytes={} database_growth_bytes={} database_bytes={}",
         summary.rows_indexed,
+        unique_documents,
+        mappings,
         build_elapsed.as_millis(),
         summary.elapsed_ms,
         build_throughput,
@@ -402,51 +449,82 @@ fn semantic_fixture_build_and_search_benchmark() {
         index_file_growth_bytes,
         database_bytes_after
     );
+    assert_eq!(summary.documents_indexed, unique_documents);
+    assert_eq!(summary.mappings_written, mappings);
+    if bench_rows == NUM_ROWS {
+        assert!(
+            build_elapsed <= std::time::Duration::from_secs(120),
+            "full semantic v2 build exceeded the two-minute target: {build_elapsed:?}"
+        );
+    }
 
     let search_started = Instant::now();
-    let candidates =
-        semantic::semantic_search(&conn, &model, "forensic test marker XYZ evidence", 10, -1.0)
-            .expect("searching semantic benchmark index");
+    let selection = semantic::create_semantic_selection(
+        &mut conn,
+        &imported.columns,
+        &model,
+        "dump credentials by reading LSASS memory",
+        semantic::SemanticSearchPolicy::default(),
+    )
+    .expect("creating production semantic document selection");
     let search_elapsed = search_started.elapsed();
-    let marker_candidate = candidates
+    let selected_documents = conn
+        .prepare(
+            "SELECT d.normalized_text, sd.cosine_score
+             FROM _semantic_v2_selection_doc sd
+             JOIN _semantic_v2_document d ON d.doc_id = sd.doc_id
+             WHERE sd.selection_id = ?1
+             ORDER BY sd.cosine_score DESC, sd.doc_id ASC",
+        )
+        .unwrap()
+        .query_map([&selection.selection_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, f32>(1)?))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    let (marker_rank, marker_document) = selected_documents
         .iter()
-        .find(|candidate| candidate.row_num == MARKER_ROW as i64)
+        .enumerate()
+        .find(|(_, (text, _))| text.contains("lsass process memory access"))
+        .map(|(index, document)| (index + 1, document))
         .unwrap_or_else(|| {
-            panic!(
-                "known forensic marker row was not retrieved; candidates={:?}",
-                candidates
-                    .iter()
-                    .map(|candidate| (candidate.row_num, candidate.score))
-                    .collect::<Vec<_>>()
-            )
+            panic!("semantic marker document was not retained; selected={selected_documents:?}")
         });
-    println!(
-        "semantic bench search: elapsed_ms={} candidates={} marker_rank={} marker_score={:.6} top={:?}",
-        search_elapsed.as_millis(),
-        candidates.len(),
-        candidates
-            .iter()
-            .position(|candidate| candidate.row_num == MARKER_ROW as i64)
-            .unwrap()
-            + 1,
-        marker_candidate.score,
-        candidates
-            .iter()
-            .map(|candidate| (candidate.row_num, candidate.score))
-            .collect::<Vec<_>>()
+    assert!(
+        marker_rank <= 5,
+        "semantic marker ranked too low: rank={marker_rank} selected={selected_documents:?}"
     );
-
-    let projection_scale = NUM_ROWS as f64 / summary.rows_indexed as f64;
-    let projected_build_seconds = build_seconds * projection_scale;
-    let projected_embedding_bytes = (embedding_bytes as f64 * projection_scale).round() as u64;
-    let projected_database_growth_bytes =
-        (index_file_growth_bytes as f64 * projection_scale).round() as u64;
+    let selection_spec = query::QuerySpec {
+        expression: Some(query::QueryExpression::SemanticSelection {
+            selection_id: selection.selection_id.clone(),
+        }),
+        cursor: Some(query::Cursor {
+            sort_value: None,
+            row_num: MARKER_ROW as i64 - 1,
+        }),
+        limit: 1,
+        ..query::QuerySpec::default()
+    };
+    let marker_page = query::query_rows(&conn, &imported.columns, &selection_spec)
+        .expect("querying the trusted semantic selection");
+    assert_eq!(marker_page.rows[0]["row_num"], MARKER_ROW as i64);
+    let marker_reasons =
+        semantic::semantic_selection_reasons(&conn, &selection.selection_id, &[MARKER_ROW as i64])
+            .unwrap();
+    assert!(marker_reasons[&(MARKER_ROW as i64)]
+        .iter()
+        .any(|reason| reason.contains("lsass process memory access")));
     println!(
-        "semantic bench projection_120k: build_seconds={:.2} embedding_bytes={} database_growth_bytes={} scale={:.4}",
-        projected_build_seconds,
-        projected_embedding_bytes,
-        projected_database_growth_bytes,
-        projection_scale
+        "semantic bench search: elapsed_ms={} documents_above_threshold={} documents_retained={} rows_matched={} marker_rank={} marker_score={:.6} warnings={:?} top={:?}",
+        search_elapsed.as_millis(),
+        selection.documents_above_threshold,
+        selection.documents_retained,
+        selection.rows_matched,
+        marker_rank,
+        marker_document.1,
+        selection.warnings,
+        selected_documents.iter().take(10).collect::<Vec<_>>()
     );
 
     drop(conn);

@@ -232,12 +232,14 @@ fn header_key(column: &ColumnMeta) -> String {
 }
 
 fn exact_only_header(column: &ColumnMeta) -> bool {
-    if matches!(
-        column.inferred_type.to_ascii_lowercase().as_str(),
-        "timestamp" | "ip" | "identifier" | "number" | "numeric"
-    ) {
-        return true;
-    }
+    exact_only_header_name(column)
+        || matches!(
+            column.inferred_type.to_ascii_lowercase().as_str(),
+            "timestamp" | "ip" | "identifier" | "number" | "numeric"
+        )
+}
+
+fn exact_only_header_name(column: &ColumnMeta) -> bool {
     let key = header_key(column);
     [
         "timestamp",
@@ -443,10 +445,13 @@ fn classify_columns(conn: &Connection, columns: &[ColumnMeta]) -> Result<Vec<Col
             } else {
                 stat.dynamic as f64 / stat.nonempty as f64
             };
-            let mode = if exact_only_header(column) {
-                ColumnMode::ExactOnly
-            } else if force_text_header(column) {
+            // Strong free-text headers correct weak importer type inference (for example, a
+            // Description column once misclassified as IP). Explicit identifier/timestamp/hash
+            // names still win for ambiguous names such as ProcessId.
+            let mode = if force_text_header(column) && !exact_only_header_name(column) {
                 ColumnMode::Text
+            } else if exact_only_header(column) {
+                ColumnMode::ExactOnly
             } else if stat.nonempty >= 16 && dynamic_ratio >= 0.80 {
                 ColumnMode::ExactOnly
             } else if stat.distinct.len() <= 128 || distinct_ratio <= 0.10 {
@@ -1800,10 +1805,12 @@ mod tests {
     #[test]
     fn v2_normalizer_deduplicates_dynamic_ids_and_never_starves_the_final_column() {
         let conn = Connection::open_in_memory().unwrap();
+        let mut description = text_column("final_evidence", "Evidence Description", 2);
+        description.inferred_type = "ip".to_string();
         let columns = vec![
             text_column("event_id", "Event GUID", 0),
             text_column("verbose_message", "Message", 1),
-            text_column("final_evidence", "Evidence Description", 2),
+            description,
         ];
         db::create_schema(&conn, &columns).unwrap();
         let long_prefix = (0..300)
@@ -1826,6 +1833,7 @@ mod tests {
 
         let plans = classify_columns(&conn, &columns).unwrap();
         assert_eq!(plans[0].mode, ColumnMode::ExactOnly);
+        assert_eq!(plans[2].mode, ColumnMode::Text);
         let values = vec![
             Some("550e8400-e29b-41d4-a716-446655440000".to_string()),
             Some(format!("{long_prefix} process 9384")),
