@@ -1,12 +1,16 @@
-use crate::db::ColumnMeta;
+use crate::db::{self, ColumnMeta};
 use crate::intel::library::{self, LoadedLibrary, Technique};
 use crate::intel::llm_parser::{self, ConfirmedRole, LlmContext, LlmParser};
+use crate::query::{
+    ColumnFilter, Cursor, FilterOp, QueryExpression, QuerySpec, SortDirection, SortSpec,
+};
 use anyhow::{anyhow, bail, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 const CORRELATION_ENGINE_VERSION: &str = "matcher:v1;guided-grounding:v3";
+const RAW_QUERY_ENGINE_VERSION: &str = "raw-table-search:v1";
 const MAX_GROUNDED_USER_CHARS: usize = 256;
 const MAX_USER_CANDIDATES: usize = 16;
 const MAX_RAW_USER_MATCHES: usize = 16;
@@ -22,11 +26,69 @@ pub struct GuidedQueryPreview {
     pub audit_id: Option<i64>,
     pub review_status: String,
     pub validation_status: Option<String>,
+    pub query_spec: Option<QuerySpec>,
+    pub match_explanation: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RawSearchAlternative {
+    pub terms: Vec<String>,
+    pub filters: Vec<RawSearchFilter>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RawSearchFilter {
+    pub column: String,
+    pub op: RawFilterOp,
+    #[serde(default)]
+    pub value: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RawFilterOp {
+    Equals,
+    NotEquals,
+    Contains,
+    NotContains,
+    StartsWith,
+    EndsWith,
+    IsEmpty,
+    IsNotEmpty,
+    GreaterThan,
+    LessThan,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RawSearchSort {
+    pub column: String,
+    pub direction: RawSortDirection,
+    #[serde(default, rename = "normalizedTime")]
+    pub normalized_time: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RawSortDirection {
+    Asc,
+    Desc,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "intent", rename_all = "camelCase", deny_unknown_fields)]
 pub enum GuidedIntent {
+    RawEvidenceSearch {
+        alternatives: Vec<RawSearchAlternative>,
+        #[serde(default)]
+        sort: Option<RawSearchSort>,
+        /// Trusted backend-only semantic candidates. The model wire schema cannot emit this
+        /// field; Rust adds bounded positive row IDs only after searching a verified local index.
+        #[serde(default, rename = "semanticRowIds")]
+        semantic_row_ids: Vec<i64>,
+    },
     SuspiciousScan {
         #[serde(rename = "tacticIds")]
         tactic_ids: Vec<String>,
@@ -125,131 +187,100 @@ pub fn parse_guided_query_with_llm(
     query_text: &str,
     model: &mut LlmParser,
 ) -> Result<GuidedQueryPreview> {
-    let library = library::load_merged_library()?;
-    let context = ParserContext::from_db(conn, columns)?;
+    parse_guided_query_with_llm_and_semantic(conn, columns, query_text, model, &[])
+}
+
+pub fn parse_guided_query_with_llm_and_semantic(
+    conn: &Connection,
+    columns: &[ColumnMeta],
+    query_text: &str,
+    model: &mut LlmParser,
+    semantic_row_ids: &[i64],
+) -> Result<GuidedQueryPreview> {
     let trimmed = query_text.trim();
     if trimmed.is_empty() {
         return clarification(
-            "I need a query before I can build a guided search.",
-            &["Try: show credential access for alice chronologically"],
+            "I need a query before I can search the imported table.",
+            &["Try: show failed logons for alice as a timeline"],
         );
     }
     if trimmed.chars().count() > llm_parser::MAX_QUERY_CHARS {
         return clarification(
-            "That query is too long for the local guided-search parser.",
-            &["Shorten it to a technique, tactic, and optional user identity"],
+            "That query is too long for the local table-search planner.",
+            &["Shorten it to the evidence values, columns, and optional sort order"],
         );
     }
-    if let Some(preview) = deterministic_llm_preflight(trimmed, &library, &context)? {
-        return Ok(preview);
-    }
-
-    let candidates = build_candidates(&library);
-    let mut grounding = select_techniques(trimmed, &library, &candidates);
-    let mut user_resolution = grounded_user_values_from_query(conn, trimmed, &grounding, &context)?;
-    if user_resolution.overflowed {
-        return clarification(
-            "That query matches too many possible user identities to resolve safely.",
-            &["Use one exact qualified identity from the confirmed user column"],
-        );
-    }
-    let mut grounded_users = user_resolution.values;
-    if is_bounded_semantic_shorthand_request(trimmed, &grounded_users) {
-        let Some(semantic_selection) =
-            select_bounded_semantic_shorthand(trimmed, &library, &grounded_users)
-        else {
+    let llm_context = LlmContext::from_table(conn, columns, trimmed)?;
+    if llm_parser::query_requests_timeline(trimmed) {
+        if let Some(issue) = llm_context.timeline_issue() {
             return clarification(
-                "The configured library cannot resolve that shorthand to its one audited technique.",
-                &["Name the exact technique or restore the built-in intelligence library"],
-            );
-        };
-        grounding = semantic_selection;
-        user_resolution = grounded_user_values_from_query(conn, trimmed, &grounding, &context)?;
-        if user_resolution.overflowed {
-            return clarification(
-                "That query matches too many possible user identities to resolve safely.",
-                &["Use one exact qualified identity from the confirmed user column"],
+                issue,
+                &["Name the timestamp column or normalize its timezone first"],
             );
         }
-        grounded_users = user_resolution.values;
     }
-    if grounded_users.len() > 1 {
-        return clarification(
-            "I found more than one user identity from the confirmed user column in that query.",
-            &["Use one exact user identity per guided search"],
-        );
-    }
-    if let Some(message) =
-        unresolved_user_request_message(conn, trimmed, &grounding, &grounded_users, &context)?
-    {
-        return clarification(
-            &message,
-            &["Use one exact identity from the confirmed user column, or remove the user filter"],
-        );
-    }
-    let llm_context = LlmContext::from_library_subset(
-        &library,
-        &grounding.technique_ids,
-        context.confirmed_roles.clone(),
-        context.has_normalized_time,
-    )
-    .with_query_grounding(
-        grounded_users.clone(),
-        grounding.matched_terms.iter().cloned().collect(),
-    );
+
+    // The local model only proposes a bounded plan. Strict Rust validation in `llm_parser`
+    // checks every column, operator, literal, branch, and sort before this token is created.
     let mut result = model.parse(trimmed, &llm_context)?;
-    let grounding_error = bind_llm_intent_to_grounding(
-        trimmed,
-        &mut result.intent,
-        &grounding,
-        &grounded_users,
-        &context,
-    )
-    .or(llm_grounding_error(
-        conn,
-        trimmed,
-        &result.intent,
-        &grounding,
-        &grounded_users,
-        &context,
-    )?);
-    if let Some(detail) = grounding_error {
-        result.intent = GuidedIntent::Unknown {
-            message:
-                "The local AI interpretation was not grounded in the query and loaded evidence."
-                    .to_string(),
-            suggestions: vec![
-                "Name an exact technique, tactic, or user identity and try again.".to_string(),
-            ],
-        };
-        result.validation_status = "rejected_by_grounding".to_string();
-        result.validation_detail = Some(detail);
+    if let GuidedIntent::RawEvidenceSearch {
+        semantic_row_ids: trusted_ids,
+        ..
+    } = &mut result.intent
+    {
+        let mut ids = semantic_row_ids
+            .iter()
+            .copied()
+            .filter(|row_num| *row_num > 0)
+            .take(crate::query::MAX_ROW_IDS)
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        ids.dedup();
+        *trusted_ids = ids;
     }
     let intent_token = encode_intent(&result.intent)?;
     let audit_id = record_llm_audit(conn, trimmed, &intent_token, &result, &llm_context)?;
 
     let needs_clarification = matches!(result.intent, GuidedIntent::Unknown { .. });
-    let (preview_text, clarification_message) = if let GuidedIntent::Unknown {
-        message,
-        suggestions,
-    } = &result.intent
-    {
-        let follow_up = if suggestions.is_empty() {
-            message.clone()
+    let (preview_text, clarification_message, query_spec, match_explanation) =
+        if let GuidedIntent::Unknown {
+            message,
+            suggestions,
+        } = &result.intent
+        {
+            let follow_up = if suggestions.is_empty() {
+                message.clone()
+            } else {
+                format!("{} {}", message, suggestions.join("; "))
+            };
+            (
+                "No table query will be run until this is clarified.".to_string(),
+                Some(follow_up),
+                None,
+                Vec::new(),
+            )
+        } else if matches!(result.intent, GuidedIntent::RawEvidenceSearch { .. }) {
+            let explanation = raw_match_explanation(&result.intent);
+            let spec = query_spec_from_raw_intent(&result.intent, None, Some(200))?;
+            (
+                raw_preview_text(&result.intent),
+                None,
+                Some(spec),
+                explanation,
+            )
         } else {
-            format!("{} {}", message, suggestions.join("; "))
+            // Compatibility path for previously-supported MITRE intents. New local-AI prompts do
+            // not request these; old tokens remain readable and executable after a scan.
+            let library = library::load_merged_library()?;
+            let context = ParserContext::from_db(conn, columns)?;
+            let selection = selection_for_intent(&result.intent, &library);
+            (
+                preview_text(&result.intent, &selection, &library, &context),
+                None,
+                None,
+                Vec::new(),
+            )
         };
-        (
-            "No guided query will be run until this is clarified.".to_string(),
-            Some(follow_up),
-        )
-    } else {
-        let selection = selection_for_intent(&result.intent, &library);
-        (
-            preview_text(&result.intent, &selection, &library, &context),
-            None,
-        )
-    };
 
     Ok(GuidedQueryPreview {
         intent_token,
@@ -260,6 +291,8 @@ pub fn parse_guided_query_with_llm(
         audit_id: Some(audit_id),
         review_status: "unreviewed".to_string(),
         validation_status: Some(result.validation_status),
+        query_spec,
+        match_explanation,
     })
 }
 
@@ -387,11 +420,212 @@ fn parse_with_context(
         audit_id: None,
         review_status: "not_applicable".to_string(),
         validation_status: None,
+        query_spec: None,
+        match_explanation: Vec::new(),
     })
 }
 
 fn encode_intent(intent: &GuidedIntent) -> Result<String> {
     serde_json::to_string(intent).map_err(Into::into)
+}
+
+pub fn query_spec_from_raw_intent(
+    intent: &GuidedIntent,
+    cursor: Option<Cursor>,
+    limit: Option<u32>,
+) -> Result<QuerySpec> {
+    let GuidedIntent::RawEvidenceSearch {
+        alternatives,
+        sort,
+        semantic_row_ids,
+    } = intent
+    else {
+        bail!("guided intent is not a raw evidence search");
+    };
+    if alternatives.is_empty() {
+        bail!("raw evidence search has no alternatives");
+    }
+    let mut branches = Vec::with_capacity(alternatives.len());
+    for alternative in alternatives {
+        if alternative.terms.is_empty() && alternative.filters.is_empty() {
+            bail!("raw evidence search contains an empty alternative");
+        }
+        let mut children = alternative
+            .terms
+            .iter()
+            .map(|value| QueryExpression::Search {
+                value: value.clone(),
+            })
+            .collect::<Vec<_>>();
+        children.extend(
+            alternative
+                .filters
+                .iter()
+                .map(|filter| QueryExpression::Predicate {
+                    column: filter.column.clone(),
+                    op: core_filter_op(filter.op),
+                    value: filter.value.clone(),
+                }),
+        );
+        branches.push(if children.len() == 1 {
+            children.pop().expect("one expression child")
+        } else {
+            QueryExpression::And { children }
+        });
+    }
+    let lexical_expression = if branches.len() == 1 {
+        branches.pop().expect("one expression branch")
+    } else {
+        QueryExpression::Or { children: branches }
+    };
+    if semantic_row_ids.len() > crate::query::MAX_ROW_IDS
+        || semantic_row_ids.iter().any(|row_num| *row_num <= 0)
+    {
+        bail!("raw evidence search contains invalid semantic row candidates");
+    }
+    let mut semantic_ids = semantic_row_ids.clone();
+    semantic_ids.sort_unstable();
+    semantic_ids.dedup();
+    let expression = if semantic_ids.is_empty() {
+        lexical_expression
+    } else {
+        QueryExpression::Or {
+            children: vec![
+                lexical_expression,
+                QueryExpression::RowIds {
+                    values: semantic_ids,
+                },
+            ],
+        }
+    };
+    Ok(QuerySpec {
+        search: None,
+        filters: Vec::<ColumnFilter>::new(),
+        expression: Some(expression),
+        sort: sort.as_ref().map(|sort| SortSpec {
+            column: sort.column.clone(),
+            direction: match sort.direction {
+                RawSortDirection::Asc => SortDirection::Asc,
+                RawSortDirection::Desc => SortDirection::Desc,
+            },
+        }),
+        cursor,
+        limit: limit.unwrap_or(200).clamp(1, 5000),
+    })
+}
+
+fn core_filter_op(op: RawFilterOp) -> FilterOp {
+    match op {
+        RawFilterOp::Equals => FilterOp::Equals,
+        RawFilterOp::NotEquals => FilterOp::NotEquals,
+        RawFilterOp::Contains => FilterOp::Contains,
+        RawFilterOp::NotContains => FilterOp::NotContains,
+        RawFilterOp::StartsWith => FilterOp::StartsWith,
+        RawFilterOp::EndsWith => FilterOp::EndsWith,
+        RawFilterOp::IsEmpty => FilterOp::IsEmpty,
+        RawFilterOp::IsNotEmpty => FilterOp::IsNotEmpty,
+        RawFilterOp::GreaterThan => FilterOp::GreaterThan,
+        RawFilterOp::LessThan => FilterOp::LessThan,
+    }
+}
+
+fn raw_preview_text(intent: &GuidedIntent) -> String {
+    let GuidedIntent::RawEvidenceSearch {
+        alternatives, sort, ..
+    } = intent
+    else {
+        return "Raw table search.".to_string();
+    };
+    let predicates = alternatives
+        .iter()
+        .map(|alternative| alternative.terms.len() + alternative.filters.len())
+        .sum::<usize>();
+    let sort_text = sort.as_ref().map_or_else(
+        || "source row order".to_string(),
+        |sort| {
+            format!(
+                "{} {}",
+                sort.column,
+                match sort.direction {
+                    RawSortDirection::Asc => "ascending",
+                    RawSortDirection::Desc => "descending",
+                }
+            )
+        },
+    );
+    format!(
+        "Search every raw row using {} alternative(s) and {predicates} literal predicate(s); sort by {sort_text}.",
+        alternatives.len()
+    )
+}
+
+fn raw_match_explanation(intent: &GuidedIntent) -> Vec<String> {
+    let GuidedIntent::RawEvidenceSearch {
+        alternatives,
+        sort,
+        semantic_row_ids,
+    } = intent
+    else {
+        return Vec::new();
+    };
+    let mut explanation = vec![
+        "Alternatives are OR'ed; every term and filter inside one alternative is AND'ed."
+            .to_string(),
+    ];
+    explanation.extend(
+        alternatives
+            .iter()
+            .enumerate()
+            .map(|(index, alternative)| {
+                let mut parts = alternative
+                    .terms
+                    .iter()
+                    .map(|term| format!("any-column literal '{term}'"))
+                    .collect::<Vec<_>>();
+                parts.extend(alternative.filters.iter().map(|filter| {
+                    format!(
+                        "{} {} '{}'",
+                        filter.column,
+                        raw_filter_label(filter.op),
+                        filter.value
+                    )
+                }));
+                format!("Alternative {}: {}", index + 1, parts.join(" AND "))
+            })
+            .collect::<Vec<_>>(),
+    );
+    if let Some(sort) = sort {
+        explanation.push(format!(
+            "Sort: {} {}",
+            sort.column,
+            match sort.direction {
+                RawSortDirection::Asc => "ascending",
+                RawSortDirection::Desc => "descending",
+            }
+        ));
+    }
+    if !semantic_row_ids.is_empty() {
+        explanation.push(format!(
+            "Semantic recall: {} locally-ranked raw row candidate(s) OR the literal plan",
+            semantic_row_ids.len()
+        ));
+    }
+    explanation
+}
+
+fn raw_filter_label(op: RawFilterOp) -> &'static str {
+    match op {
+        RawFilterOp::Equals => "equals",
+        RawFilterOp::NotEquals => "does not equal",
+        RawFilterOp::Contains => "contains",
+        RawFilterOp::NotContains => "does not contain",
+        RawFilterOp::StartsWith => "starts with",
+        RawFilterOp::EndsWith => "ends with",
+        RawFilterOp::IsEmpty => "is empty",
+        RawFilterOp::IsNotEmpty => "is not empty",
+        RawFilterOp::GreaterThan => "is greater than",
+        RawFilterOp::LessThan => "is less than",
+    }
 }
 
 fn clarification(message: &str, suggestions: &[&str]) -> Result<GuidedQueryPreview> {
@@ -408,6 +642,8 @@ fn clarification(message: &str, suggestions: &[&str]) -> Result<GuidedQueryPrevi
         audit_id: None,
         review_status: "not_applicable".to_string(),
         validation_status: None,
+        query_spec: None,
+        match_explanation: Vec::new(),
     })
 }
 
@@ -588,6 +824,8 @@ fn deterministic_llm_preflight(
             audit_id: None,
             review_status: "not_applicable".to_string(),
             validation_status: None,
+            query_spec: None,
+            match_explanation: Vec::new(),
         }));
     }
     Ok(None)
@@ -705,6 +943,11 @@ fn llm_grounding_error(
     };
 
     match intent {
+        GuidedIntent::RawEvidenceSearch { .. } => {
+            return Ok(Some(
+                "raw evidence searches are validated directly against table metadata".to_string(),
+            ));
+        }
         GuidedIntent::SuspiciousScan {
             tactic_ids,
             technique_ids,
@@ -1010,6 +1253,7 @@ fn unresolved_user_request_message(
 
 fn selection_for_intent(intent: &GuidedIntent, library: &LoadedLibrary) -> TechniqueSelection {
     let (technique_ids, tactic_ids): (&[String], &[String]) = match intent {
+        GuidedIntent::RawEvidenceSearch { .. } => (&[], &[]),
         GuidedIntent::SuspiciousScan {
             technique_ids,
             tactic_ids,
@@ -1061,12 +1305,35 @@ fn create_llm_audit_table(conn: &Connection) -> rusqlite::Result<()> {
             validation_status TEXT NOT NULL,
             validation_detail TEXT,
             trusted_intent_json TEXT NOT NULL,
+            dataset_schema_sha256 TEXT,
+            dataset_import_sha256 TEXT,
             examiner_decision TEXT NOT NULL CHECK (
                 examiner_decision IN ('unreviewed', 'accepted', 'rejected', 'edited')
             ),
             decided_at TEXT
          );",
-    )
+    )?;
+    // Existing cache databases may already contain the v3 audit table. Add the dataset-binding
+    // columns in place without invalidating old MITRE audit history.
+    ensure_audit_column(conn, "dataset_schema_sha256")?;
+    ensure_audit_column(conn, "dataset_import_sha256")?;
+    Ok(())
+}
+
+fn ensure_audit_column(conn: &Connection, column: &str) -> rusqlite::Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(_llm_parse_audit)")?;
+    let exists = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .iter()
+        .any(|name| name == column);
+    if !exists {
+        conn.execute_batch(&format!(
+            "ALTER TABLE _llm_parse_audit ADD COLUMN {} TEXT",
+            crate::db::quote_ident(column)
+        ))?;
+    }
+    Ok(())
 }
 
 fn record_llm_audit(
@@ -1078,16 +1345,34 @@ fn record_llm_audit(
 ) -> Result<i64> {
     create_llm_audit_table(conn)?;
     let artifacts = context.artifact_ids_json()?;
+    let raw_context = context.is_raw_table_context();
+    let correlation_engine = if raw_context {
+        RAW_QUERY_ENGINE_VERSION.to_string()
+    } else {
+        format!(
+            "intel-library:{};{CORRELATION_ENGINE_VERSION}",
+            context.library_hash
+        )
+    };
+    let dataset_schema_sha256 = context
+        .dataset_identity
+        .as_ref()
+        .map(|identity| identity.schema_sha256.as_str());
+    let dataset_import_sha256 = context
+        .dataset_identity
+        .as_ref()
+        .map(|identity| identity.import_sha256.as_str());
     conn.execute(
         "INSERT INTO _llm_parse_audit (
             provider, model_name, model_version, model_sha256, tokenizer_sha256,
             prompt_template_version, correlation_engine_version, artifact_ids_json,
             input_sha256, generation_parameters_json, created_at, load_time_ms,
             inference_latency_ms, raw_output, validation_status, validation_detail,
-            trusted_intent_json, examiner_decision
+            trusted_intent_json, dataset_schema_sha256, dataset_import_sha256,
+            examiner_decision
          ) VALUES (
             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-            ?15, ?16, ?17, 'unreviewed'
+            ?15, ?16, ?17, ?18, ?19, 'unreviewed'
          )",
         params![
             result.metadata.provider,
@@ -1096,10 +1381,7 @@ fn record_llm_audit(
             result.metadata.model_sha256,
             result.metadata.tokenizer_sha256,
             llm_parser::PROMPT_TEMPLATE_VERSION,
-            format!(
-                "intel-library:{};{CORRELATION_ENGINE_VERSION}",
-                context.library_hash
-            ),
+            correlation_engine,
             artifacts,
             llm_parser::sha256_text(query_text),
             llm_parser::generation_parameters_json(),
@@ -1110,6 +1392,8 @@ fn record_llm_audit(
             result.validation_status,
             result.validation_detail,
             trusted_intent_json,
+            dataset_schema_sha256,
+            dataset_import_sha256,
         ],
     )?;
     Ok(conn.last_insert_rowid())
@@ -1136,18 +1420,31 @@ pub fn accept_llm_audit(conn: &Connection, audit_id: i64, intent_token: &str) ->
     if !table_exists(conn, "_llm_parse_audit")? {
         bail!("AI-assisted guided-query audit record is missing");
     }
-    if matches!(
-        intent_from_token(intent_token)?,
-        GuidedIntent::Unknown { .. }
-    ) {
+    let intent = intent_from_token(intent_token)?;
+    if matches!(intent, GuidedIntent::Unknown { .. }) {
         bail!("AI-assisted interpretation needs clarification and cannot be accepted");
     }
-    let current_library = library::load_merged_library()?;
-    let expected_engine = format!(
-        "intel-library:{};{CORRELATION_ENGINE_VERSION}",
-        current_library.library_hash
-    );
-    require_matching_scan_library(conn, &current_library.library_hash)?;
+    let (expected_engine, expected_schema, expected_import) =
+        if matches!(intent, GuidedIntent::RawEvidenceSearch { .. }) {
+            let columns = db::load_columns(conn)?;
+            let identity = llm_parser::dataset_identity(conn, &columns)?;
+            (
+                RAW_QUERY_ENGINE_VERSION.to_string(),
+                Some(identity.schema_sha256),
+                Some(identity.import_sha256),
+            )
+        } else {
+            let current_library = library::load_merged_library()?;
+            require_matching_scan_library(conn, &current_library.library_hash)?;
+            (
+                format!(
+                    "intel-library:{};{CORRELATION_ENGINE_VERSION}",
+                    current_library.library_hash
+                ),
+                None,
+                None,
+            )
+        };
 
     let changed = conn.execute(
         "UPDATE _llm_parse_audit
@@ -1156,35 +1453,69 @@ pub fn accept_llm_audit(conn: &Connection, audit_id: i64, intent_token: &str) ->
            AND trusted_intent_json = ?2
            AND correlation_engine_version = ?3
            AND validation_status = 'validated'
+           AND (?5 IS NULL OR dataset_schema_sha256 = ?5)
+           AND (?6 IS NULL OR dataset_import_sha256 = ?6)
            AND examiner_decision = 'unreviewed'",
         params![
             audit_id,
             intent_token,
             expected_engine,
-            chrono::Utc::now().to_rfc3339()
+            chrono::Utc::now().to_rfc3339(),
+            expected_schema,
+            expected_import,
         ],
     )?;
     if changed == 1 {
         return Ok(());
     }
 
-    let audit: Option<(String, String, String, String)> = conn
+    let audit: Option<(
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+    )> = conn
         .query_row(
             "SELECT trusted_intent_json, examiner_decision, validation_status,
-                    correlation_engine_version
+                    correlation_engine_version, dataset_schema_sha256, dataset_import_sha256
              FROM _llm_parse_audit WHERE id = ?1",
             [audit_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
         )
         .optional()?;
-    let Some((stored_intent, decision, validation_status, correlation_engine)) = audit else {
+    let Some((
+        stored_intent,
+        decision,
+        validation_status,
+        correlation_engine,
+        stored_schema,
+        stored_import,
+    )) = audit
+    else {
         bail!("AI-assisted guided-query audit record is missing");
     };
     if stored_intent != intent_token {
         bail!("guided-query intent does not match its AI audit record");
     }
     if correlation_engine != expected_engine {
-        bail!("AI-assisted interpretation used a different intelligence library; parse it again");
+        bail!("AI-assisted interpretation used a different query engine; parse it again");
+    }
+    if expected_schema.is_some() && stored_schema != expected_schema {
+        bail!("the imported table schema changed after AI parsing; parse the query again");
+    }
+    if expected_import.is_some() && stored_import != expected_import {
+        bail!("the loaded import changed after AI parsing; parse the query again");
     }
     if validation_status != "validated" {
         bail!(
@@ -1790,6 +2121,7 @@ fn preview_text(
         }
     };
     match intent {
+        GuidedIntent::RawEvidenceSearch { .. } => raw_preview_text(intent),
         GuidedIntent::SuspiciousScan {
             tactic_ids,
             technique_ids,
@@ -1835,6 +2167,7 @@ fn preview_text(
 
 fn intent_sort(intent: &GuidedIntent) -> GuidedSort {
     match intent {
+        GuidedIntent::RawEvidenceSearch { .. } => GuidedSort::RowNumAsc,
         GuidedIntent::SuspiciousScan { sort, .. }
         | GuidedIntent::UserTechniqueTimeline { sort, .. }
         | GuidedIntent::TechniqueTimeline { sort, .. } => *sort,
@@ -2161,6 +2494,51 @@ mod tests {
             sort: GuidedSort::RowNumAsc,
         })
         .unwrap()
+    }
+
+    fn raw_intent_token() -> String {
+        serde_json::to_string(&GuidedIntent::RawEvidenceSearch {
+            alternatives: vec![RawSearchAlternative {
+                terms: vec!["alice".into()],
+                filters: vec![RawSearchFilter {
+                    column: "account".into(),
+                    op: RawFilterOp::Contains,
+                    value: "alice".into(),
+                }],
+            }],
+            sort: None,
+            semantic_row_ids: Vec::new(),
+        })
+        .unwrap()
+    }
+
+    fn insert_raw_audit(conn: &Connection, intent: &str) -> i64 {
+        create_llm_audit_table(conn).unwrap();
+        let columns = db::load_columns(conn).unwrap();
+        let identity = llm_parser::dataset_identity(conn, &columns).unwrap();
+        conn.execute(
+            "INSERT INTO _llm_parse_audit (
+                provider, model_name, model_version, model_sha256, tokenizer_sha256,
+                prompt_template_version, correlation_engine_version, artifact_ids_json,
+                input_sha256, generation_parameters_json, created_at, load_time_ms,
+                inference_latency_ms, raw_output, validation_status, validation_detail,
+                trusted_intent_json, dataset_schema_sha256, dataset_import_sha256,
+                examiner_decision
+             ) VALUES (
+                'local-candle', 'model', 'version', 'model-hash', 'tokenizer-hash',
+                'raw-v1', ?2, '{}', 'input-hash', '{}',
+                '2026-07-17T00:00:00Z', 1, 2, '{}', 'validated', NULL, ?1, ?3, ?4,
+                'unreviewed'
+             )",
+            rusqlite::params![
+                intent,
+                RAW_QUERY_ENGINE_VERSION,
+                identity.schema_sha256,
+                identity.import_sha256,
+            ],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
     }
 
     #[test]
@@ -2878,6 +3256,63 @@ mod tests {
             )
             .unwrap();
         assert_eq!(decision, "accepted");
+    }
+
+    #[test]
+    fn raw_audit_accepts_without_intel_scan_and_binds_the_exact_import() {
+        let conn = db_with_confirmed_user();
+        let token = raw_intent_token();
+        let audit_id = insert_raw_audit(&conn, &token);
+        assert!(!table_exists(&conn, "_intel_match").unwrap());
+        accept_llm_audit(&conn, audit_id, &token).unwrap();
+
+        let changed_conn = db_with_confirmed_user();
+        changed_conn
+            .execute(
+                "INSERT INTO rows (row_num, account) VALUES (2, 'CORP\\bob')",
+                [],
+            )
+            .unwrap();
+        let changed_id = insert_raw_audit(&changed_conn, &token);
+        changed_conn
+            .execute(
+                "INSERT INTO rows (row_num, account) VALUES (3, 'CORP\\carol')",
+                [],
+            )
+            .unwrap();
+        let error = accept_llm_audit(&changed_conn, changed_id, &token).unwrap_err();
+        assert!(error.to_string().contains("loaded import changed"));
+    }
+
+    #[test]
+    fn raw_intent_converts_or_alternatives_and_trusted_semantic_rows_to_query_spec() {
+        let intent = GuidedIntent::RawEvidenceSearch {
+            alternatives: vec![
+                RawSearchAlternative {
+                    terms: vec!["powershell".into()],
+                    filters: vec![],
+                },
+                RawSearchAlternative {
+                    terms: vec![],
+                    filters: vec![RawSearchFilter {
+                        column: "account".into(),
+                        op: RawFilterOp::Equals,
+                        value: "alice".into(),
+                    }],
+                },
+            ],
+            sort: None,
+            semantic_row_ids: vec![7, 7, 9],
+        };
+        let spec = query_spec_from_raw_intent(&intent, None, Some(50)).unwrap();
+        assert_eq!(spec.limit, 50);
+        match spec.expression.unwrap() {
+            QueryExpression::Or { children } => {
+                assert_eq!(children.len(), 2);
+                assert!(matches!(children[1], QueryExpression::RowIds { .. }));
+            }
+            other => panic!("unexpected expression: {other:?}"),
+        }
     }
 
     #[test]

@@ -4,6 +4,7 @@ use crate::intel::matcher::{self, IntelScanSummary};
 use crate::intel::{llm_parser, parser as guided_parser, query as guided_query, roles, time};
 use crate::query::{self, QueryPage, QuerySpec};
 use crate::report::{self, ReportExportSummary};
+use crate::semantic;
 use crate::tabular_import;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -21,6 +22,7 @@ pub struct AppStateInner {
 pub struct AppState {
     pub loaded: Mutex<Option<AppStateInner>>,
     pub llm: Arc<Mutex<Option<llm_parser::LlmParser>>>,
+    pub semantic: Arc<Mutex<Option<semantic::SemanticModel>>>,
     next_generation: AtomicU64,
     /// Guards against overlapping `import_sheet` calls (e.g. a double-clicked "Load Sheet"
     /// button, or opening a second file while the first is still importing). Without this,
@@ -73,6 +75,21 @@ struct IntelScanProgressPayload {
     rows_done: i64,
     rows_total: i64,
     phase: String,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct SemanticIndexProgressPayload {
+    rows_done: i64,
+    rows_total: i64,
+    phase: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SemanticIndexStatus {
+    pub ready: bool,
+    pub rows_indexed: i64,
 }
 
 #[derive(Serialize, Clone)]
@@ -279,6 +296,94 @@ pub fn count_rows(state: State<'_, AppState>, spec: QuerySpec) -> Result<i64, St
 }
 
 #[tauri::command]
+pub fn semantic_index_status(state: State<'_, AppState>) -> Result<SemanticIndexStatus, String> {
+    let (db_path, columns, _) = state_snapshot(&state)?;
+    let conn = db::open(&db_path).map_err(|error| error.to_string())?;
+    let ready =
+        semantic::semantic_index_ready(&conn, &columns).map_err(|error| error.to_string())?;
+    let rows_indexed = if ready {
+        conn.query_row(
+            "SELECT rows_indexed FROM _semantic_index_info ORDER BY rowid DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0)
+    } else {
+        0
+    };
+    Ok(SemanticIndexStatus {
+        ready,
+        rows_indexed,
+    })
+}
+
+#[tauri::command]
+pub async fn build_semantic_index(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<semantic::SemanticIndexSummary, String> {
+    let (db_path, columns, generation) = state_snapshot(&state)?;
+    let indexed_db_path = db_path.clone();
+    let model_path = resolve_llm_resource(&app, semantic::MODEL_RESOURCE_PATH)?;
+    let tokenizer_path = resolve_llm_resource(&app, semantic::TOKENIZER_RESOURCE_PATH)?;
+    let config_path = resolve_llm_resource(&app, semantic::CONFIG_RESOURCE_PATH)?;
+    let semantic_model = Arc::clone(&state.semantic);
+    let app_for_task = app.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let mut conn = db::open(&db_path).map_err(|error| error.to_string())?;
+        let rows_total: i64 = conn
+            .query_row("SELECT COUNT(*) FROM rows", [], |row| row.get(0))
+            .map_err(|error| error.to_string())?;
+        let _ = app_for_task.emit(
+            "semantic-index-progress",
+            SemanticIndexProgressPayload {
+                rows_done: 0,
+                rows_total,
+                phase: "indexing".to_string(),
+            },
+        );
+        let mut guard = semantic_model
+            .lock()
+            .map_err(|_| "semantic model lock poisoned".to_string())?;
+        if guard.is_none() {
+            *guard = Some(
+                semantic::SemanticModel::load(&model_path, &tokenizer_path, &config_path)
+                    .map_err(|error| error.to_string())?,
+            );
+        }
+        let model = guard
+            .as_ref()
+            .ok_or_else(|| "semantic model failed to initialize".to_string())?;
+        let summary = semantic::ensure_semantic_index(&mut conn, &columns, model)
+            .map_err(|error| error.to_string())?;
+        let _ = app_for_task.emit(
+            "semantic-index-progress",
+            SemanticIndexProgressPayload {
+                rows_done: summary.rows_indexed,
+                rows_total,
+                phase: "complete".to_string(),
+            },
+        );
+        Ok::<_, String>(summary)
+    })
+    .await
+    .map_err(|error| format!("semantic index task join error: {error}"))??;
+
+    let still_current = state
+        .loaded
+        .lock()
+        .map_err(|_| "app state lock poisoned".to_string())?
+        .as_ref()
+        .is_some_and(|inner| inner.generation == generation && inner.db_path == indexed_db_path);
+    if !still_current {
+        return Err(
+            "the loaded file or sheet changed while the semantic index was building".to_string(),
+        );
+    }
+    Ok(result)
+}
+
+#[tauri::command]
 pub async fn parse_guided_query(
     app: AppHandle,
     state: State<'_, AppState>,
@@ -289,9 +394,48 @@ pub async fn parse_guided_query(
     let model_path = resolve_llm_resource(&app, llm_parser::MODEL_RESOURCE_PATH)?;
     let tokenizer_path = resolve_llm_resource(&app, llm_parser::TOKENIZER_RESOURCE_PATH)?;
     let llm = Arc::clone(&state.llm);
+    let semantic_model = Arc::clone(&state.semantic);
+    let semantic_paths = match (
+        resolve_llm_resource(&app, semantic::MODEL_RESOURCE_PATH),
+        resolve_llm_resource(&app, semantic::TOKENIZER_RESOURCE_PATH),
+        resolve_llm_resource(&app, semantic::CONFIG_RESOURCE_PATH),
+    ) {
+        (Ok(model), Ok(tokenizer), Ok(config)) => Some((model, tokenizer, config)),
+        _ => None,
+    };
     let preview = tauri::async_runtime::spawn_blocking(
         move || -> Result<guided_parser::GuidedQueryPreview, String> {
             let conn = db::open(&db_path).map_err(|e| e.to_string())?;
+            // Semantic retrieval is optional. A missing/not-yet-built index or model resource
+            // never blocks the validated lexical raw-table plan.
+            let semantic_row_ids =
+                if semantic::semantic_index_ready(&conn, &columns).unwrap_or(false) {
+                    semantic_paths
+                        .as_ref()
+                        .and_then(|(semantic_path, semantic_tokenizer, semantic_config)| {
+                            let mut guard = semantic_model.lock().ok()?;
+                            if guard.is_none() {
+                                *guard = semantic::SemanticModel::load(
+                                    semantic_path,
+                                    semantic_tokenizer,
+                                    semantic_config,
+                                )
+                                .ok();
+                            }
+                            let model = guard.as_ref()?;
+                            semantic::semantic_search(&conn, model, &query_text, 250, 0.20)
+                                .ok()
+                                .map(|candidates| {
+                                    candidates
+                                        .into_iter()
+                                        .map(|candidate| candidate.row_num)
+                                        .collect::<Vec<_>>()
+                                })
+                        })
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
             let mut guard = llm
                 .lock()
                 .map_err(|_| "local AI model lock poisoned".to_string())?;
@@ -304,8 +448,14 @@ pub async fn parse_guided_query(
             let model = guard
                 .as_mut()
                 .ok_or_else(|| "local AI model failed to initialize".to_string())?;
-            guided_parser::parse_guided_query_with_llm(&conn, &columns, &query_text, model)
-                .map_err(|error| error.to_string())
+            guided_parser::parse_guided_query_with_llm_and_semantic(
+                &conn,
+                &columns,
+                &query_text,
+                model,
+                &semantic_row_ids,
+            )
+            .map_err(|error| error.to_string())
         },
     )
     .await
@@ -522,14 +672,16 @@ pub async fn scan_intel_matches(
     let app_for_task = app.clone();
     tauri::async_runtime::spawn_blocking(move || -> Result<IntelScanSummary, String> {
         let mut conn = db::open(&db_path).map_err(|e| e.to_string())?;
+        // Suggested or confirmed (but never rejected) automatic mappings are sufficient for
+        // optional MITRE enrichment. They no longer sit in front of raw AI retrieval.
         let mut requested_columns = evidence_columns.clone();
         requested_columns.sort();
         requested_columns.dedup();
-        let confirmed_columns = matcher::confirmed_evidence_columns(&conn)
+        let active_columns = guided_query::active_evidence_columns(&conn)
             .map_err(|error| error.to_string())?;
-        if requested_columns != confirmed_columns {
+        if requested_columns != active_columns {
             return Err(
-                "evidence columns changed or are not examiner-confirmed; review roles before scanning"
+                "evidence columns changed or are not active automatic mappings; refresh data mapping before scanning"
                     .to_string(),
             );
         }

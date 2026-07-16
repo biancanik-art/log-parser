@@ -30,6 +30,8 @@ pub fn run() {
             commands::import_sheet,
             commands::query_rows,
             commands::count_rows,
+            commands::semantic_index_status,
+            commands::build_semantic_index,
             commands::parse_guided_query,
             commands::accept_guided_query,
             commands::run_guided_query,
