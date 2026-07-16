@@ -2,10 +2,10 @@
 
 A fast, fully offline desktop viewer for large SIEM/EDR log exports (Excel
 and CSV) — built for DFIR examiners. Handles 100k+ row files, dynamic
-column detection, keyset-paginated filtering/search, MITRE ATT&CK-mapped
-keyword scanning, a guided natural-language search box, and multi-sheet
-report export. **No network calls, ever** — your data never leaves your
-machine.
+column detection, keyset-paginated filtering/search, AI-assisted evidence
+retrieval, optional MITRE ATT&CK enrichment, and multi-sheet report export.
+**No runtime network calls** — imported evidence and AI inference stay on
+your machine.
 
 See the [wiki](../../wiki) for a full user guide.
 
@@ -16,19 +16,26 @@ See the [wiki](../../wiki) for a full user guide.
 - Dynamic column detection — no per-source schema required.
 - Fast filtering, full-text search, sorting, and CSV/XLSX export, all
   keyset-paginated for large files.
-- Column-role detection (user, timestamp, command line, host, IP, etc.)
-  with suggest-then-confirm — the tool never assumes, it always asks.
+- Automatic data mapping for timestamps and common evidence fields, with
+  optional manual overrides. Mapping is metadata for timelines and threat
+  enrichment; it never limits which raw rows the AI can search.
 - UTC timestamp normalization, with an explicit prompt when a timestamp's
   timezone is ambiguous.
 - An offline, built-in MITRE ATT&CK-style keyword library, scanned via
   Aho-Corasick pattern matching, extensible with your own custom
   categories.
-- A local-AI guided search box powered by an embedded, quantized
-  Qwen2.5-1.5B-Instruct model — describe what you're looking for in plain
-  language (e.g. *"show credential access for alice chronologically"*).
-  Its structured interpretation is validated and previewed for examiner
-  acceptance before anything runs. Inference is in-process and offline; the
-  model never receives direct row, SQL, file, shell, or network access.
+- A local AI evidence search powered by embedded Qwen2.5-1.5B-Instruct and
+  all-MiniLM-L6-v2 models. Describe the evidence in plain language (for
+  example, *"show failed logins followed by PowerShell activity for alice,
+  chronologically"*). The AI plans a bounded query over the complete raw
+  table and combines exact/full-text conditions with semantic candidates;
+  it is not restricted to rows found by the optional threat scan.
+- A validated, examiner-visible query plan before execution, plus a
+  `Why matched` explanation on returned rows. The models cannot execute SQL,
+  read arbitrary files, launch processes, or access the network.
+- Background semantic indexing after import. Lexical AI queries remain
+  available while the index is building, and semantic recall is added when
+  it becomes ready.
 - One-click multi-sheet XLSX report export: a case-summary sheet, a
   chronological MITRE-mapped timeline, and one sheet per matched
   technique category — every row traceable back to its original source
@@ -43,11 +50,11 @@ Sample data is included under `testdata/`:
 
 ## Building from source
 
-Requires [Rust](https://rustup.rs/) and the
+Requires [Rust](https://rustup.rs/), Python 3, and the
 [Tauri v2 prerequisites](https://v2.tauri.app/start/prerequisites/) for
-your platform (Windows, macOS, or Linux). Fetch the checksum-pinned model and
-tokenizer once before building; this is an explicit build-time download, not
-an application runtime download:
+your platform (Windows, macOS, or Linux). Fetch the checksum-pinned models,
+tokenizers, and configuration once before building; this is an explicit
+build-time download, not an application runtime download:
 
 ```sh
 python scripts/fetch_llm_resources.py
@@ -68,7 +75,8 @@ cd src-tauri
 cargo tauri dev
 ```
 
-The embedded model adds about 1.12 GB to an unpacked application. Current
+The embedded AI resources add about 1.22 GB (1.13 GiB) to an unpacked
+application. Current
 x86-64 builds require AVX2 and FMA CPU support; Apple Silicon uses its native
 ARM SIMD baseline.
 
@@ -80,7 +88,9 @@ Rust + [Tauri v2](https://v2.tauri.app/) · [calamine](https://github.com/tafia/
 (keyword matching) · [rust_xlsxwriter](https://github.com/jmcnamara/rust_xlsxwriter)
 (report export) · [Candle](https://github.com/huggingface/candle) with
 [Qwen2.5-1.5B-Instruct](https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct)
-for embedded local inference · plain HTML/CSS/vanilla JS frontend
+for local query planning and
+[all-MiniLM-L6-v2](https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2)
+for semantic retrieval · plain HTML/CSS/vanilla JS frontend
 ([Tabulator.js](https://tabulator.info/) for the grid), no build step.
 
 ## Downloads
