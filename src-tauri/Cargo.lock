@@ -2287,6 +2287,7 @@ dependencies = [
  "anyhow",
  "calamine",
  "candle-core",
+ "candle-nn",
  "candle-transformers",
  "chrono",
  "chrono-tz",

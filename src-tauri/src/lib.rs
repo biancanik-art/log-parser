@@ -7,6 +7,7 @@ pub mod header_utils;
 pub mod intel;
 pub mod query;
 pub mod report;
+pub mod semantic;
 pub mod tabular_import;
 
 use commands::AppState;
