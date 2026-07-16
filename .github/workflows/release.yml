@@ -52,7 +52,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: src-tauri/resources/models
-          key: qwen2.5-1.5b-q4-k-m-${{ runner.os }}-6a1a2eb6-c0382117
+          key: offline-ai-models-${{ runner.os }}-6a1a2eb6-c0382117-53aa5117-be50c362-953f9c0d
 
       - name: Fetch and verify pinned local-AI resources
         run: python scripts/fetch_llm_resources.py

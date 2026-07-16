@@ -45,6 +45,33 @@ RESOURCES = (
         ),
         "sha256": "c0382117ea329cdf097041132f6d735924b697924d6f6fc3945713e96ce87539",
     },
+    {
+        "label": "all-MiniLM-L6-v2 semantic-search model",
+        "filename": "all-minilm-l6-v2-model.safetensors",
+        "url": (
+            "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/"
+            "1110a243fdf4706b3f48f1d95db1a4f5529b4d41/model.safetensors"
+        ),
+        "sha256": "53aa51172d142c89d9012cce15ae4d6cc0ca6895895114379cacb4fab128d9db",
+    },
+    {
+        "label": "all-MiniLM-L6-v2 tokenizer",
+        "filename": "all-minilm-l6-v2-tokenizer.json",
+        "url": (
+            "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/"
+            "1110a243fdf4706b3f48f1d95db1a4f5529b4d41/tokenizer.json"
+        ),
+        "sha256": "be50c3628f2bf5bb5e3a7f17b1f74611b2561a3a27eeab05e5aa30f411572037",
+    },
+    {
+        "label": "all-MiniLM-L6-v2 configuration",
+        "filename": "all-minilm-l6-v2-config.json",
+        "url": (
+            "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/"
+            "1110a243fdf4706b3f48f1d95db1a4f5529b4d41/config.json"
+        ),
+        "sha256": "953f9c0d463486b10a6871cc2fd59f223b2c70184f49815e7efbcab5d8908b41",
+    },
 )
 
 
@@ -134,7 +161,7 @@ def parse_args() -> argparse.Namespace:
         Path(__file__).resolve().parents[1] / "src-tauri" / "resources" / "models"
     )
     parser = argparse.ArgumentParser(
-        description="Fetch checksum-pinned resources for the embedded local Qwen parser."
+        description="Fetch checksum-pinned resources for offline AI search."
     )
     parser.add_argument(
         "--destination",

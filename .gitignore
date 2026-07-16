@@ -13,7 +13,9 @@
 # Pinned local-AI resources are fetched for development/release builds. They are
 # too large for Git and are checksum-verified by scripts/fetch_llm_resources.py.
 /src-tauri/resources/models/*.gguf
+/src-tauri/resources/models/*.safetensors
 /src-tauri/resources/models/*tokenizer.json
+/src-tauri/resources/models/*config.json
 /src-tauri/resources/models/*.part
 __pycache__/
 *.pyc

@@ -9,3 +9,7 @@ You may obtain a copy of the License at
 
 This product bundles Qwen2.5-1.5B-Instruct model weights developed by the
 Qwen team. The model is distributed under the Apache License, Version 2.0.
+
+This product bundles all-MiniLM-L6-v2 model weights developed by the
+sentence-transformers project. The model is distributed under the Apache
+License, Version 2.0.
