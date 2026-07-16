@@ -37,17 +37,17 @@ fn atomic_export(
     dest_path: &Path,
     write: impl FnOnce(&Path) -> Result<ExportSummary>,
 ) -> Result<ExportSummary> {
-    atomic_export_guarded(dest_path, write, || Ok(()))
+    atomic_export_guarded(dest_path, write, publish_completed_export)
 }
 
-/// Variant used by dataset-bound exports. The guard runs only after the complete temporary file
-/// has been flushed to stable storage and immediately before publication. If the loaded dataset
-/// changed while a long export was running, the new file is discarded and any existing examiner
-/// export remains untouched.
+/// Variant used by dataset-bound exports. The publisher runs only after the complete temporary
+/// file has been flushed to stable storage. A caller can hold its dataset-generation lock while
+/// invoking `publish_completed_export`, making validation and replacement one guarded operation.
+/// If validation fails, the new file is discarded and any existing examiner export is untouched.
 fn atomic_export_guarded(
     dest_path: &Path,
     write: impl FnOnce(&Path) -> Result<ExportSummary>,
-    before_publish: impl FnOnce() -> Result<()>,
+    publish: impl FnOnce(&Path, &Path) -> Result<()>,
 ) -> Result<ExportSummary> {
     let parent = dest_path
         .parent()
@@ -85,11 +85,14 @@ fn atomic_export_guarded(
         .write(true)
         .open(&pending.path)?
         .sync_all()?;
-    before_publish()?;
-    atomic_replace(&pending.path, dest_path)?;
+    publish(&pending.path, dest_path)?;
     pending.published = true;
     sync_parent_directory(parent)?;
     Ok(summary)
+}
+
+pub(crate) fn publish_completed_export(source: &Path, destination: &Path) -> Result<()> {
+    atomic_replace(source, destination)
 }
 
 #[cfg(windows)]
@@ -199,7 +202,14 @@ pub fn export_csv(
     dest_path: &Path,
     on_progress: impl FnMut(i64),
 ) -> Result<ExportSummary> {
-    export_csv_guarded(conn, columns, spec, dest_path, on_progress, || Ok(()))
+    export_csv_guarded(
+        conn,
+        columns,
+        spec,
+        dest_path,
+        on_progress,
+        publish_completed_export,
+    )
 }
 
 pub fn export_csv_guarded(
@@ -208,7 +218,7 @@ pub fn export_csv_guarded(
     spec: &QuerySpec,
     dest_path: &Path,
     mut on_progress: impl FnMut(i64),
-    before_publish: impl FnOnce() -> Result<()>,
+    publish: impl FnOnce(&Path, &Path) -> Result<()>,
 ) -> Result<ExportSummary> {
     let (sql, predicate) = build_export_query(columns, spec)?;
     atomic_export_guarded(
@@ -241,7 +251,7 @@ pub fn export_csv_guarded(
 
             Ok(ExportSummary { row_count })
         },
-        before_publish,
+        publish,
     )
 }
 
@@ -262,7 +272,7 @@ pub fn export_csv_normalized_time(
         direction,
         dest_path,
         on_progress,
-        || Ok(()),
+        publish_completed_export,
     )
 }
 
@@ -274,7 +284,7 @@ pub fn export_csv_normalized_time_guarded(
     direction: query::SortDirection,
     dest_path: &Path,
     mut on_progress: impl FnMut(i64),
-    before_publish: impl FnOnce() -> Result<()>,
+    publish: impl FnOnce(&Path, &Path) -> Result<()>,
 ) -> Result<ExportSummary> {
     let (sql, predicate) =
         build_normalized_time_export_query(conn, columns, spec, source_column, direction)?;
@@ -312,7 +322,7 @@ pub fn export_csv_normalized_time_guarded(
             on_progress(row_count);
             Ok(ExportSummary { row_count })
         },
-        before_publish,
+        publish,
     )
 }
 
@@ -323,7 +333,14 @@ pub fn export_xlsx(
     dest_path: &Path,
     on_progress: impl FnMut(i64),
 ) -> Result<ExportSummary> {
-    export_xlsx_guarded(conn, columns, spec, dest_path, on_progress, || Ok(()))
+    export_xlsx_guarded(
+        conn,
+        columns,
+        spec,
+        dest_path,
+        on_progress,
+        publish_completed_export,
+    )
 }
 
 pub fn export_xlsx_guarded(
@@ -332,7 +349,7 @@ pub fn export_xlsx_guarded(
     spec: &QuerySpec,
     dest_path: &Path,
     mut on_progress: impl FnMut(i64),
-    before_publish: impl FnOnce() -> Result<()>,
+    publish: impl FnOnce(&Path, &Path) -> Result<()>,
 ) -> Result<ExportSummary> {
     let (sql, predicate) = build_export_query(columns, spec)?;
     atomic_export_guarded(
@@ -372,7 +389,7 @@ pub fn export_xlsx_guarded(
 
             Ok(ExportSummary { row_count })
         },
-        before_publish,
+        publish,
     )
 }
 
@@ -393,7 +410,7 @@ pub fn export_xlsx_normalized_time(
         direction,
         dest_path,
         on_progress,
-        || Ok(()),
+        publish_completed_export,
     )
 }
 
@@ -405,7 +422,7 @@ pub fn export_xlsx_normalized_time_guarded(
     direction: query::SortDirection,
     dest_path: &Path,
     mut on_progress: impl FnMut(i64),
-    before_publish: impl FnOnce() -> Result<()>,
+    publish: impl FnOnce(&Path, &Path) -> Result<()>,
 ) -> Result<ExportSummary> {
     let (sql, predicate) =
         build_normalized_time_export_query(conn, columns, spec, source_column, direction)?;
@@ -442,7 +459,7 @@ pub fn export_xlsx_normalized_time_guarded(
             on_progress(row_count);
             Ok(ExportSummary { row_count })
         },
-        before_publish,
+        publish,
     )
 }
 
@@ -648,7 +665,7 @@ mod tests {
             &empty_spec(),
             &path,
             |_| {},
-            || anyhow::bail!("the loaded dataset changed"),
+            |_, _| anyhow::bail!("the loaded dataset changed"),
         )
         .unwrap_err();
         assert!(error.to_string().contains("loaded dataset changed"));
