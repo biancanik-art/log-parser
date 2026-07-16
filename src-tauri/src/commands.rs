@@ -7,7 +7,7 @@ use crate::report::{self, ReportExportSummary};
 use crate::semantic;
 use crate::tabular_import;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::{path::BaseDirectory, AppHandle, Emitter, Manager, State};
@@ -116,6 +116,29 @@ fn state_snapshot(state: &State<'_, AppState>) -> Result<(PathBuf, Vec<ColumnMet
         inner.columns.clone(),
         inner.generation,
     ))
+}
+
+fn publish_export_if_current(
+    app: &AppHandle,
+    expected_db_path: &Path,
+    expected_generation: u64,
+    temporary_path: &Path,
+    destination_path: &Path,
+) -> anyhow::Result<()> {
+    let state = app.state::<AppState>();
+    let guard = state
+        .loaded
+        .lock()
+        .map_err(|_| anyhow::anyhow!("app state lock poisoned"))?;
+    let still_current = guard.as_ref().is_some_and(|inner| {
+        inner.generation == expected_generation && inner.db_path == expected_db_path
+    });
+    if !still_current {
+        anyhow::bail!("the loaded file or sheet changed while the export was running");
+    }
+    // Keep the state lock through the atomic replace. An import cannot publish a new generation
+    // between this check and publication of the completed export.
+    export::publish_completed_export(temporary_path, destination_path)
 }
 
 #[tauri::command]
@@ -624,23 +647,44 @@ pub async fn export_data(
     format: ExportFormat,
     dest_path: String,
 ) -> Result<ExportSummary, String> {
-    let (db_path, columns, _) = state_snapshot(&state)?;
+    let (db_path, columns, generation) = state_snapshot(&state)?;
+    let exported_db_path = db_path.clone();
     let dest = PathBuf::from(&dest_path);
     let dest_for_task = dest.clone();
-    let app_for_task = app.clone();
+    let app_for_progress = app.clone();
+    let app_for_publish = app.clone();
 
     let row_count = tauri::async_runtime::spawn_blocking(move || -> Result<i64, String> {
         let conn = db::open(&db_path).map_err(|e| e.to_string())?;
         let on_progress = |rows_done: i64| {
-            let _ = app_for_task.emit("export-progress", ExportProgressPayload { rows_done });
+            let _ = app_for_progress.emit("export-progress", ExportProgressPayload { rows_done });
+        };
+        let publish = |temporary_path: &Path, destination_path: &Path| {
+            publish_export_if_current(
+                &app_for_publish,
+                &exported_db_path,
+                generation,
+                temporary_path,
+                destination_path,
+            )
         };
         let result = match format {
-            ExportFormat::Csv => {
-                export::export_csv(&conn, &columns, &spec, &dest_for_task, on_progress)
-            }
-            ExportFormat::Xlsx => {
-                export::export_xlsx(&conn, &columns, &spec, &dest_for_task, on_progress)
-            }
+            ExportFormat::Csv => export::export_csv_guarded(
+                &conn,
+                &columns,
+                &spec,
+                &dest_for_task,
+                on_progress,
+                publish,
+            ),
+            ExportFormat::Xlsx => export::export_xlsx_guarded(
+                &conn,
+                &columns,
+                &spec,
+                &dest_for_task,
+                on_progress,
+                publish,
+            ),
         }
         .map_err(|e| e.to_string())?;
         Ok(result.row_count)
@@ -667,7 +711,8 @@ pub async fn export_guided_data(
     let exported_db_path = db_path.clone();
     let dest = PathBuf::from(&dest_path);
     let dest_for_task = dest.clone();
-    let app_for_task = app.clone();
+    let app_for_progress = app.clone();
+    let app_for_publish = app.clone();
     let row_count = tauri::async_runtime::spawn_blocking(move || -> Result<i64, String> {
         let conn = db::open(&db_path).map_err(|error| error.to_string())?;
         guided_parser::accept_llm_audit(&conn, audit_id, &intent_token)
@@ -687,11 +732,20 @@ pub async fn export_guided_data(
         let normalized_sort = guided_query::normalized_raw_sort_direction(&conn, &columns, &intent)
             .map_err(|error| error.to_string())?;
         let on_progress = |rows_done: i64| {
-            let _ = app_for_task.emit("export-progress", ExportProgressPayload { rows_done });
+            let _ = app_for_progress.emit("export-progress", ExportProgressPayload { rows_done });
+        };
+        let publish = |temporary_path: &Path, destination_path: &Path| {
+            publish_export_if_current(
+                &app_for_publish,
+                &exported_db_path,
+                generation,
+                temporary_path,
+                destination_path,
+            )
         };
         let summary = match (format, normalized_sort) {
             (ExportFormat::Csv, Some((source_column, direction))) => {
-                export::export_csv_normalized_time(
+                export::export_csv_normalized_time_guarded(
                     &conn,
                     &columns,
                     &spec,
@@ -699,10 +753,11 @@ pub async fn export_guided_data(
                     direction,
                     &dest_for_task,
                     on_progress,
+                    publish,
                 )
             }
             (ExportFormat::Xlsx, Some((source_column, direction))) => {
-                export::export_xlsx_normalized_time(
+                export::export_xlsx_normalized_time_guarded(
                     &conn,
                     &columns,
                     &spec,
@@ -710,14 +765,25 @@ pub async fn export_guided_data(
                     direction,
                     &dest_for_task,
                     on_progress,
+                    publish,
                 )
             }
-            (ExportFormat::Csv, None) => {
-                export::export_csv(&conn, &columns, &spec, &dest_for_task, on_progress)
-            }
-            (ExportFormat::Xlsx, None) => {
-                export::export_xlsx(&conn, &columns, &spec, &dest_for_task, on_progress)
-            }
+            (ExportFormat::Csv, None) => export::export_csv_guarded(
+                &conn,
+                &columns,
+                &spec,
+                &dest_for_task,
+                on_progress,
+                publish,
+            ),
+            (ExportFormat::Xlsx, None) => export::export_xlsx_guarded(
+                &conn,
+                &columns,
+                &spec,
+                &dest_for_task,
+                on_progress,
+                publish,
+            ),
         }
         .map_err(|error| error.to_string())?;
         Ok(summary.row_count)
@@ -725,17 +791,6 @@ pub async fn export_guided_data(
     .await
     .map_err(|error| format!("AI result export task join error: {error}"))??;
 
-    let still_current = state
-        .loaded
-        .lock()
-        .map_err(|_| "app state lock poisoned".to_string())?
-        .as_ref()
-        .is_some_and(|inner| inner.generation == generation && inner.db_path == exported_db_path);
-    if !still_current {
-        return Err(
-            "the loaded file or sheet changed while the AI result export was running".to_string(),
-        );
-    }
     Ok(ExportSummary {
         row_count,
         dest_path: dest.display().to_string(),
