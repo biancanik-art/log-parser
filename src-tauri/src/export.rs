@@ -17,7 +17,10 @@ const PROGRESS_EVERY: i64 = 5000;
 /// intermediate `Vec`/JSON blob of the whole result set is ever materialized. Reuses
 /// `query::build_predicate` and `query::build_order_by` so the exported set — filters, search,
 /// *and* the active sort — always matches what's on screen, not just the row set.
-fn build_export_query(columns: &[ColumnMeta], spec: &QuerySpec) -> Result<(String, query::Predicate)> {
+fn build_export_query(
+    columns: &[ColumnMeta],
+    spec: &QuerySpec,
+) -> Result<(String, query::Predicate)> {
     let predicate = query::build_predicate(columns, spec)?;
     let order_by = query::build_order_by(columns, &spec.sort)?;
     let sql = format!(
@@ -131,8 +134,9 @@ mod tests {
             },
         ];
         db::create_schema(&conn, &columns).unwrap();
-        for (i, (account, event_id)) in
-            [("alice", "100"), ("bob", "200"), ("carol", "300")].iter().enumerate()
+        for (i, (account, event_id)) in [("alice", "100"), ("bob", "200"), ("carol", "300")]
+            .iter()
+            .enumerate()
         {
             conn.execute(
                 "INSERT INTO rows (row_num, account, event_id) VALUES (?1, ?2, ?3)",
@@ -148,6 +152,7 @@ mod tests {
         QuerySpec {
             search: None,
             filters: vec![],
+            expression: None,
             sort: None,
             cursor: None,
             limit: 200,
@@ -165,7 +170,10 @@ mod tests {
         assert_eq!(summary.row_count, 3);
 
         let mut contents = String::new();
-        File::open(&path).unwrap().read_to_string(&mut contents).unwrap();
+        File::open(&path)
+            .unwrap()
+            .read_to_string(&mut contents)
+            .unwrap();
         assert!(contents.contains("Account,EventID"));
         assert!(contents.contains("alice,100"));
         assert!(contents.contains("carol,300"));
@@ -189,13 +197,52 @@ mod tests {
         export_csv(&conn, &columns, &spec, &path, |_| {}).unwrap();
 
         let mut contents = String::new();
-        File::open(&path).unwrap().read_to_string(&mut contents).unwrap();
+        File::open(&path)
+            .unwrap()
+            .read_to_string(&mut contents)
+            .unwrap();
         let data_lines: Vec<&str> = contents.lines().skip(1).collect();
         assert_eq!(
             data_lines,
             vec!["carol,300", "bob,200", "alice,100"],
             "export should follow the descending event_id sort, not source row_num order"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn csv_export_respects_recursive_raw_table_expression() {
+        let (conn, columns) = setup();
+        let dir = std::env::temp_dir().join(format!(
+            "log-parser-test-expression-export-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("export_expression.csv");
+
+        let mut spec = empty_spec();
+        spec.expression = Some(query::QueryExpression::Or {
+            children: vec![
+                query::QueryExpression::Predicate {
+                    column: "account".to_string(),
+                    op: query::FilterOp::Equals,
+                    value: "alice".to_string(),
+                },
+                query::QueryExpression::Predicate {
+                    column: "event_id".to_string(),
+                    op: query::FilterOp::Equals,
+                    value: "300".to_string(),
+                },
+            ],
+        });
+
+        let summary = export_csv(&conn, &columns, &spec, &path, |_| {}).unwrap();
+        assert_eq!(summary.row_count, 2);
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert!(contents.contains("alice,100"));
+        assert!(contents.contains("carol,300"));
+        assert!(!contents.contains("bob,200"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
