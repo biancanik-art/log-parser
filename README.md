@@ -27,15 +27,20 @@ See the [wiki](../../wiki) for a full user guide.
 - A local AI evidence search powered by embedded Qwen2.5-1.5B-Instruct and
   all-MiniLM-L6-v2 models. Describe the evidence in plain language (for
   example, *"show failed logins followed by PowerShell activity for alice,
-  chronologically"*). The AI plans a bounded query over the complete raw
-  table and combines exact/full-text conditions with semantic candidates;
-  it is not restricted to rows found by the optional threat scan.
+  chronologically"*). Qwen plans a validated, bounded lexical/structured
+  query over the complete raw table. MiniLM can supplement that plan with
+  semantically similar evidence. Neither path is restricted by data mappings
+  or rows found by the optional threat scan.
 - A validated, examiner-visible query plan before execution, plus a
-  `Why matched` explanation on returned rows. The models cannot execute SQL,
-  read arbitrary files, launch processes, or access the network.
-- Background semantic indexing after import. Lexical AI queries remain
-  available while the index is building, and semantic recall is added when
-  it becomes ready.
+  `Why matched` explanation on returned rows. Generated search values must be
+  grounded in the examiner's request. The models cannot execute SQL, read
+  arbitrary files, launch processes, or access the network.
+- Resumable semantic preparation after import. Repeated log templates are
+  deduplicated, volatile IDs remain available to exact search, and balanced
+  per-column chunks keep later columns represented. Lexical/structured AI
+  search is available while this runs. Semantic document selection is
+  deliberately bounded and disclosed, while every raw row mapped to a
+  selected document remains included in count, pagination, and export.
 - One-click multi-sheet XLSX report export: a case-summary sheet, a
   chronological MITRE-mapped timeline, and one sheet per matched
   technique category — every row traceable back to its original source
@@ -44,6 +49,7 @@ See the [wiki](../../wiki) for a full user guide.
 ## Try it
 
 Sample data is included under `testdata/`:
+
 - `sentinel_sample_120k.xlsx` — a 120,000-row synthetic Sentinel-style
   export, for trying the tool at realistic scale.
 - `multi_sheet_sample.xlsx` — a small 3-sheet workbook.
