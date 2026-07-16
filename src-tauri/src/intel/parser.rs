@@ -3414,6 +3414,8 @@ mod tests {
             .join("resources")
             .join(llm_parser::TOKENIZER_RESOURCE_PATH);
         let mut model = LlmParser::load(&model_path, &tokenizer_path).unwrap();
+        let mut account = account_column();
+        account.col_index = 1;
         let columns = vec![
             ColumnMeta {
                 sql_name: "event_time".into(),
@@ -3421,7 +3423,7 @@ mod tests {
                 col_index: 0,
                 inferred_type: "timestamp".into(),
             },
-            account_column(),
+            account,
             ColumnMeta {
                 sql_name: "status".into(),
                 original_name: "Status".into(),
@@ -3435,7 +3437,7 @@ mod tests {
                 inferred_type: "text".into(),
             },
         ];
-        let conn = Connection::open_in_memory().unwrap();
+        let mut conn = Connection::open_in_memory().unwrap();
         db::create_schema(&conn, &columns).unwrap();
         conn.execute_batch(
             "INSERT INTO rows (row_num, event_time, account, status, command_line) VALUES
@@ -3455,15 +3457,10 @@ mod tests {
             },
         )
         .unwrap();
-        db::create_row_time_table(&conn).unwrap();
-        for (row_num, epoch_ms) in [(1_i64, 100_i64), (2, 200), (3, 300)] {
-            conn.execute(
-                "INSERT INTO _row_time (row_num, epoch_ms, utc_text, source_text, parse_status)
-                 VALUES (?1, ?2, 'utc', 'source', 'explicit_offset')",
-                rusqlite::params![row_num, epoch_ms],
-            )
-            .unwrap();
-        }
+        crate::intel::time::normalize_timestamp_column_with_options(
+            &mut conn, &columns, None, None,
+        )
+        .unwrap();
 
         let query = "Show a timeline of rows where the Status column equals failed and the Account column equals alice.";
         let preview = parse_guided_query_with_llm(&conn, &columns, query, &mut model).unwrap();

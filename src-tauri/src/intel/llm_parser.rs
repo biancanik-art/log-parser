@@ -1517,10 +1517,17 @@ mod tests {
     }
 
     #[test]
-    fn timeline_column_is_automatic_but_naive_timezone_is_a_real_clarification() {
-        let explicit = raw_db("2026-07-17T01:02:03+02:00");
+    fn timeline_requires_bound_normalization_and_naive_timezone_is_a_real_clarification() {
+        let mut explicit = raw_db("2026-07-17T01:02:03+02:00");
         let context = LlmContext::from_table(&explicit, &raw_columns(), "show a timeline").unwrap();
         assert_eq!(context.recommended_timeline_column(), Some("event_time"));
+        assert!(context
+            .timeline_issue()
+            .is_some_and(|issue| issue.contains("not normalized for this import")));
+
+        time::normalize_timestamp_column_with_options(&mut explicit, &raw_columns(), None, None)
+            .unwrap();
+        let context = LlmContext::from_table(&explicit, &raw_columns(), "show a timeline").unwrap();
         assert!(context.timeline_issue().is_none());
 
         let naive = raw_db("2026-07-17 01:02:03");
@@ -1528,6 +1535,13 @@ mod tests {
         assert!(context
             .timeline_issue()
             .is_some_and(|issue| issue.contains("source timezone")));
+
+        let ambiguous = raw_db("03/04/2026 01:02:03");
+        let context =
+            LlmContext::from_table(&ambiguous, &raw_columns(), "show a timeline").unwrap();
+        assert!(context
+            .timeline_issue()
+            .is_some_and(|issue| issue.contains("month_first")));
     }
 
     #[test]
