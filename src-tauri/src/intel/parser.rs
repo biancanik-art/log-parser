@@ -4,6 +4,7 @@ use crate::intel::llm_parser::{self, ConfirmedRole, LlmContext, LlmParser};
 use crate::query::{
     ColumnFilter, Cursor, FilterOp, QueryExpression, QuerySpec, SortDirection, SortSpec,
 };
+use crate::semantic;
 use anyhow::{anyhow, bail, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -88,6 +89,14 @@ pub enum GuidedIntent {
         /// field; Rust adds bounded positive row IDs only after searching a verified local index.
         #[serde(default, rename = "semanticRowIds")]
         semantic_row_ids: Vec<i64>,
+        /// Trusted backend-only semantic document selection. Query compilation validates that it
+        /// belongs to this dataset's currently active semantic build.
+        #[serde(
+            default,
+            rename = "semanticSelectionId",
+            skip_serializing_if = "Option::is_none"
+        )]
+        semantic_selection_id: Option<String>,
     },
     SuspiciousScan {
         #[serde(rename = "tacticIds")]
@@ -197,6 +206,24 @@ pub fn parse_guided_query_with_llm_and_semantic(
     model: &mut LlmParser,
     semantic_row_ids: &[i64],
 ) -> Result<GuidedQueryPreview> {
+    parse_guided_query_with_llm_and_semantic_selection(
+        conn,
+        columns,
+        query_text,
+        model,
+        semantic_row_ids,
+        None,
+    )
+}
+
+pub fn parse_guided_query_with_llm_and_semantic_selection(
+    conn: &Connection,
+    columns: &[ColumnMeta],
+    query_text: &str,
+    model: &mut LlmParser,
+    semantic_row_ids: &[i64],
+    semantic_selection_id: Option<&str>,
+) -> Result<GuidedQueryPreview> {
     let trimmed = query_text.trim();
     if trimmed.is_empty() {
         return clarification(
@@ -225,6 +252,7 @@ pub fn parse_guided_query_with_llm_and_semantic(
     let mut result = model.parse(trimmed, &llm_context)?;
     if let GuidedIntent::RawEvidenceSearch {
         semantic_row_ids: trusted_ids,
+        semantic_selection_id: trusted_selection,
         ..
     } = &mut result.intent
     {
@@ -237,6 +265,12 @@ pub fn parse_guided_query_with_llm_and_semantic(
         ids.sort_unstable();
         ids.dedup();
         *trusted_ids = ids;
+        *trusted_selection = if let Some(selection_id) = semantic_selection_id {
+            semantic::validate_semantic_selection(conn, columns, selection_id)?;
+            Some(selection_id.to_string())
+        } else {
+            None
+        };
     }
     let intent_token = encode_intent(&result.intent)?;
     let audit_id = record_llm_audit(conn, trimmed, &intent_token, &result, &llm_context)?;
@@ -438,6 +472,7 @@ pub fn query_spec_from_raw_intent(
         alternatives,
         sort,
         semantic_row_ids,
+        semantic_selection_id,
     } = intent
     else {
         bail!("guided intent is not a raw evidence search");
@@ -486,16 +521,30 @@ pub fn query_spec_from_raw_intent(
     let mut semantic_ids = semantic_row_ids.clone();
     semantic_ids.sort_unstable();
     semantic_ids.dedup();
-    let expression = if semantic_ids.is_empty() {
-        lexical_expression
+    if semantic_selection_id.as_ref().is_some_and(|selection_id| {
+        selection_id.len() != 64
+            || !selection_id
+                .chars()
+                .all(|character| character.is_ascii_hexdigit())
+    }) {
+        bail!("raw evidence search contains an invalid semantic selection ID");
+    }
+    let mut retrieval_branches = vec![lexical_expression];
+    if !semantic_ids.is_empty() {
+        retrieval_branches.push(QueryExpression::RowIds {
+            values: semantic_ids,
+        });
+    }
+    if let Some(selection_id) = semantic_selection_id {
+        retrieval_branches.push(QueryExpression::SemanticSelection {
+            selection_id: selection_id.clone(),
+        });
+    }
+    let expression = if retrieval_branches.len() == 1 {
+        retrieval_branches.pop().expect("one retrieval branch")
     } else {
         QueryExpression::Or {
-            children: vec![
-                lexical_expression,
-                QueryExpression::RowIds {
-                    values: semantic_ids,
-                },
-            ],
+            children: retrieval_branches,
         }
     };
     Ok(QuerySpec {
@@ -564,6 +613,7 @@ fn raw_match_explanation(intent: &GuidedIntent) -> Vec<String> {
         alternatives,
         sort,
         semantic_row_ids,
+        semantic_selection_id,
     } = intent
     else {
         return Vec::new();
@@ -609,6 +659,12 @@ fn raw_match_explanation(intent: &GuidedIntent) -> Vec<String> {
             "Semantic recall: {} locally-ranked raw row candidate(s) OR the literal plan",
             semantic_row_ids.len()
         ));
+    }
+    if semantic_selection_id.is_some() {
+        explanation.push(
+            "Semantic recall: the persisted document selection is OR'ed with the complete literal plan and expands every mapped raw row."
+                .to_string(),
+        );
     }
     explanation
 }
@@ -2508,6 +2564,7 @@ mod tests {
             }],
             sort: None,
             semantic_row_ids: Vec::new(),
+            semantic_selection_id: None,
         })
         .unwrap()
     }
@@ -3303,6 +3360,7 @@ mod tests {
             ],
             sort: None,
             semantic_row_ids: vec![7, 7, 9],
+            semantic_selection_id: None,
         };
         let spec = query_spec_from_raw_intent(&intent, None, Some(50)).unwrap();
         assert_eq!(spec.limit, 50);

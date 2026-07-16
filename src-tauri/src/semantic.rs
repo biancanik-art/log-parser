@@ -1177,6 +1177,18 @@ pub fn semantic_index_ready(conn: &Connection, columns: &[ColumnMeta]) -> Result
     Ok(active_v2_build(conn, &dataset_hash, &semantic_schema_hash(columns))?.is_some())
 }
 
+pub fn semantic_indexed_rows(conn: &Connection, columns: &[ColumnMeta]) -> Result<i64> {
+    if !table_exists(conn, "_semantic_v2_active")? || !table_exists(conn, "_semantic_v2_build")? {
+        return Ok(0);
+    }
+    let dataset_hash = semantic_dataset_hash(conn, columns)?;
+    Ok(
+        active_v2_build(conn, &dataset_hash, &semantic_schema_hash(columns))?
+            .map(|(_, rows, _, _)| rows)
+            .unwrap_or(0),
+    )
+}
+
 pub fn ensure_semantic_index(
     conn: &mut Connection,
     columns: &[ColumnMeta],
@@ -1455,6 +1467,7 @@ pub fn semantic_selection_reasons(
     let mut stmt = conn.prepare(
         "SELECT m.row_num, d.normalized_text, sd.cosine_score
          FROM _semantic_v2_selection s
+         JOIN _semantic_v2_active a ON a.singleton = 1 AND a.build_id = s.build_id
          JOIN _semantic_v2_selection_doc sd ON sd.selection_id = s.selection_id
          JOIN _semantic_v2_mapping m ON m.build_id = s.build_id AND m.doc_id = sd.doc_id
          JOIN _semantic_v2_document d ON d.doc_id = sd.doc_id

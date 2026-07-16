@@ -1,12 +1,12 @@
 use crate::db::{self, ColumnMeta};
 use crate::intel::parser::{
-    self, GuidedIntent, GuidedSort, RawFilterOp, RawSearchAlternative, RawSortDirection,
+    self, GuidedIntent, GuidedSort, RawSearchAlternative, RawSortDirection,
 };
 use crate::intel::{library, matcher, time};
 use crate::query::{Cursor, QueryPage, SortDirection};
 use anyhow::{anyhow, bail, Result};
 use rusqlite::{Connection, OptionalExtension};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
 pub fn run_guided_query(
     conn: &Connection,
@@ -33,7 +33,7 @@ pub fn run_guided_query(
         } else {
             crate::query::query_rows(conn, columns, &spec)?
         };
-        annotate_raw_matches(&mut page, &intent);
+        annotate_raw_matches(conn, &mut page, &intent)?;
         return Ok(page);
     }
     if !table_exists(conn, "_intel_match")? {
@@ -88,7 +88,7 @@ fn query_raw_normalized_time(
         bail!("raw timeline references an unavailable timestamp column");
     }
     time::require_row_time_binding(conn, columns, &sort.column)?;
-    let predicate = crate::query::build_predicate(columns, spec)?;
+    let predicate = crate::query::build_predicate_for_connection(conn, columns, spec)?;
     let limit = spec.limit.clamp(1, 5000);
     let direction = match sort.direction {
         RawSortDirection::Asc => "ASC",
@@ -184,29 +184,41 @@ fn query_raw_normalized_time(
     })
 }
 
-fn annotate_raw_matches(page: &mut QueryPage, intent: &GuidedIntent) {
+fn annotate_raw_matches(
+    conn: &Connection,
+    page: &mut QueryPage,
+    intent: &GuidedIntent,
+) -> Result<()> {
     let GuidedIntent::RawEvidenceSearch {
         alternatives,
         semantic_row_ids,
+        semantic_selection_id,
         ..
     } = intent
     else {
-        return;
+        return Ok(());
     };
     let semantic_ids = semantic_row_ids.iter().copied().collect::<BTreeSet<_>>();
+    let page_row_numbers = page
+        .rows
+        .iter()
+        .filter_map(|row| row.get("row_num").and_then(serde_json::Value::as_i64))
+        .collect::<Vec<_>>();
+    let lexical_matches = exact_alternative_matches(conn, alternatives, &page_row_numbers)?;
+    let semantic_reasons = if let Some(selection_id) = semantic_selection_id {
+        crate::semantic::semantic_selection_reasons(conn, selection_id, &page_row_numbers)?
+    } else {
+        std::collections::HashMap::new()
+    };
     for row in &mut page.rows {
         let Some(object) = row.as_object_mut() else {
             continue;
         };
         let row_num = object.get("row_num").and_then(serde_json::Value::as_i64);
-        let searchable_values = object
-            .iter()
-            .filter(|(name, _)| name.as_str() != "row_num" && name.as_str() != "__aiMatch")
-            .filter_map(|(_, value)| value.as_str())
-            .collect::<Vec<_>>();
         let mut reasons = Vec::new();
-        for (index, alternative) in alternatives.iter().enumerate() {
-            if alternative_matches(object, &searchable_values, alternative) {
+        if let Some(row_num) = row_num {
+            for index in lexical_matches.get(&row_num).into_iter().flatten() {
+                let alternative = &alternatives[*index];
                 for term in &alternative.terms {
                     reasons.push(format!("alternative {} literal: {term}", index + 1));
                 }
@@ -224,54 +236,58 @@ fn annotate_raw_matches(page: &mut QueryPage, intent: &GuidedIntent) {
         if row_num.is_some_and(|row_num| semantic_ids.contains(&row_num)) {
             reasons.push("semantic recall candidate".to_string());
         }
-        object.insert("__aiMatch".to_string(), serde_json::json!(reasons));
-    }
-}
-
-fn alternative_matches(
-    object: &serde_json::Map<String, serde_json::Value>,
-    searchable_values: &[&str],
-    alternative: &RawSearchAlternative,
-) -> bool {
-    let terms_match = alternative.terms.iter().all(|term| {
-        let needle = term.to_ascii_lowercase();
-        searchable_values
-            .iter()
-            .any(|value| value.to_ascii_lowercase().contains(&needle))
-    });
-    terms_match
-        && alternative.filters.iter().all(|filter| {
-            object
-                .get(&filter.column)
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|value| raw_filter_matches(value, filter.op, &filter.value))
-        })
-}
-
-fn raw_filter_matches(value: &str, op: RawFilterOp, expected: &str) -> bool {
-    let value_folded = value.to_ascii_lowercase();
-    let expected_folded = expected.to_ascii_lowercase();
-    match op {
-        RawFilterOp::Equals => value == expected,
-        RawFilterOp::NotEquals => value != expected,
-        RawFilterOp::Contains => value_folded.contains(&expected_folded),
-        RawFilterOp::NotContains => !value_folded.contains(&expected_folded),
-        RawFilterOp::StartsWith => value_folded.starts_with(&expected_folded),
-        RawFilterOp::EndsWith => value_folded.ends_with(&expected_folded),
-        RawFilterOp::IsEmpty => value.is_empty(),
-        RawFilterOp::IsNotEmpty => !value.is_empty(),
-        RawFilterOp::GreaterThan | RawFilterOp::LessThan => {
-            let ordering = match (value.trim().parse::<f64>(), expected.trim().parse::<f64>()) {
-                (Ok(left), Ok(right)) => left.partial_cmp(&right),
-                _ => Some(value.cmp(expected)),
-            };
-            match op {
-                RawFilterOp::GreaterThan => ordering.is_some_and(|order| order.is_gt()),
-                RawFilterOp::LessThan => ordering.is_some_and(|order| order.is_lt()),
-                _ => false,
+        if let Some(row_num) = row_num {
+            if let Some(matches) = semantic_reasons.get(&row_num) {
+                reasons.extend(matches.iter().cloned());
             }
         }
+        object.insert("__aiMatch".to_string(), serde_json::json!(reasons));
     }
+    Ok(())
+}
+
+fn exact_alternative_matches(
+    conn: &Connection,
+    alternatives: &[RawSearchAlternative],
+    page_row_numbers: &[i64],
+) -> Result<HashMap<i64, Vec<usize>>> {
+    let mut matches = HashMap::<i64, Vec<usize>>::new();
+    if page_row_numbers.is_empty() {
+        return Ok(matches);
+    }
+    // A single JSON parameter remains bounded for a maximum-size page. Every alternative is
+    // evaluated by the production predicate compiler, so FTS tokenization, escaping, and SQL
+    // filter behavior cannot drift from the actual row-selection semantics.
+    let page_rows_json = serde_json::to_string(page_row_numbers)?;
+    let columns = db::load_columns(conn)?;
+    for (index, alternative) in alternatives.iter().enumerate() {
+        let intent = GuidedIntent::RawEvidenceSearch {
+            alternatives: vec![alternative.clone()],
+            sort: None,
+            semantic_row_ids: Vec::new(),
+            semantic_selection_id: None,
+        };
+        let spec = parser::query_spec_from_raw_intent(&intent, None, Some(1))?;
+        let predicate = crate::query::build_predicate_for_connection(conn, &columns, &spec)?;
+        let sql = format!(
+            "SELECT row_num FROM rows {} AND row_num IN (
+                SELECT CAST(value AS INTEGER) FROM json_each(?)
+             )",
+            predicate.where_sql
+        );
+        let mut params = predicate
+            .params
+            .iter()
+            .map(|parameter| parameter.as_ref() as &dyn rusqlite::ToSql)
+            .collect::<Vec<_>>();
+        params.push(&page_rows_json);
+        let mut statement = conn.prepare(&sql)?;
+        let rows = statement.query_map(params.as_slice(), |row| row.get::<_, i64>(0))?;
+        for row_num in rows {
+            matches.entry(row_num?).or_default().push(index);
+        }
+    }
+    Ok(matches)
 }
 
 fn validate_intent_against_current_context(conn: &Connection, intent: &GuidedIntent) -> Result<()> {
@@ -874,6 +890,7 @@ mod tests {
             ],
             sort: None,
             semantic_row_ids: vec![3],
+            semantic_selection_id: None,
         })
         .unwrap();
         assert!(!table_exists(&conn, "_intel_match").unwrap());
@@ -890,6 +907,48 @@ mod tests {
             .unwrap()
             .iter()
             .any(|reason| reason == "semantic recall candidate"));
+    }
+
+    #[test]
+    fn raw_match_explanations_use_fts_semantics_for_semantic_only_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        let columns = vec![ColumnMeta {
+            sql_name: "event".into(),
+            original_name: "Event".into(),
+            col_index: 0,
+            inferred_type: "text".into(),
+        }];
+        db::create_schema(&conn, &columns).unwrap();
+        conn.execute(
+            "INSERT INTO rows(row_num, event) VALUES
+                (1, 'cat alert'),
+                (2, 'concatenate strings')",
+            [],
+        )
+        .unwrap();
+        db::populate_fts(&conn, &columns).unwrap();
+        let token = serde_json::to_string(&GuidedIntent::RawEvidenceSearch {
+            alternatives: vec![RawSearchAlternative {
+                terms: vec!["cat".into()],
+                filters: vec![],
+            }],
+            sort: None,
+            semantic_row_ids: vec![2],
+            semantic_selection_id: None,
+        })
+        .unwrap();
+
+        let page = run_guided_query(&conn, &columns, &token, None, Some(10)).unwrap();
+        assert_eq!(page.rows.len(), 2);
+        let lexical_reasons = page.rows[0]["__aiMatch"].as_array().unwrap();
+        assert!(lexical_reasons
+            .iter()
+            .any(|reason| reason == "alternative 1 literal: cat"));
+        let semantic_only_reasons = page.rows[1]["__aiMatch"].as_array().unwrap();
+        assert_eq!(
+            semantic_only_reasons,
+            &[serde_json::json!("semantic recall candidate")]
+        );
     }
 
     #[test]
@@ -933,6 +992,7 @@ mod tests {
                 normalized_time: true,
             }),
             semantic_row_ids: vec![],
+            semantic_selection_id: None,
         })
         .unwrap();
         let first = run_guided_query(&conn, &columns, &token, None, Some(1)).unwrap();
@@ -959,6 +1019,7 @@ mod tests {
                 normalized_time: true,
             }),
             semantic_row_ids: vec![],
+            semantic_selection_id: None,
         })
         .unwrap();
         let mut cursor = None;
@@ -1026,6 +1087,7 @@ mod tests {
                     normalized_time: true,
                 }),
                 semantic_row_ids: vec![],
+                semantic_selection_id: None,
             })
             .unwrap()
         };

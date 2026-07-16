@@ -1775,6 +1775,7 @@ fn parse_and_validate(raw: &str, query_text: &str, context: &LlmContext) -> Vali
                 alternatives: trusted_alternatives,
                 sort: trusted_sort,
                 semantic_row_ids: Vec::new(),
+                semantic_selection_id: None,
             }
         }
         ModelIntent::SuspiciousScan {
@@ -2137,6 +2138,7 @@ mod tests {
                 alternatives,
                 sort,
                 semantic_row_ids,
+                ..
             } => {
                 assert_eq!(alternatives.len(), 2);
                 assert!(semantic_row_ids.is_empty());

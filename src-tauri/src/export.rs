@@ -151,10 +151,11 @@ fn sync_parent_directory(_parent: &Path) -> Result<()> {
 /// `query::build_predicate` and `query::build_order_by` so the exported set — filters, search,
 /// *and* the active sort — always matches what's on screen, not just the row set.
 fn build_export_query(
+    conn: &Connection,
     columns: &[ColumnMeta],
     spec: &QuerySpec,
 ) -> Result<(String, query::Predicate)> {
-    let predicate = query::build_predicate(columns, spec)?;
+    let predicate = query::build_predicate_for_connection(conn, columns, spec)?;
     let order_by = query::build_order_by(columns, &spec.sort)?;
     let sql = format!(
         "SELECT {cols} FROM rows {where_sql} {order_by}",
@@ -172,7 +173,7 @@ fn build_normalized_time_export_query(
     direction: query::SortDirection,
 ) -> Result<(String, query::Predicate)> {
     time::require_row_time_binding(conn, columns, source_column)?;
-    let predicate = query::build_predicate(columns, spec)?;
+    let predicate = query::build_predicate_for_connection(conn, columns, spec)?;
     let raw_columns = columns
         .iter()
         .map(|column| format!("raw.{}", crate::db::quote_ident(&column.sql_name)))
@@ -220,7 +221,7 @@ pub fn export_csv_guarded(
     mut on_progress: impl FnMut(i64),
     publish: impl FnOnce(&Path, &Path) -> Result<()>,
 ) -> Result<ExportSummary> {
-    let (sql, predicate) = build_export_query(columns, spec)?;
+    let (sql, predicate) = build_export_query(conn, columns, spec)?;
     atomic_export_guarded(
         dest_path,
         |dest_path| {
@@ -351,7 +352,7 @@ pub fn export_xlsx_guarded(
     mut on_progress: impl FnMut(i64),
     publish: impl FnOnce(&Path, &Path) -> Result<()>,
 ) -> Result<ExportSummary> {
-    let (sql, predicate) = build_export_query(columns, spec)?;
+    let (sql, predicate) = build_export_query(conn, columns, spec)?;
     atomic_export_guarded(
         dest_path,
         |dest_path| {
@@ -467,8 +468,80 @@ pub fn export_xlsx_normalized_time_guarded(
 mod tests {
     use super::*;
     use crate::db;
+    use crate::semantic::{self, SemanticEmbedder, SemanticSearchPolicy};
     use calamine::Reader;
     use std::io::Read;
+
+    struct ConstantEmbedder;
+
+    impl SemanticEmbedder for ConstantEmbedder {
+        fn embed_batch(&self, texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
+            Ok(texts
+                .iter()
+                .map(|_| {
+                    let mut vector = vec![0.0; 384];
+                    vector[0] = 1.0;
+                    vector
+                })
+                .collect())
+        }
+    }
+
+    fn semantic_export_fixture(count: usize) -> (Connection, Vec<ColumnMeta>, QuerySpec) {
+        let mut conn = Connection::open_in_memory().unwrap();
+        let columns = vec![
+            ColumnMeta {
+                sql_name: "event_id".into(),
+                original_name: "Event ID".into(),
+                col_index: 0,
+                inferred_type: "identifier".into(),
+            },
+            ColumnMeta {
+                sql_name: "message".into(),
+                original_name: "Message".into(),
+                col_index: 1,
+                inferred_type: "text".into(),
+            },
+        ];
+        db::create_schema(&conn, &columns).unwrap();
+        let tx = conn.transaction().unwrap();
+        {
+            let mut insert = tx
+                .prepare("INSERT INTO rows(row_num, event_id, message) VALUES (?1, ?2, ?3)")
+                .unwrap();
+            for index in 0..count {
+                insert
+                    .execute(rusqlite::params![
+                        index as i64 + 1,
+                        format!("event-{index}"),
+                        "credential dumping process observed"
+                    ])
+                    .unwrap();
+            }
+        }
+        tx.commit().unwrap();
+        let embedder = ConstantEmbedder;
+        semantic::ensure_semantic_index_v2(&mut conn, &columns, &embedder, || false, |_| {})
+            .unwrap();
+        let selection = semantic::create_semantic_selection(
+            &mut conn,
+            &columns,
+            &embedder,
+            "credential theft activity",
+            SemanticSearchPolicy {
+                maximum_documents: 1,
+                minimum_score: -1.0,
+            },
+        )
+        .unwrap();
+        let spec = QuerySpec {
+            expression: Some(query::QueryExpression::SemanticSelection {
+                selection_id: selection.selection_id,
+            }),
+            ..QuerySpec::default()
+        };
+        (conn, columns, spec)
+    }
 
     fn setup() -> (Connection, Vec<ColumnMeta>) {
         let conn = Connection::open_in_memory().unwrap();
@@ -701,6 +774,40 @@ mod tests {
         assert_eq!(header[0].to_string(), "Account");
         let first_data_row = rows.next().unwrap();
         assert_eq!(first_data_row[0].to_string(), "alice");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn semantic_selection_has_csv_xlsx_and_query_count_parity_above_legacy_caps() {
+        let (conn, columns, spec) = semantic_export_fixture(1_601);
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "log-parser-semantic-export-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let csv_path = dir.join("selection.csv");
+        let xlsx_path = dir.join("selection.xlsx");
+
+        let expected = query::count_rows(&conn, &columns, &spec).unwrap();
+        let csv = export_csv(&conn, &columns, &spec, &csv_path, |_| {}).unwrap();
+        let xlsx = export_xlsx(&conn, &columns, &spec, &xlsx_path, |_| {}).unwrap();
+        assert_eq!(expected, 1_601);
+        assert_eq!(csv.row_count, expected);
+        assert_eq!(xlsx.row_count, expected);
+        assert_eq!(
+            std::fs::read_to_string(&csv_path).unwrap().lines().count(),
+            1_602
+        );
+
+        let mut workbook = calamine::open_workbook_auto(&xlsx_path).unwrap();
+        let sheet_name = workbook.sheet_names()[0].clone();
+        let range = workbook.worksheet_range(&sheet_name).unwrap();
+        assert_eq!(range.height(), 1_602);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -22,7 +22,8 @@ pub struct AppStateInner {
 pub struct AppState {
     pub loaded: Mutex<Option<AppStateInner>>,
     pub llm: Arc<Mutex<Option<llm_parser::LlmParser>>>,
-    pub semantic: Arc<Mutex<Option<semantic::SemanticModel>>>,
+    pub semantic: Arc<Mutex<Option<Arc<semantic::SemanticModel>>>>,
+    semantic_cancel: Mutex<Option<Arc<AtomicBool>>>,
     next_generation: AtomicU64,
     /// Guards against overlapping `import_sheet` calls (e.g. a double-clicked "Load Sheet"
     /// button, or opening a second file while the first is still importing). Without this,
@@ -80,8 +81,12 @@ struct IntelScanProgressPayload {
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct SemanticIndexProgressPayload {
+    build_id: i64,
     rows_done: i64,
     rows_total: i64,
+    documents_embedded: i64,
+    mappings_written: i64,
+    resumed_from_row: i64,
     phase: String,
 }
 
@@ -101,6 +106,14 @@ struct ReportExportProgressPayload {
 
 fn now_marker() -> String {
     chrono::Utc::now().to_rfc3339()
+}
+
+fn cancel_semantic_index_build(state: &AppState) {
+    if let Ok(mut current) = state.semantic_cancel.lock() {
+        if let Some(cancelled) = current.take() {
+            cancelled.store(true, Ordering::SeqCst);
+        }
+    }
 }
 
 fn state_snapshot(state: &State<'_, AppState>) -> Result<(PathBuf, Vec<ColumnMeta>, u64), String> {
@@ -162,6 +175,7 @@ pub async fn import_sheet(
             "Another file is already being imported — please wait for it to finish.".to_string(),
         );
     }
+    cancel_semantic_index_build(&state);
     let generation = state.next_generation.fetch_add(1, Ordering::SeqCst) + 1;
     {
         let mut guard = state
@@ -324,16 +338,8 @@ pub fn semantic_index_status(state: State<'_, AppState>) -> Result<SemanticIndex
     let conn = db::open(&db_path).map_err(|error| error.to_string())?;
     let ready =
         semantic::semantic_index_ready(&conn, &columns).map_err(|error| error.to_string())?;
-    let rows_indexed = if ready {
-        conn.query_row(
-            "SELECT rows_indexed FROM _semantic_index_info ORDER BY rowid DESC LIMIT 1",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap_or(0)
-    } else {
-        0
-    };
+    let rows_indexed =
+        semantic::semantic_indexed_rows(&conn, &columns).map_err(|error| error.to_string())?;
     Ok(SemanticIndexStatus {
         ready,
         rows_indexed,
@@ -351,7 +357,18 @@ pub async fn build_semantic_index(
     let tokenizer_path = resolve_llm_resource(&app, semantic::TOKENIZER_RESOURCE_PATH)?;
     let config_path = resolve_llm_resource(&app, semantic::CONFIG_RESOURCE_PATH)?;
     let semantic_model = Arc::clone(&state.semantic);
+    let cancellation = Arc::new(AtomicBool::new(false));
+    {
+        let mut current = state
+            .semantic_cancel
+            .lock()
+            .map_err(|_| "semantic cancellation lock poisoned".to_string())?;
+        if let Some(previous) = current.replace(Arc::clone(&cancellation)) {
+            previous.store(true, Ordering::SeqCst);
+        }
+    }
     let app_for_task = app.clone();
+    let task_cancellation = Arc::clone(&cancellation);
     let result = tauri::async_runtime::spawn_blocking(move || {
         let mut conn = db::open(&db_path).map_err(|error| error.to_string())?;
         let rows_total: i64 = conn
@@ -360,37 +377,65 @@ pub async fn build_semantic_index(
         let _ = app_for_task.emit(
             "semantic-index-progress",
             SemanticIndexProgressPayload {
+                build_id: 0,
                 rows_done: 0,
                 rows_total,
-                phase: "indexing".to_string(),
+                documents_embedded: 0,
+                mappings_written: 0,
+                resumed_from_row: 0,
+                phase: "loadingModel".to_string(),
             },
         );
-        let mut guard = semantic_model
-            .lock()
-            .map_err(|_| "semantic model lock poisoned".to_string())?;
-        if guard.is_none() {
-            *guard = Some(
-                semantic::SemanticModel::load(&model_path, &tokenizer_path, &config_path)
-                    .map_err(|error| error.to_string())?,
-            );
-        }
-        let model = guard
-            .as_ref()
-            .ok_or_else(|| "semantic model failed to initialize".to_string())?;
-        let summary = semantic::ensure_semantic_index(&mut conn, &columns, model)
-            .map_err(|error| error.to_string())?;
-        let _ = app_for_task.emit(
-            "semantic-index-progress",
-            SemanticIndexProgressPayload {
-                rows_done: summary.rows_indexed,
-                rows_total,
-                phase: "complete".to_string(),
+        let model = {
+            let mut guard = semantic_model
+                .lock()
+                .map_err(|_| "semantic model lock poisoned".to_string())?;
+            if guard.is_none() {
+                *guard = Some(Arc::new(
+                    semantic::SemanticModel::load(&model_path, &tokenizer_path, &config_path)
+                        .map_err(|error| error.to_string())?,
+                ));
+            }
+            guard
+                .as_ref()
+                .cloned()
+                .ok_or_else(|| "semantic model failed to initialize".to_string())?
+        };
+        let progress_app = app_for_task.clone();
+        let summary = semantic::ensure_semantic_index_v2(
+            &mut conn,
+            &columns,
+            model.as_ref(),
+            || task_cancellation.load(Ordering::SeqCst),
+            move |progress| {
+                let _ = progress_app.emit(
+                    "semantic-index-progress",
+                    SemanticIndexProgressPayload {
+                        build_id: progress.build_id,
+                        rows_done: progress.rows_scanned,
+                        rows_total: progress.rows_total,
+                        documents_embedded: progress.documents_embedded,
+                        mappings_written: progress.mappings_written,
+                        resumed_from_row: progress.resumed_from_row,
+                        phase: progress.phase,
+                    },
+                );
             },
-        );
+        )
+        .map_err(|error| error.to_string())?;
         Ok::<_, String>(summary)
     })
     .await
     .map_err(|error| format!("semantic index task join error: {error}"))??;
+
+    if let Ok(mut current) = state.semantic_cancel.lock() {
+        if current
+            .as_ref()
+            .is_some_and(|active| Arc::ptr_eq(active, &cancellation))
+        {
+            current.take();
+        }
+    }
 
     let still_current = state
         .loaded
@@ -428,10 +473,10 @@ pub async fn parse_guided_query(
     };
     let preview = tauri::async_runtime::spawn_blocking(
         move || -> Result<guided_parser::GuidedQueryPreview, String> {
-            let conn = db::open(&db_path).map_err(|e| e.to_string())?;
+            let mut conn = db::open(&db_path).map_err(|e| e.to_string())?;
             // Semantic retrieval is optional. A missing/not-yet-built index or model resource
             // never blocks the validated lexical raw-table plan.
-            let semantic_row_ids =
+            let semantic_selection =
                 if semantic::semantic_index_ready(&conn, &columns).unwrap_or(false) {
                     semantic_paths
                         .as_ref()
@@ -443,21 +488,23 @@ pub async fn parse_guided_query(
                                     semantic_tokenizer,
                                     semantic_config,
                                 )
-                                .ok();
-                            }
-                            let model = guard.as_ref()?;
-                            semantic::semantic_search(&conn, model, &query_text, 250, 0.20)
                                 .ok()
-                                .map(|candidates| {
-                                    candidates
-                                        .into_iter()
-                                        .map(|candidate| candidate.row_num)
-                                        .collect::<Vec<_>>()
-                                })
+                                .map(Arc::new);
+                            }
+                            guard.as_ref().cloned()
                         })
-                        .unwrap_or_default()
+                        .and_then(|model| {
+                            semantic::create_semantic_selection(
+                                &mut conn,
+                                &columns,
+                                model.as_ref(),
+                                &query_text,
+                                semantic::SemanticSearchPolicy::default(),
+                            )
+                            .ok()
+                        })
                 } else {
-                    Vec::new()
+                    None
                 };
             let mut guard = llm
                 .lock()
@@ -471,14 +518,28 @@ pub async fn parse_guided_query(
             let model = guard
                 .as_mut()
                 .ok_or_else(|| "local AI model failed to initialize".to_string())?;
-            guided_parser::parse_guided_query_with_llm_and_semantic(
+            let mut preview = guided_parser::parse_guided_query_with_llm_and_semantic_selection(
                 &conn,
                 &columns,
                 &query_text,
                 model,
-                &semantic_row_ids,
+                &[],
+                semantic_selection
+                    .as_ref()
+                    .filter(|selection| selection.documents_retained > 0)
+                    .map(|selection| selection.selection_id.as_str()),
             )
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+            if preview.query_spec.is_some() {
+                if let Some(selection) = semantic_selection {
+                    preview.match_explanation.extend(selection.warnings);
+                    preview.match_explanation.push(format!(
+                        "Semantic selection retained {} document(s) and expands to {} raw row(s).",
+                        selection.documents_retained, selection.rows_matched
+                    ));
+                }
+            }
+            Ok(preview)
         },
     )
     .await
@@ -552,6 +613,7 @@ pub fn set_guided_parse_decision(
 
 #[tauri::command]
 pub fn clear_loaded_file(state: State<'_, AppState>) -> Result<(), String> {
+    cancel_semantic_index_build(&state);
     let mut guard = state
         .loaded
         .lock()

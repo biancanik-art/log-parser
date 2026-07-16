@@ -1,4 +1,5 @@
 use crate::db::{self, ColumnMeta};
+use crate::semantic;
 use anyhow::{anyhow, Result};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
@@ -89,6 +90,12 @@ pub enum QueryExpression {
     /// AI-generated JSON must not be permitted to create this variant without backend validation.
     RowIds {
         values: Vec<i64>,
+    },
+    /// Backend-created, dataset-bound semantic document selection. The identifier is never
+    /// interpreted as SQL and is accepted only when it names the currently active semantic build.
+    SemanticSelection {
+        #[serde(rename = "selectionId")]
+        selection_id: String,
     },
 }
 
@@ -260,6 +267,7 @@ fn compile_column_predicate(
 }
 
 struct ExpressionCompiler<'a> {
+    conn: Option<&'a Connection>,
     columns: &'a [ColumnMeta],
     params: &'a mut Vec<Box<dyn rusqlite::ToSql>>,
     node_count: usize,
@@ -293,6 +301,9 @@ impl ExpressionCompiler<'_> {
                 compile_column_predicate(self.columns, column, *op, value, self.params)
             }
             QueryExpression::RowIds { values } => self.compile_row_ids(values),
+            QueryExpression::SemanticSelection { selection_id } => {
+                self.compile_semantic_selection(selection_id)
+            }
         }
     }
 
@@ -337,9 +348,33 @@ impl ExpressionCompiler<'_> {
         }
         Ok(format!("row_num IN ({})", placeholders.join(", ")))
     }
+
+    fn compile_semantic_selection(&mut self, selection_id: &str) -> Result<String> {
+        let conn = self
+            .conn
+            .ok_or_else(|| anyhow!("semantic selection requires a database-bound query"))?;
+        semantic::validate_semantic_selection(conn, self.columns, selection_id)?;
+        self.params.push(Box::new(selection_id.to_string()));
+        Ok("row_num IN (
+                SELECT m.row_num
+                FROM _semantic_v2_selection s
+                JOIN _semantic_v2_active a
+                  ON a.singleton = 1 AND a.build_id = s.build_id
+                JOIN _semantic_v2_selection_doc sd
+                  ON sd.selection_id = s.selection_id
+                JOIN _semantic_v2_mapping m
+                  ON m.build_id = s.build_id AND m.doc_id = sd.doc_id
+                WHERE s.selection_id = ?
+             )"
+        .to_string())
+    }
 }
 
-pub(crate) fn build_predicate(columns: &[ColumnMeta], spec: &QuerySpec) -> Result<Predicate> {
+fn build_predicate_inner(
+    conn: Option<&Connection>,
+    columns: &[ColumnMeta],
+    spec: &QuerySpec,
+) -> Result<Predicate> {
     let mut clauses: Vec<String> = Vec::new();
     let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
 
@@ -368,6 +403,7 @@ pub(crate) fn build_predicate(columns: &[ColumnMeta], spec: &QuerySpec) -> Resul
 
     if let Some(expression) = &spec.expression {
         let mut compiler = ExpressionCompiler {
+            conn,
             columns,
             params: &mut params,
             node_count: 0,
@@ -388,6 +424,18 @@ pub(crate) fn build_predicate(columns: &[ColumnMeta], spec: &QuerySpec) -> Resul
     };
 
     Ok(Predicate { where_sql, params })
+}
+
+pub(crate) fn build_predicate(columns: &[ColumnMeta], spec: &QuerySpec) -> Result<Predicate> {
+    build_predicate_inner(None, columns, spec)
+}
+
+pub(crate) fn build_predicate_for_connection(
+    conn: &Connection,
+    columns: &[ColumnMeta],
+    spec: &QuerySpec,
+) -> Result<Predicate> {
+    build_predicate_inner(Some(conn), columns, spec)
 }
 
 /// `ORDER BY` clause for a given sort spec, defaulting to `row_num ASC`. Shared by `query_rows`
@@ -418,7 +466,7 @@ pub(crate) fn column_ident_list(columns: &[ColumnMeta]) -> String {
 }
 
 pub fn count_rows(conn: &Connection, columns: &[ColumnMeta], spec: &QuerySpec) -> Result<i64> {
-    let predicate = build_predicate(columns, spec)?;
+    let predicate = build_predicate_for_connection(conn, columns, spec)?;
     let sql = format!("SELECT COUNT(*) FROM rows {}", predicate.where_sql);
     let mut stmt = conn.prepare(&sql)?;
     let params: Vec<&dyn rusqlite::ToSql> = predicate.params.iter().map(|p| p.as_ref()).collect();
@@ -434,7 +482,7 @@ pub fn query_rows(
     columns: &[ColumnMeta],
     spec: &QuerySpec,
 ) -> Result<QueryPage> {
-    let predicate = build_predicate(columns, spec)?;
+    let predicate = build_predicate_for_connection(conn, columns, spec)?;
     let limit = spec.limit.clamp(1, 5000);
 
     let (order_sql, sort_ident) = match &spec.sort {
@@ -549,6 +597,80 @@ pub fn query_rows(
 mod tests {
     use super::*;
     use crate::db::ImportInfo;
+    use crate::semantic::{self, SemanticEmbedder, SemanticSearchPolicy};
+
+    struct ConstantEmbedder;
+
+    impl SemanticEmbedder for ConstantEmbedder {
+        fn embed_batch(&self, texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
+            Ok(texts
+                .iter()
+                .map(|_| {
+                    let mut vector = vec![0.0; 384];
+                    vector[0] = 1.0;
+                    vector
+                })
+                .collect())
+        }
+    }
+
+    fn semantic_scale_fixture(count: usize) -> (Connection, Vec<ColumnMeta>, String) {
+        let mut conn = Connection::open_in_memory().unwrap();
+        let columns = vec![
+            ColumnMeta {
+                sql_name: "event_id".into(),
+                original_name: "Event ID".into(),
+                col_index: 0,
+                inferred_type: "identifier".into(),
+            },
+            ColumnMeta {
+                sql_name: "message".into(),
+                original_name: "Message".into(),
+                col_index: 1,
+                inferred_type: "text".into(),
+            },
+        ];
+        db::create_schema(&conn, &columns).unwrap();
+        let tx = conn.transaction().unwrap();
+        {
+            let mut insert = tx
+                .prepare("INSERT INTO rows(row_num, event_id, message) VALUES (?1, ?2, ?3)")
+                .unwrap();
+            for index in 0..count {
+                insert
+                    .execute(rusqlite::params![
+                        index as i64 + 1,
+                        format!("event-{index}"),
+                        "credential dumping process observed"
+                    ])
+                    .unwrap();
+            }
+        }
+        tx.commit().unwrap();
+        let embedder = ConstantEmbedder;
+        semantic::ensure_semantic_index_v2(&mut conn, &columns, &embedder, || false, |_| {})
+            .unwrap();
+        let selection = semantic::create_semantic_selection(
+            &mut conn,
+            &columns,
+            &embedder,
+            "credential theft activity",
+            SemanticSearchPolicy {
+                maximum_documents: 1,
+                minimum_score: -1.0,
+            },
+        )
+        .unwrap();
+        (conn, columns, selection.selection_id)
+    }
+
+    fn semantic_selection_spec(selection_id: String, limit: u32) -> QuerySpec {
+        QuerySpec {
+            expression: Some(QueryExpression::SemanticSelection { selection_id }),
+            limit,
+            ..QuerySpec::default()
+        }
+    }
 
     fn setup() -> (Connection, Vec<ColumnMeta>) {
         let conn = Connection::open_in_memory().unwrap();
@@ -1100,5 +1222,33 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("parameter count"), "{error}");
+    }
+
+    #[test]
+    fn trusted_semantic_selection_counts_and_paginates_all_mapped_rows() {
+        let (conn, columns, selection_id) = semantic_scale_fixture(1_601);
+        let mut spec = semantic_selection_spec(selection_id.clone(), 317);
+        assert_eq!(count_rows(&conn, &columns, &spec).unwrap(), 1_601);
+
+        let mut observed = Vec::new();
+        loop {
+            let page = query_rows(&conn, &columns, &spec).unwrap();
+            observed.extend(page.rows.iter().map(|row| row["row_num"].as_i64().unwrap()));
+            if !page.has_more {
+                break;
+            }
+            spec.cursor = page.next_cursor;
+        }
+        assert_eq!(observed.len(), 1_601);
+        assert_eq!(observed.first(), Some(&1));
+        assert_eq!(observed.last(), Some(&1_601));
+        assert!(observed.windows(2).all(|window| window[0] < window[1]));
+
+        let forged = semantic_selection_spec("f".repeat(64), 10);
+        assert!(count_rows(&conn, &columns, &forged).is_err());
+
+        let (other_conn, other_columns, _) = semantic_scale_fixture(2);
+        let cross_dataset = semantic_selection_spec(selection_id, 10);
+        assert!(count_rows(&other_conn, &other_columns, &cross_dataset).is_err());
     }
 }
