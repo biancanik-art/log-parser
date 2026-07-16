@@ -90,13 +90,21 @@
   let guidedReviewStatus = null;
   let guidedQuerySpec = null;
   let guidedMatchExplanation = [];
+  let guidedPreviewQueryText = null;
   let guidedContextRevision = 0;
   let guidedParseRequestSequence = 0;
   let guidedActiveParse = null;
   let guidedActionSequence = 0;
   let guidedActiveAction = null;
   let guidedActiveQuery = null;
+  let dataRequestSequence = 0;
+  let activeDataRequest = null;
+  let countRequestSequence = 0;
+  let activeCountRequest = null;
   let sheetLoadInFlight = false;
+  let sourceLoadSequence = 0;
+  let activeSourceLoad = null;
+  let activeSheetImport = null;
   let controlsEnabled = false;
 
   let columnRoleSuggestions = [];
@@ -108,8 +116,12 @@
   let roleDetectionError = null;
   let roleDetectionRequestSequence = 0;
   let activeRoleDetectionRequest = null;
+  let mappingRequestSequence = 0;
+  const activeMappingRequests = new Map();
   let automaticTimestampInFlight = false;
   let automaticTimestampSqlName = null;
+  let timestampOperationSequence = 0;
+  let activeTimestampOperation = null;
   let semanticIndexState = { status: "idle", rowsIndexed: 0, summary: null, error: null };
   let semanticIndexRequestSequence = 0;
   let activeSemanticIndexRequest = null;
@@ -174,6 +186,30 @@
     updateGuidedInteractionControls();
   }
 
+  function setSourceLoadInFlight(inFlight) {
+    sheetLoadInFlight = inFlight;
+    openFileBtn.disabled = inFlight;
+    sheetLoadBtn.disabled = inFlight;
+    searchBox.disabled = inFlight || !controlsEnabled;
+    reportExportBtn.disabled = inFlight || !controlsEnabled;
+    exportCsvBtn.disabled = inFlight || !controlsEnabled;
+    exportXlsxBtn.disabled = inFlight || !controlsEnabled;
+    addFilterBtn.disabled = inFlight || !controlsEnabled;
+    applyBtn.disabled = inFlight || !controlsEnabled;
+    clearBtn.disabled = inFlight || !controlsEnabled;
+    reviewRolesBtn.disabled = inFlight || !controlsEnabled;
+    suspiciousScanBtn.disabled = inFlight || !controlsEnabled;
+    if (inFlight) {
+      prevPageBtn.disabled = true;
+      nextPageBtn.disabled = true;
+    } else {
+      prevPageBtn.disabled = cursorStack.length === 0;
+      nextPageBtn.disabled = !hasMore;
+      updateEvidenceColumnsUi();
+    }
+    updateGuidedInteractionControls();
+  }
+
   function showProgress(label, fraction) {
     progressWrap.classList.remove("hidden");
     progressLabel.textContent = label;
@@ -188,6 +224,13 @@
     const parsing = guidedActiveParse !== null;
     const actionInFlight = guidedActiveAction !== null;
     const queryInFlight = guidedActiveQuery !== null;
+    guidedSearchBox.disabled =
+      !controlsEnabled ||
+      columns.length === 0 ||
+      sheetLoadInFlight ||
+      parsing ||
+      actionInFlight ||
+      queryInFlight;
     guidedSearchSubmit.disabled =
       !controlsEnabled || columns.length === 0 || sheetLoadInFlight || parsing || actionInFlight || queryInFlight;
     guidedRunBtn.disabled = actionInFlight || queryInFlight;
@@ -204,6 +247,7 @@
   }
 
   function resetGuidedQueryUi() {
+    cancelSearchDebounce();
     invalidateGuidedContext();
     queryMode = "normal";
     guidedParseResult = null;
@@ -212,6 +256,7 @@
     guidedReviewStatus = null;
     guidedQuerySpec = null;
     guidedMatchExplanation = [];
+    guidedPreviewQueryText = null;
 
     guidedSearchBox.value = "";
     guidedQueryPanel.classList.add("hidden");
@@ -237,13 +282,17 @@
     roleDetectionInFlight = false;
     roleDetectionError = null;
     activeRoleDetectionRequest = null;
+    activeMappingRequests.clear();
     automaticTimestampInFlight = false;
     automaticTimestampSqlName = null;
+    activeTimestampOperation = null;
     activeSemanticIndexRequest = null;
     semanticIndexState = { status: "idle", rowsIndexed: 0, summary: null, error: null };
     semanticIndexStatus.className = "semantic-index-status";
     semanticIndexStatus.textContent = "Semantic matching starts automatically after import.";
     intelScanInFlight = false;
+    activeDataRequest = null;
+    activeCountRequest = null;
 
     roleList.innerHTML = "";
     rolePanelStatus.textContent = "";
@@ -256,6 +305,8 @@
     timezoneSamples.textContent = "";
     timezoneSamples.classList.add("hidden");
     timezonePanel.classList.add("hidden");
+    timezoneNormalizeBtn.disabled = false;
+    timezoneUtcBtn.disabled = false;
 
     reportSummaryText.textContent = "";
     reportSummaryPanel.classList.add("hidden");
@@ -269,7 +320,8 @@
       guidedActiveParse === request &&
       guidedContextRevision === request.contextRevision &&
       currentPath === request.path &&
-      currentSheet === request.sheet
+      currentSheet === request.sheet &&
+      guidedSearchBox.value.trim() === request.queryText
     );
   }
 
@@ -482,9 +534,17 @@
       confirmBtn.addEventListener("click", () => {
         const selectedColumn = columnSelect.value;
         if (!selectedColumn) return;
+        columnSelect.disabled = true;
+        confirmBtn.disabled = true;
+        rejectBtn.disabled = true;
         setColumnRoleStatus(role, selectedColumn, "confirmed").catch((err) =>
           alert(`Data mapping update failed: ${err}`)
-        );
+        ).finally(() => {
+          if (!row.isConnected) return;
+          columnSelect.disabled = false;
+          updateConfirmButton();
+          rejectBtn.disabled = !suggestion.sqlName || suggestion.status === "rejected";
+        });
       });
 
       const rejectBtn = document.createElement("button");
@@ -492,11 +552,26 @@
       rejectBtn.textContent = "Reject";
       rejectBtn.disabled = !suggestion.sqlName || suggestion.status === "rejected";
       rejectBtn.addEventListener("click", () => {
+        columnSelect.disabled = true;
+        confirmBtn.disabled = true;
+        rejectBtn.disabled = true;
         setColumnRoleStatus(role, suggestion.sqlName, "rejected").catch((err) =>
           alert(`Data mapping update failed: ${err}`)
-        );
+        ).finally(() => {
+          if (!row.isConnected) return;
+          columnSelect.disabled = false;
+          updateConfirmButton();
+          rejectBtn.disabled = !suggestion.sqlName || suggestion.status === "rejected";
+        });
       });
       actions.append(confirmBtn, rejectBtn);
+      if (role === "timestamp" && timestampAnalysis && timestampAnalysis.needsTimezone) {
+        const timezoneBtn = document.createElement("button");
+        timezoneBtn.className = "btn btn-small";
+        timezoneBtn.textContent = "Timezone...";
+        timezoneBtn.addEventListener("click", () => showTimezonePrompt(timestampAnalysis));
+        actions.appendChild(timezoneBtn);
+      }
 
       row.append(roleTitle, columnSelect, meta, actions);
       if (suggestion.reasons && suggestion.reasons.length > 0) {
@@ -669,7 +744,7 @@
     return normalized;
   }
 
-  function renderGuidedPreview(result) {
+  function renderGuidedPreview(result, queryText) {
     guidedParseResult = result;
     guidedIntentToken = typeof result.intentToken === "string" && result.intentToken ? result.intentToken : null;
     guidedAuditId = Number.isInteger(result.auditId) ? result.auditId : null;
@@ -677,6 +752,7 @@
     guidedMatchExplanation = Array.isArray(result.matchExplanation)
       ? result.matchExplanation.filter((item) => typeof item === "string" && item.trim())
       : [];
+    guidedPreviewQueryText = queryText;
     try {
       guidedQuerySpec = normalizeBackendQuerySpec(result.querySpec);
     } catch (error) {
@@ -720,6 +796,9 @@
         "More detail is needed before a safe evidence search can run.";
       guidedClarification.classList.remove("hidden");
       guidedRunBtn.classList.add("hidden");
+      if (table && table.getDataCount() > 0) {
+        rowCountLabel.textContent = "Previous table results shown — they do not answer this unresolved request.";
+      }
     } else {
       guidedClarification.textContent = "";
       guidedClarification.classList.add("hidden");
@@ -804,18 +883,48 @@
     return s;
   }
 
+  function snapshotQuerySpec(source = spec) {
+    return JSON.parse(JSON.stringify(source));
+  }
+
   async function refreshCount() {
     if (queryMode === "guided") {
+      activeCountRequest = null;
+      countRequestSequence += 1;
       totalCount = null;
       updateRowCountLabel();
       return;
     }
 
+    const request = {
+      id: ++countRequestSequence,
+      contextRevision: guidedContextRevision,
+      path: currentPath,
+      sheet: currentSheet,
+      mode: queryMode,
+      table,
+      querySpec: guidedQuerySpec,
+      spec: snapshotQuerySpec(),
+    };
+    activeCountRequest = request;
+    totalCount = null;
+    updateRowCountLabel();
+    const isCurrent = () =>
+      activeCountRequest === request &&
+      loadedContextIsCurrent(request) &&
+      queryMode === request.mode &&
+      table === request.table &&
+      (request.mode === "normal" || guidedQuerySpec === request.querySpec);
     try {
-      totalCount = await invoke("count_rows", { spec });
+      const count = await invoke("count_rows", { spec: request.spec });
+      if (!isCurrent()) return;
+      totalCount = count;
       updateRowCountLabel();
     } catch (err) {
+      if (!isCurrent()) return;
       console.error("count_rows failed", err);
+    } finally {
+      if (activeCountRequest === request) activeCountRequest = null;
     }
   }
 
@@ -854,32 +963,35 @@
     if (isTrackedEvidenceRequest && guidedActiveQuery !== null) return null;
     setAiMatchColumnVisible(isTrackedEvidenceRequest);
 
-    const guidedQueryRequest = isTrackedEvidenceRequest
-      ? {
-          contextRevision: guidedContextRevision,
-          mode: modeAtStart,
-          auditId: guidedAuditId,
-          intentToken: guidedIntentToken,
-          querySpec: guidedQuerySpec,
-          cursor: spec.cursor,
-          limit: spec.limit,
-          spec: isQuerySpecRequest ? { ...spec, cursor: spec.cursor } : null,
-          table,
-        }
-      : null;
-    if (guidedQueryRequest) {
-      guidedActiveQuery = guidedQueryRequest;
+    const request = {
+      id: ++dataRequestSequence,
+      contextRevision: guidedContextRevision,
+      path: currentPath,
+      sheet: currentSheet,
+      mode: modeAtStart,
+      auditId: guidedAuditId,
+      intentToken: guidedIntentToken,
+      querySpec: guidedQuerySpec,
+      cursor: spec.cursor,
+      limit: spec.limit,
+      spec: isGuidedRequest ? null : snapshotQuerySpec(),
+      table,
+    };
+    activeDataRequest = request;
+    if (isTrackedEvidenceRequest) {
+      guidedActiveQuery = request;
       updateGuidedInteractionControls();
     }
 
-    const guidedQueryIsCurrent = () =>
-      !guidedQueryRequest ||
-      (guidedContextRevision === guidedQueryRequest.contextRevision &&
-        queryMode === guidedQueryRequest.mode &&
-        guidedAuditId === guidedQueryRequest.auditId &&
-        guidedIntentToken === guidedQueryRequest.intentToken &&
-        guidedQuerySpec === guidedQueryRequest.querySpec &&
-        table === guidedQueryRequest.table);
+    const requestIsCurrent = () =>
+      activeDataRequest === request &&
+      loadedContextIsCurrent(request) &&
+      queryMode === request.mode &&
+      (!isTrackedEvidenceRequest ||
+        (guidedAuditId === request.auditId &&
+          guidedIntentToken === request.intentToken &&
+          guidedQuerySpec === request.querySpec)) &&
+      table === request.table;
 
     prevPageBtn.disabled = true;
     nextPageBtn.disabled = true;
@@ -895,26 +1007,28 @@
       const page =
         isGuidedRequest
           ? await invoke("run_guided_query", {
-              intentToken: guidedQueryRequest.intentToken,
-              auditId: guidedQueryRequest.auditId,
-              cursor: guidedQueryRequest.cursor,
-              limit: guidedQueryRequest.limit,
+              intentToken: request.intentToken,
+              auditId: request.auditId,
+              cursor: request.cursor,
+              limit: request.limit,
             })
-          : await invoke("query_rows", { spec: guidedQueryRequest ? guidedQueryRequest.spec : spec });
-      if (!guidedQueryIsCurrent() || !table) return null;
-      table.setData(page.rows);
+          : await invoke("query_rows", { spec: request.spec });
+      if (!requestIsCurrent() || !table) return null;
+      await request.table.replaceData(page.rows);
+      if (!requestIsCurrent() || !table) return null;
       nextCursor = page.nextCursor;
       hasMore = page.hasMore;
       updateRowCountLabel();
       return page;
     } catch (err) {
-      if (!guidedQueryIsCurrent()) return null;
+      if (!requestIsCurrent()) return null;
       console.error(`${isGuidedRequest ? "run_guided_query" : "query_rows"} failed`, err);
       alert(`Query failed: ${err}`);
       return null;
     } finally {
-      const stillCurrent = guidedQueryIsCurrent();
-      if (guidedActiveQuery === guidedQueryRequest) {
+      const stillCurrent = requestIsCurrent();
+      if (activeDataRequest === request) activeDataRequest = null;
+      if (guidedActiveQuery === request) {
         guidedActiveQuery = null;
         updateGuidedInteractionControls();
       }
@@ -927,6 +1041,7 @@
   }
 
   function applyControlsAndReload() {
+    cancelSearchDebounce();
     queryMode = "normal";
     setAiMatchColumnVisible(false);
     guidedResetBtn.classList.add("hidden");
@@ -942,9 +1057,24 @@
   }
 
   let searchDebounceHandle = null;
-  function debouncedApply() {
+  function cancelSearchDebounce() {
     if (searchDebounceHandle) clearTimeout(searchDebounceHandle);
-    searchDebounceHandle = setTimeout(applyControlsAndReload, 300);
+    searchDebounceHandle = null;
+  }
+
+  function debouncedApply() {
+    cancelSearchDebounce();
+    const request = {
+      contextRevision: guidedContextRevision,
+      path: currentPath,
+      sheet: currentSheet,
+    };
+    searchDebounceHandle = setTimeout(() => {
+      searchDebounceHandle = null;
+      if (loadedContextIsCurrent(request) && controlsEnabled && !sheetLoadInFlight) {
+        applyControlsAndReload();
+      }
+    }, 300);
   }
 
   function loadedContextIsCurrent(request) {
@@ -975,6 +1105,25 @@
     }
   }
 
+  function requireFreshPreviewForSemanticIndex() {
+    if (
+      !guidedParseResult ||
+      guidedPreviewQueryText === null ||
+      guidedReviewStatus !== "unreviewed" ||
+      ["guided", "querySpec"].includes(queryMode)
+    ) {
+      return;
+    }
+    guidedPreviewQueryText = null;
+    guidedRunBtn.classList.add("hidden");
+    guidedRejectBtn.classList.add("hidden");
+    guidedClarification.textContent = "Semantic matching is now ready. Preview again to include semantic evidence candidates.";
+    guidedClarification.classList.remove("hidden");
+    decideGuidedParse("edited").catch((err) =>
+      console.error("could not retire the pre-semantic AI interpretation", err)
+    );
+  }
+
   async function startSemanticIndexForLoadedFile() {
     const request = {
       id: ++semanticIndexRequestSequence,
@@ -996,6 +1145,7 @@
           error: null,
         };
         renderSemanticIndexState();
+        requireFreshPreviewForSemanticIndex();
         return status;
       }
 
@@ -1008,6 +1158,7 @@
         error: null,
       };
       renderSemanticIndexState();
+      requireFreshPreviewForSemanticIndex();
       return summary;
     } catch (err) {
       if (!semanticIndexRequestIsCurrent(request)) return null;
@@ -1030,6 +1181,10 @@
     );
   }
 
+  function timestampOperationIsCurrent(operation) {
+    return activeTimestampOperation === operation && loadedContextIsCurrent(operation);
+  }
+
   async function analyzeAutomaticTimestampMapping(suggestion, request) {
     if (
       automaticTimestampInFlight ||
@@ -1041,15 +1196,24 @@
       return null;
     }
 
+    const operation = {
+      id: ++timestampOperationSequence,
+      contextRevision: request.contextRevision,
+      path: request.path,
+      sheet: request.sheet,
+      kind: "automatic",
+    };
+    activeTimestampOperation = operation;
     automaticTimestampInFlight = true;
     automaticTimestampSqlName = suggestion.sqlName;
     dataMappingSummary.textContent = "Checking timestamp format...";
     rolePanelStatus.textContent = "The high-confidence timestamp mapping is being checked in the background.";
     try {
       const analysis = await invoke("analyze_timestamp_column");
-      if (!automaticTimestampMappingIsCurrent(suggestion, request)) return null;
+      if (!automaticTimestampMappingIsCurrent(suggestion, request) || !timestampOperationIsCurrent(operation)) return null;
       timestampAnalysis = analysis;
       if (analysis.needsTimezone) {
+        renderRoleSuggestions();
         showTimezonePrompt(analysis);
         dataMappingSummary.textContent = "Timestamp timezone needed";
         rolePanelStatus.textContent = "Choose a timezone only if chronological ordering is needed. AI evidence search remains available.";
@@ -1057,14 +1221,14 @@
       }
 
       const summary = await invoke("normalize_timestamp_column", { naiveTimezone: null });
-      if (!automaticTimestampMappingIsCurrent(suggestion, request)) return null;
+      if (!automaticTimestampMappingIsCurrent(suggestion, request) || !timestampOperationIsCurrent(operation)) return null;
       timestampNormalizationSummary = summary;
       timezonePanel.classList.add("hidden");
       dataMappingSummary.textContent = `${columnRoleSuggestions.filter((row) => row.status !== "rejected").length} inferred, time ready`;
       rolePanelStatus.textContent = `Unambiguous timestamp values (explicit timezone or epoch) were normalized to UTC automatically (${summary.rowsWritten.toLocaleString()} rows).`;
       return summary;
     } catch (err) {
-      if (!automaticTimestampMappingIsCurrent(suggestion, request)) return null;
+      if (!automaticTimestampMappingIsCurrent(suggestion, request) || !timestampOperationIsCurrent(operation)) return null;
       console.error("automatic timestamp analysis/normalization failed", err);
       rolePanelStatus.textContent = `Automatic timestamp preparation was skipped: ${err}. AI evidence search is unaffected.`;
       return null;
@@ -1073,6 +1237,7 @@
         automaticTimestampInFlight = false;
         automaticTimestampSqlName = null;
       }
+      if (activeTimestampOperation === operation) activeTimestampOperation = null;
     }
   }
 
@@ -1107,69 +1272,129 @@
           (row) => row.role === "timestamp" && row.status !== "rejected" && row.confidence >= 0.75
         );
         if (timestampSuggestion) {
-          analyzeAutomaticTimestampMapping(timestampSuggestion, request);
+          await analyzeAutomaticTimestampMapping(timestampSuggestion, request);
         }
       }
     }
   }
 
   async function setColumnRoleStatus(role, sqlName, status) {
+    const request = {
+      id: ++mappingRequestSequence,
+      contextRevision: guidedContextRevision,
+      path: currentPath,
+      sheet: currentSheet,
+      role,
+      sqlName,
+      status,
+    };
+    activeMappingRequests.set(role, request);
     rolePanelStatus.textContent = `Updating ${formatRoleName(role)} mapping...`;
+    let updated;
     try {
-      const updated = await invoke("set_column_role_status", { role, sqlName, status });
+      updated = await invoke("set_column_role_status", { role, sqlName, status });
+      if (activeMappingRequests.get(role) !== request || !loadedContextIsCurrent(request)) return null;
       upsertRoleSuggestion(updated);
       renderRoleSuggestions();
-      if (
-        role === "timestamp" &&
-        status === "confirmed" &&
-        (!automaticTimestampInFlight || automaticTimestampSqlName !== sqlName)
-      ) {
-        await handleTimestampConfirmed();
-      }
-      return updated;
     } catch (err) {
+      if (activeMappingRequests.get(role) !== request || !loadedContextIsCurrent(request)) return null;
       console.error("set_column_role_status failed", err);
       rolePanelStatus.textContent = `Data mapping update failed: ${err}`;
       throw err;
+    } finally {
+      if (activeMappingRequests.get(role) === request) activeMappingRequests.delete(role);
     }
+
+    if (
+      role === "timestamp" &&
+      status === "confirmed" &&
+      (!automaticTimestampInFlight || automaticTimestampSqlName !== sqlName)
+    ) {
+      try {
+        await handleTimestampConfirmed(request);
+      } catch (err) {
+        if (loadedContextIsCurrent(request)) {
+          console.error("timestamp preparation after mapping failed", err);
+          rolePanelStatus.textContent = `Timestamp mapping was saved, but timeline preparation failed: ${err}`;
+        }
+      }
+    }
+    return updated;
   }
 
-  async function handleTimestampConfirmed() {
+  async function handleTimestampConfirmed(context = {
+    contextRevision: guidedContextRevision,
+    path: currentPath,
+    sheet: currentSheet,
+  }) {
+    const operation = {
+      id: ++timestampOperationSequence,
+      contextRevision: context.contextRevision,
+      path: context.path,
+      sheet: context.sheet,
+      kind: "manual-analysis",
+    };
+    activeTimestampOperation = operation;
     rolePanelStatus.textContent = "Analyzing timestamp column...";
     try {
       const analysis = await invoke("analyze_timestamp_column");
+      if (!timestampOperationIsCurrent(operation)) return null;
       timestampAnalysis = analysis;
       if (analysis.needsTimezone) {
+        renderRoleSuggestions();
         showTimezonePrompt(analysis);
+        dataMappingSummary.textContent = "Timestamp timezone needed";
         rolePanelStatus.textContent = "Timestamp normalization needs examiner timezone input.";
         return null;
       }
-      const summary = await normalizeTimestampColumn(null);
+      const summary = await normalizeTimestampColumn(null, operation);
+      if (!timestampOperationIsCurrent(operation)) return null;
       rolePanelStatus.textContent = `Timestamp normalized to UTC: ${summary.rowsWritten.toLocaleString()} rows written.`;
       return summary;
     } catch (err) {
+      if (!timestampOperationIsCurrent(operation)) return null;
       console.error("timestamp analysis/normalization failed", err);
       rolePanelStatus.textContent = `Timestamp normalization failed: ${err}`;
       throw err;
+    } finally {
+      if (activeTimestampOperation === operation) activeTimestampOperation = null;
     }
   }
 
-  async function normalizeTimestampColumn(naiveTimezone) {
+  async function normalizeTimestampColumn(naiveTimezone, existingOperation = null) {
+    const operation = existingOperation || {
+      id: ++timestampOperationSequence,
+      contextRevision: guidedContextRevision,
+      path: currentPath,
+      sheet: currentSheet,
+      kind: "manual-normalization",
+    };
+    if (!existingOperation) activeTimestampOperation = operation;
     timezoneNormalizeBtn.disabled = true;
     timezoneUtcBtn.disabled = true;
     try {
       const summary = await invoke("normalize_timestamp_column", { naiveTimezone });
+      if (!timestampOperationIsCurrent(operation)) return null;
       timestampNormalizationSummary = summary;
+      if (timestampAnalysis) timestampAnalysis = { ...timestampAnalysis, needsTimezone: false };
       timezonePanel.classList.add("hidden");
+      renderRoleSuggestions();
+      dataMappingSummary.textContent = `${columnRoleSuggestions.filter((row) => row.status !== "rejected").length} inferred, time ready`;
       rolePanelStatus.textContent = `Timestamp normalized to UTC: ${summary.rowsWritten.toLocaleString()} rows written.`;
       return summary;
     } catch (err) {
+      if (!timestampOperationIsCurrent(operation)) return null;
       console.error("normalize_timestamp_column failed", err);
       timezoneSummary.textContent = `Normalization failed: ${err}`;
       throw err;
     } finally {
-      timezoneNormalizeBtn.disabled = false;
-      timezoneUtcBtn.disabled = false;
+      if (activeTimestampOperation === operation && !existingOperation) {
+        activeTimestampOperation = null;
+      }
+      if (activeTimestampOperation === operation || activeTimestampOperation === null) {
+        timezoneNormalizeBtn.disabled = false;
+        timezoneUtcBtn.disabled = false;
+      }
     }
   }
 
@@ -1200,12 +1425,14 @@
     const trimmed = queryText.trim();
     if (!trimmed) return null;
     if (guidedActiveAction !== null || guidedActiveQuery !== null || sheetLoadInFlight) return null;
+    cancelSearchDebounce();
 
     const request = {
       id: ++guidedParseRequestSequence,
       contextRevision: guidedContextRevision,
       path: currentPath,
       sheet: currentSheet,
+      queryText: trimmed,
     };
     // Replacing this object immediately makes any older inference response stale, even when a
     // test/debug caller starts a second preview without waiting for the first one.
@@ -1225,7 +1452,7 @@
       }
       const result = await invoke("parse_guided_query", { queryText: trimmed });
       if (!guidedParseIsCurrent(request)) return null;
-      renderGuidedPreview(result);
+      renderGuidedPreview(result, request.queryText);
       return result;
     } catch (err) {
       if (!guidedParseIsCurrent(request)) return null;
@@ -1243,6 +1470,7 @@
   }
 
   async function runGuidedQuery(intentToken = guidedIntentToken) {
+    cancelSearchDebounce();
     const deterministicPlanReady =
       guidedParseResult &&
       !guidedParseResult.aiAssisted &&
@@ -1355,33 +1583,39 @@
   // -- import flow --------------------------------------------------------------
 
   async function pickAndOpenFile() {
-    const path = await invoke("plugin:dialog|open", {
-      options: {
-        multiple: false,
-        filters: [{ name: "Tabular files", extensions: ["xlsx", "xls", "xlsb", "ods", "csv"] }],
-      },
-    });
-    if (!path) return;
-
-    currentPath = path;
-    sheetLoadInFlight = true;
-    // Choosing a different source invalidates any inference that was started for the previous
-    // file, even before the native sheet listing/import round trip completes.
-    resetGuidedQueryUi();
-    hideProgress();
-    let sheets;
+    if (sheetLoadInFlight) return null;
+    setSourceLoadInFlight(true);
+    const previousPath = currentPath;
+    const previousSheet = currentSheet;
+    let sourceRequest = null;
     try {
-      sheets = await invoke("list_sheets", { path });
-    } catch (err) {
-      sheetLoadInFlight = false;
-      updateGuidedInteractionControls();
-      alert(`Could not read workbook: ${err}`);
-      return;
-    }
+      const path = await invoke("plugin:dialog|open", {
+        options: {
+          multiple: false,
+          filters: [{ name: "Tabular files", extensions: ["xlsx", "xls", "xlsb", "ods", "csv"] }],
+        },
+      });
+      if (!path) {
+        setSourceLoadInFlight(false);
+        return null;
+      }
 
-    if (sheets.length === 1) {
-      await loadSheet(sheets[0]);
-    } else {
+      sourceRequest = {
+        id: ++sourceLoadSequence,
+        path,
+        previousPath,
+        previousSheet,
+      };
+      activeSourceLoad = sourceRequest;
+      sheetPicker.classList.add("hidden");
+      hideProgress();
+      const sheets = await invoke("list_sheets", { path });
+      if (activeSourceLoad !== sourceRequest) return null;
+
+      if (sheets.length === 1) {
+        return await loadSheet(sheets[0], sourceRequest);
+      }
+
       sheetSelect.innerHTML = "";
       sheets.forEach((name) => {
         const opt = document.createElement("option");
@@ -1390,34 +1624,72 @@
         sheetSelect.appendChild(opt);
       });
       sheetPicker.classList.remove("hidden");
+      setSourceLoadInFlight(false);
+      return sheets;
+    } catch (err) {
+      if (sourceRequest && activeSourceLoad !== sourceRequest) return null;
+      if (sourceRequest && activeSourceLoad === sourceRequest) {
+        currentPath = sourceRequest.previousPath;
+        currentSheet = sourceRequest.previousSheet;
+        activeSourceLoad = null;
+      }
+      setSourceLoadInFlight(false);
+      alert(`Could not read workbook: ${err}`);
+      return null;
     }
   }
 
-  async function loadSheet(sheet) {
-    sheetLoadInFlight = true;
+  async function loadSheet(sheet, sourceRequest = activeSourceLoad) {
+    if (!sourceRequest || sourceRequest !== activeSourceLoad || !sheet) return null;
+    const importRequest = {
+      id: ++sourceLoadSequence,
+      sourceRequest,
+      path: sourceRequest.path,
+      sheet,
+    };
+    activeSheetImport = importRequest;
+    setSourceLoadInFlight(true);
     resetGuidedQueryUi();
     sheetPicker.classList.add("hidden");
+    currentPath = importRequest.path;
     currentSheet = sheet;
     showProgress(`Reading "${sheet}"…`, 0);
 
     try {
-      const summary = await invoke("import_sheet", { path: currentPath, sheet });
-      sheetLoadInFlight = false;
+      const summary = await invoke("import_sheet", { path: importRequest.path, sheet });
+      if (
+        activeSheetImport !== importRequest ||
+        activeSourceLoad !== sourceRequest ||
+        currentPath !== importRequest.path ||
+        currentSheet !== sheet
+      ) {
+        return null;
+      }
+      activeSheetImport = null;
+      activeSourceLoad = null;
+      setSourceLoadInFlight(false);
       hideProgress();
-      onImportComplete(summary);
+      onImportComplete(summary, importRequest.path, sheet);
       return summary;
     } catch (err) {
-      sheetLoadInFlight = false;
-      updateGuidedInteractionControls();
+      if (activeSheetImport !== importRequest) return null;
+      activeSheetImport = null;
+      activeSourceLoad = null;
+      setSourceLoadInFlight(false);
       hideProgress();
+      // import_sheet clears the backend's prior loaded state before it starts. A failed import
+      // therefore cannot safely restore the old table UI; clear it so frontend and backend agree.
+      await removeFile();
       alert(`Import failed: ${err}`);
       throw err;
     }
   }
 
-  function onImportComplete(summary) {
+  function onImportComplete(summary, importedPath, importedSheet) {
+    currentPath = importedPath;
+    currentSheet = importedSheet;
     columns = summary.columns;
-    fileInfo.textContent = `${currentPath.split(/[\\/]/).pop()} — ${summary.rowCount.toLocaleString()} rows, ${columns.length} columns${summary.fromCache ? " (cached)" : ""}`;
+    fileInfo.textContent = `${importedPath.split(/[\\/]/).pop()} — ${summary.rowCount.toLocaleString()} rows, ${columns.length} columns${summary.fromCache ? " (cached)" : ""}`;
 
     // reset controls
     resetIntelUiState();
@@ -1479,16 +1751,35 @@
     });
 
     setControlsEnabled(true);
-    detectColumnRolesForLoadedFile();
-    startSemanticIndexForLoadedFile();
+    const importedContext = {
+      contextRevision: guidedContextRevision,
+      path: importedPath,
+      sheet: importedSheet,
+    };
+    detectColumnRolesForLoadedFile()
+      .then(() => {
+        if (loadedContextIsCurrent(importedContext)) startSemanticIndexForLoadedFile();
+      })
+      .catch((err) => console.error("data mapping preparation failed", err));
+    const builtTable = table;
+    const tableContext = {
+      contextRevision: guidedContextRevision,
+      path: importedPath,
+      sheet: importedSheet,
+    };
     table.on("tableBuilt", () => {
+      if (table !== builtTable || !loadedContextIsCurrent(tableContext) || sheetLoadInFlight) return;
       refreshData();
       refreshCount();
     });
   }
 
   function removeFile() {
-    sheetLoadInFlight = false;
+    sourceLoadSequence += 1;
+    activeSourceLoad = null;
+    activeSheetImport = null;
+    setSourceLoadInFlight(false);
+    sheetPicker.classList.add("hidden");
     if (table) {
       table.destroy();
       table = null;
@@ -1517,6 +1808,7 @@
   // -- export flow --------------------------------------------------------------
 
   async function doExport(format) {
+    if (sheetLoadInFlight || !controlsEnabled) return;
     const ext = format === "csv" ? "csv" : "xlsx";
     const destPath = await invoke("plugin:dialog|save", {
       options: {
@@ -1526,13 +1818,32 @@
     });
     if (!destPath) return;
 
-    const exportSpec = buildSpecFromControls(true);
+    const modeAtStart = queryMode;
+    const context = {
+      contextRevision: guidedContextRevision,
+      path: currentPath,
+      sheet: currentSheet,
+    };
+    const exportSpec =
+      modeAtStart === "querySpec"
+        ? { ...snapshotQuerySpec(), cursor: null }
+        : buildSpecFromControls(true);
     showProgress(`Exporting to ${ext.toUpperCase()}…`, 0);
     try {
-      const result = await invoke("export_data", { spec: exportSpec, format, destPath });
+      const result =
+        modeAtStart === "guided"
+          ? await invoke("export_guided_data", {
+              intentToken: guidedIntentToken,
+              auditId: guidedAuditId,
+              format,
+              destPath,
+            })
+          : await invoke("export_data", { spec: exportSpec, format, destPath });
+      if (!loadedContextIsCurrent(context) || queryMode !== modeAtStart) return;
       hideProgress();
       alert(`Exported ${result.rowCount.toLocaleString()} rows to ${result.destPath}`);
     } catch (err) {
+      if (!loadedContextIsCurrent(context) || queryMode !== modeAtStart) return;
       hideProgress();
       alert(`Export failed: ${err}`);
     }
@@ -1570,10 +1881,30 @@
   });
 
   sheetLoadBtn.addEventListener("click", () => {
-    loadSheet(sheetSelect.value);
+    loadSheet(sheetSelect.value).catch((err) => console.error("import_sheet failed", err));
   });
 
   searchBox.addEventListener("input", debouncedApply);
+  guidedSearchBox.addEventListener("input", () => {
+    const currentText = guidedSearchBox.value.trim();
+    if (guidedActiveParse && currentText !== guidedActiveParse.queryText) {
+      cancelActiveGuidedParse();
+      guidedQueryPanel.classList.remove("hidden");
+      guidedPreviewText.textContent = "The evidence request changed before planning finished.";
+    }
+    if (guidedPreviewQueryText !== null && currentText !== guidedPreviewQueryText) {
+      guidedPreviewQueryText = null;
+      guidedRunBtn.classList.add("hidden");
+      guidedRejectBtn.classList.add("hidden");
+      guidedClarification.textContent = "Request changed. Preview the updated search before running it.";
+      guidedClarification.classList.remove("hidden");
+      if (guidedAuditId !== null && guidedReviewStatus === "unreviewed") {
+        decideGuidedParse("edited").catch((err) =>
+          console.error("could not mark the previous AI interpretation as edited", err)
+        );
+      }
+    }
+  });
   guidedSearchForm.addEventListener("submit", (event) => {
     event.preventDefault();
     previewGuidedQuery().catch((err) => alert(`Evidence search preview failed: ${err}`));
@@ -1675,10 +2006,13 @@
 
   listen("semantic-index-progress", (event) => {
     if (semanticIndexState.status !== "building" || !activeSemanticIndexRequest) return;
-    const { rowsDone, phase } = event.payload;
+    const { rowsDone } = event.payload;
     semanticIndexState = {
       ...semanticIndexState,
-      status: phase === "complete" ? "ready" : "building",
+      // Progress events are process-global and carry no file generation. Only the scoped
+      // command response is authoritative for readiness; a late event from a previous file
+      // must never mark the current file ready.
+      status: "building",
       rowsIndexed: rowsDone || 0,
     };
     renderSemanticIndexState();
@@ -1705,8 +2039,16 @@
           "loadSheetForTest(path, sheet): sheet is required - call listSheetsForTest(path) first if you don't know the sheet name"
         );
       }
+      const sourceRequest = {
+        id: ++sourceLoadSequence,
+        path,
+        previousPath: currentPath,
+        previousSheet: currentSheet,
+      };
+      activeSourceLoad = sourceRequest;
       currentPath = path;
-      return loadSheet(sheet);
+      currentSheet = null;
+      return loadSheet(sheet, sourceRequest);
     },
     async listSheetsForTest(path) {
       if (!path) {
