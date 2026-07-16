@@ -522,6 +522,27 @@ mod tests {
     use super::*;
     use crate::db::ColumnMeta;
     use crate::intel::library::{Keyword, LoadedLibrary, MatchKind, Technique};
+    use std::path::{Path, PathBuf};
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
+
+    struct TestDbFile(PathBuf);
+
+    impl TestDbFile {
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestDbFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+            for suffix in ["-journal", "-wal", "-shm"] {
+                let _ = std::fs::remove_file(format!("{}{suffix}", self.0.display()));
+            }
+        }
+    }
 
     fn setup_db(rows: &[&str]) -> (Connection, Vec<String>) {
         let conn = Connection::open_in_memory().unwrap();
@@ -543,6 +564,10 @@ mod tests {
     }
 
     fn single_keyword_library(pattern: &str, match_kind: MatchKind) -> LoadedLibrary {
+        keyword_library(pattern, match_kind, "testhash")
+    }
+
+    fn keyword_library(pattern: &str, match_kind: MatchKind, hash: &str) -> LoadedLibrary {
         LoadedLibrary {
             library_ids: vec!["test".into()],
             techniques: vec![Technique {
@@ -561,9 +586,60 @@ mod tests {
                     score: 50,
                 }],
             }],
-            library_hash: "testhash".into(),
+            library_hash: hash.into(),
             custom_library_error: None,
         }
+    }
+
+    fn setup_file_db(row_count: i64, value: &str) -> TestDbFile {
+        let unique = SCAN_TOKEN_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "log-parser-matcher-{}-{}-{unique}.sqlite3",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let mut conn = Connection::open(&path).unwrap();
+        let columns = vec![ColumnMeta {
+            sql_name: "commandline".into(),
+            original_name: "CommandLine".into(),
+            col_index: 0,
+            inferred_type: "text".into(),
+        }];
+        db::create_schema(&conn, &columns).unwrap();
+        let tx = conn.transaction().unwrap();
+        {
+            let mut stmt = tx
+                .prepare("INSERT INTO rows (row_num, commandline) VALUES (?1, ?2)")
+                .unwrap();
+            for row_num in 1..=row_count {
+                stmt.execute(rusqlite::params![row_num, value]).unwrap();
+            }
+        }
+        tx.commit().unwrap();
+        drop(conn);
+        TestDbFile(path)
+    }
+
+    fn seed_published_scan(conn: &Connection, library_hash: &str) {
+        db::create_intel_schema(conn).unwrap();
+        conn.execute(
+            "INSERT INTO _intel_match (
+                row_num, tactic_id, tactic_name, technique_id, technique_name,
+                pattern_id, keyword, column_name, score
+             ) VALUES (1, 'TA-old', 'Old tactic', 'T-old', 'Old technique',
+                       'old-pattern', 'old', 'commandline', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO _intel_scan_info (library_hash, role_hash, completed_at)
+             VALUES (?1, 'old-role', '2025-01-01T00:00:00Z')",
+            [library_hash],
+        )
+        .unwrap();
     }
 
     #[test]
@@ -647,5 +723,152 @@ mod tests {
             role_hash_for_columns(&["commandline".into(), "commandline".into()]);
         assert_eq!(one, reordered_duplicates);
         assert_eq!(one.len(), 64);
+    }
+
+    #[test]
+    fn independent_audit_write_succeeds_while_scan_is_paused_between_batches() {
+        let db_file = setup_file_db(PROGRESS_INTERVAL_ROWS + SCAN_BATCH_ROWS, "alpha command");
+        let setup_conn = Connection::open(db_file.path()).unwrap();
+        setup_conn
+            .execute_batch(
+                "CREATE TABLE _test_audit (
+                    id INTEGER PRIMARY KEY,
+                    action TEXT NOT NULL
+                 );",
+            )
+            .unwrap();
+        drop(setup_conn);
+
+        let scan_path = db_file.path().to_path_buf();
+        let (paused_tx, paused_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let scan_thread = thread::spawn(move || {
+            let mut conn = Connection::open(scan_path).unwrap();
+            let mut paused = false;
+            scan_connection_with_library(
+                &mut conn,
+                &["commandline".to_string()],
+                keyword_library("alpha", MatchKind::Word, "concurrent-scan"),
+                |rows_done, _, phase| {
+                    if phase == "scanning" && rows_done >= PROGRESS_INTERVAL_ROWS && !paused {
+                        paused = true;
+                        paused_tx.send(()).unwrap();
+                        resume_rx.recv().unwrap();
+                    }
+                },
+            )
+        });
+
+        paused_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let writer = Connection::open(db_file.path()).unwrap();
+        writer
+            .execute("INSERT INTO _test_audit (action) VALUES ('accepted')", [])
+            .expect("scan must not retain a main-database write transaction");
+        resume_tx.send(()).unwrap();
+
+        scan_thread.join().unwrap().unwrap();
+        let audit_count: i64 = writer
+            .query_row("SELECT COUNT(*) FROM _test_audit", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(audit_count, 1);
+    }
+
+    #[test]
+    fn failed_scan_keeps_previous_publication_and_discards_staged_matches() {
+        let db_file = setup_file_db(PROGRESS_INTERVAL_ROWS + SCAN_BATCH_ROWS, "alpha command");
+        let setup_conn = Connection::open(db_file.path()).unwrap();
+        seed_published_scan(&setup_conn, "previous-good");
+        drop(setup_conn);
+
+        let scan_path = db_file.path().to_path_buf();
+        let (paused_tx, paused_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let scan_thread = thread::spawn(move || {
+            let mut conn = Connection::open(scan_path).unwrap();
+            let mut paused = false;
+            scan_connection_with_library(
+                &mut conn,
+                &["commandline".to_string()],
+                keyword_library("alpha", MatchKind::Word, "failed-rebuild"),
+                |rows_done, _, phase| {
+                    if phase == "scanning" && rows_done >= PROGRESS_INTERVAL_ROWS && !paused {
+                        paused = true;
+                        paused_tx.send(()).unwrap();
+                        resume_rx.recv().unwrap();
+                    }
+                },
+            )
+        });
+
+        paused_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let breaker = Connection::open(db_file.path()).unwrap();
+        breaker.execute("DROP TABLE rows", []).unwrap();
+        resume_tx.send(()).unwrap();
+
+        let error = scan_thread.join().unwrap().unwrap_err();
+        assert!(error.to_string().contains("no such table: rows"));
+        let published_hash: String = breaker
+            .query_row("SELECT library_hash FROM _intel_scan_info", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let published_pattern: String = breaker
+            .query_row("SELECT pattern_id FROM _intel_match", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(published_hash, "previous-good");
+        assert_eq!(published_pattern, "old-pattern");
+    }
+
+    #[test]
+    fn superseded_scan_cannot_overwrite_newer_complete_publication() {
+        let db_file = setup_file_db(PROGRESS_INTERVAL_ROWS + SCAN_BATCH_ROWS, "alpha command");
+        let setup_conn = Connection::open(db_file.path()).unwrap();
+        seed_published_scan(&setup_conn, "previous-good");
+        drop(setup_conn);
+
+        let slow_path = db_file.path().to_path_buf();
+        let (paused_tx, paused_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let slow_thread = thread::spawn(move || {
+            let mut conn = Connection::open(slow_path).unwrap();
+            let mut paused = false;
+            scan_connection_with_library(
+                &mut conn,
+                &["commandline".to_string()],
+                keyword_library("alpha", MatchKind::Word, "superseded"),
+                |rows_done, _, phase| {
+                    if phase == "scanning" && rows_done >= PROGRESS_INTERVAL_ROWS && !paused {
+                        paused = true;
+                        paused_tx.send(()).unwrap();
+                        resume_rx.recv().unwrap();
+                    }
+                },
+            )
+        });
+
+        paused_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let mut newer_conn = Connection::open(db_file.path()).unwrap();
+        let newer = scan_connection_with_library(
+            &mut newer_conn,
+            &["commandline".to_string()],
+            keyword_library("beta", MatchKind::Word, "newer-complete"),
+            |_, _, _| {},
+        )
+        .unwrap();
+        assert_eq!(newer.match_count, 0);
+        resume_tx.send(()).unwrap();
+
+        let error = slow_thread.join().unwrap().unwrap_err();
+        assert!(error.to_string().contains("superseded"));
+        let published_hash: String = newer_conn
+            .query_row("SELECT library_hash FROM _intel_scan_info", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let published_matches: i64 = newer_conn
+            .query_row("SELECT COUNT(*) FROM _intel_match", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(published_hash, "newer-complete");
+        assert_eq!(published_matches, 0);
     }
 }
