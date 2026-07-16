@@ -42,6 +42,7 @@ pub fn run() {
             commands::analyze_timestamp_column,
             commands::normalize_timestamp_column,
             commands::export_data,
+            commands::export_guided_data,
             commands::scan_intel_matches,
             commands::export_report,
         ])

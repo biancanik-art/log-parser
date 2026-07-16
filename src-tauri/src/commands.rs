@@ -653,6 +653,88 @@ pub async fn export_data(
 }
 
 #[tauri::command]
+pub async fn export_guided_data(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    intent_token: String,
+    audit_id: i64,
+    format: ExportFormat,
+    dest_path: String,
+) -> Result<ExportSummary, String> {
+    let (db_path, columns, generation) = state_snapshot(&state)?;
+    let exported_db_path = db_path.clone();
+    let dest = PathBuf::from(&dest_path);
+    let dest_for_task = dest.clone();
+    let app_for_task = app.clone();
+    let row_count = tauri::async_runtime::spawn_blocking(move || -> Result<i64, String> {
+        let conn = db::open(&db_path).map_err(|error| error.to_string())?;
+        guided_parser::accept_llm_audit(&conn, audit_id, &intent_token)
+            .map_err(|error| error.to_string())?;
+        let intent =
+            guided_parser::intent_from_token(&intent_token).map_err(|error| error.to_string())?;
+        if !matches!(
+            intent,
+            guided_parser::GuidedIntent::RawEvidenceSearch { .. }
+        ) {
+            return Err(
+                "AI result export is available only for audited raw evidence searches".to_string(),
+            );
+        }
+        let spec = guided_parser::query_spec_from_raw_intent(&intent, None, None)
+            .map_err(|error| error.to_string())?;
+        let normalized_direction = guided_query::normalized_raw_sort_direction(&conn, &intent)
+            .map_err(|error| error.to_string())?;
+        let on_progress = |rows_done: i64| {
+            let _ = app_for_task.emit("export-progress", ExportProgressPayload { rows_done });
+        };
+        let summary = match (format, normalized_direction) {
+            (ExportFormat::Csv, Some(direction)) => export::export_csv_normalized_time(
+                &conn,
+                &columns,
+                &spec,
+                direction,
+                &dest_for_task,
+                on_progress,
+            ),
+            (ExportFormat::Xlsx, Some(direction)) => export::export_xlsx_normalized_time(
+                &conn,
+                &columns,
+                &spec,
+                direction,
+                &dest_for_task,
+                on_progress,
+            ),
+            (ExportFormat::Csv, None) => {
+                export::export_csv(&conn, &columns, &spec, &dest_for_task, on_progress)
+            }
+            (ExportFormat::Xlsx, None) => {
+                export::export_xlsx(&conn, &columns, &spec, &dest_for_task, on_progress)
+            }
+        }
+        .map_err(|error| error.to_string())?;
+        Ok(summary.row_count)
+    })
+    .await
+    .map_err(|error| format!("AI result export task join error: {error}"))??;
+
+    let still_current = state
+        .loaded
+        .lock()
+        .map_err(|_| "app state lock poisoned".to_string())?
+        .as_ref()
+        .is_some_and(|inner| inner.generation == generation && inner.db_path == exported_db_path);
+    if !still_current {
+        return Err(
+            "the loaded file or sheet changed while the AI result export was running".to_string(),
+        );
+    }
+    Ok(ExportSummary {
+        row_count,
+        dest_path: dest.display().to_string(),
+    })
+}
+
+#[tauri::command]
 pub async fn scan_intel_matches(
     app: AppHandle,
     state: State<'_, AppState>,

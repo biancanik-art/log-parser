@@ -31,6 +31,33 @@ fn build_export_query(
     Ok((sql, predicate))
 }
 
+fn build_normalized_time_export_query(
+    columns: &[ColumnMeta],
+    spec: &QuerySpec,
+    direction: query::SortDirection,
+) -> Result<(String, query::Predicate)> {
+    let predicate = query::build_predicate(columns, spec)?;
+    let raw_columns = columns
+        .iter()
+        .map(|column| format!("raw.{}", crate::db::quote_ident(&column.sql_name)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let direction = match direction {
+        query::SortDirection::Asc => "ASC",
+        query::SortDirection::Desc => "DESC",
+    };
+    // Keep the predicate inside a rows-only subquery because FTS and trusted rowIds compile to
+    // unqualified `row_num`; joining `_row_time` first would make that identifier ambiguous.
+    let sql = format!(
+        "SELECT {raw_columns}
+         FROM (SELECT * FROM rows {where_sql}) raw
+         JOIN _row_time rt ON rt.row_num = raw.row_num
+         ORDER BY rt.epoch_ms {direction}, raw.row_num {direction}",
+        where_sql = predicate.where_sql,
+    );
+    Ok((sql, predicate))
+}
+
 pub fn export_csv(
     conn: &Connection,
     columns: &[ColumnMeta],
@@ -64,6 +91,48 @@ pub fn export_csv(
     writer.flush()?;
     on_progress(row_count);
 
+    Ok(ExportSummary { row_count })
+}
+
+pub fn export_csv_normalized_time(
+    conn: &Connection,
+    columns: &[ColumnMeta],
+    spec: &QuerySpec,
+    direction: query::SortDirection,
+    dest_path: &Path,
+    mut on_progress: impl FnMut(i64),
+) -> Result<ExportSummary> {
+    let (sql, predicate) = build_normalized_time_export_query(columns, spec, direction)?;
+
+    let file = File::create(dest_path)?;
+    let mut writer = csv::Writer::from_writer(BufWriter::new(file));
+    let headers: Vec<&str> = columns
+        .iter()
+        .map(|column| column.original_name.as_str())
+        .collect();
+    writer.write_record(&headers)?;
+
+    let mut stmt = conn.prepare(&sql)?;
+    let params: Vec<&dyn rusqlite::ToSql> = predicate
+        .params
+        .iter()
+        .map(|param| param.as_ref())
+        .collect();
+    let mut rows = stmt.query(params.as_slice())?;
+    let mut row_count = 0i64;
+    let mut record = vec![String::new(); columns.len()];
+    while let Some(row) = rows.next()? {
+        for (index, cell) in record.iter_mut().enumerate() {
+            *cell = row.get(index)?;
+        }
+        writer.write_record(&record)?;
+        row_count += 1;
+        if row_count % PROGRESS_EVERY == 0 {
+            on_progress(row_count);
+        }
+    }
+    writer.flush()?;
+    on_progress(row_count);
     Ok(ExportSummary { row_count })
 }
 
@@ -107,6 +176,46 @@ pub fn export_xlsx(
     workbook.save(dest_path)?;
     on_progress(row_count);
 
+    Ok(ExportSummary { row_count })
+}
+
+pub fn export_xlsx_normalized_time(
+    conn: &Connection,
+    columns: &[ColumnMeta],
+    spec: &QuerySpec,
+    direction: query::SortDirection,
+    dest_path: &Path,
+    mut on_progress: impl FnMut(i64),
+) -> Result<ExportSummary> {
+    let (sql, predicate) = build_normalized_time_export_query(columns, spec, direction)?;
+    let mut workbook = Workbook::new();
+    let worksheet = workbook.add_worksheet_with_constant_memory();
+    for (column_index, column) in columns.iter().enumerate() {
+        worksheet.write_string(0, column_index as u16, column.original_name.as_str())?;
+    }
+
+    let mut stmt = conn.prepare(&sql)?;
+    let params: Vec<&dyn rusqlite::ToSql> = predicate
+        .params
+        .iter()
+        .map(|param| param.as_ref())
+        .collect();
+    let mut rows = stmt.query(params.as_slice())?;
+    let mut row_count = 0i64;
+    let mut excel_row = 1u32;
+    while let Some(row) = rows.next()? {
+        for column_index in 0..columns.len() {
+            let value: String = row.get(column_index)?;
+            worksheet.write_string(excel_row, column_index as u16, value.as_str())?;
+        }
+        excel_row += 1;
+        row_count += 1;
+        if row_count % PROGRESS_EVERY == 0 {
+            on_progress(row_count);
+        }
+    }
+    workbook.save(dest_path)?;
+    on_progress(row_count);
     Ok(ExportSummary { row_count })
 }
 
@@ -267,5 +376,106 @@ mod tests {
         assert_eq!(first_data_row[0].to_string(), "alice");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn guided_csv_and_xlsx_follow_normalized_time_and_omit_ai_annotations() {
+        let conn = Connection::open_in_memory().unwrap();
+        let columns = vec![
+            ColumnMeta {
+                sql_name: "event_time".into(),
+                original_name: "Event Time".into(),
+                col_index: 0,
+                inferred_type: "timestamp".into(),
+            },
+            ColumnMeta {
+                sql_name: "event".into(),
+                original_name: "Event".into(),
+                col_index: 1,
+                inferred_type: "text".into(),
+            },
+        ];
+        db::create_schema(&conn, &columns).unwrap();
+        conn.execute(
+            "INSERT INTO rows (row_num, event_time, event) VALUES
+             (1, '2026-07-17T03:00:00+02:00', 'marker later'),
+             (2, '2026-07-17T00:30:00Z', 'marker earlier'),
+             (3, '2026-07-17T04:00:00Z', 'unrelated')",
+            [],
+        )
+        .unwrap();
+        db::populate_fts(&conn, &columns).unwrap();
+        db::create_row_time_table(&conn).unwrap();
+        for (row_num, epoch_ms) in [(1_i64, 200_i64), (2, 100), (3, 300)] {
+            conn.execute(
+                "INSERT INTO _row_time (row_num, epoch_ms, utc_text, source_text, parse_status)
+                 VALUES (?1, ?2, 'utc', 'source', 'explicit_offset')",
+                rusqlite::params![row_num, epoch_ms],
+            )
+            .unwrap();
+        }
+        let mut spec = empty_spec();
+        spec.expression = Some(query::QueryExpression::Or {
+            children: vec![
+                query::QueryExpression::Search {
+                    value: "marker".into(),
+                },
+                query::QueryExpression::RowIds { values: vec![3] },
+            ],
+        });
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "log-parser-guided-export-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let csv_path = dir.join("guided.csv");
+        let xlsx_path = dir.join("guided.xlsx");
+
+        let csv = export_csv_normalized_time(
+            &conn,
+            &columns,
+            &spec,
+            query::SortDirection::Asc,
+            &csv_path,
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(csv.row_count, 3);
+        let csv_text = std::fs::read_to_string(&csv_path).unwrap();
+        assert!(!csv_text.contains("__aiMatch"));
+        let csv_rows = csv_text.lines().skip(1).collect::<Vec<_>>();
+        assert_eq!(
+            csv_rows,
+            vec![
+                "2026-07-17T00:30:00Z,marker earlier",
+                "2026-07-17T03:00:00+02:00,marker later",
+                "2026-07-17T04:00:00Z,unrelated"
+            ]
+        );
+
+        let xlsx = export_xlsx_normalized_time(
+            &conn,
+            &columns,
+            &spec,
+            query::SortDirection::Asc,
+            &xlsx_path,
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(xlsx.row_count, 3);
+        let mut workbook = calamine::open_workbook_auto(&xlsx_path).unwrap();
+        let sheet_name = workbook.sheet_names()[0].clone();
+        let range = workbook.worksheet_range(&sheet_name).unwrap();
+        let rows = range.rows().collect::<Vec<_>>();
+        assert!(rows[0].iter().all(|cell| cell.to_string() != "__aiMatch"));
+        assert_eq!(rows[1][1].to_string(), "marker earlier");
+        assert_eq!(rows[2][1].to_string(), "marker later");
+        assert_eq!(rows[3][1].to_string(), "unrelated");
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

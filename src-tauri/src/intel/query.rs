@@ -3,7 +3,7 @@ use crate::intel::parser::{
     self, GuidedIntent, GuidedSort, RawFilterOp, RawSearchAlternative, RawSortDirection,
 };
 use crate::intel::{library, matcher};
-use crate::query::{Cursor, QueryPage};
+use crate::query::{Cursor, QueryPage, SortDirection};
 use anyhow::{anyhow, bail, Result};
 use rusqlite::{Connection, OptionalExtension};
 use std::collections::BTreeSet;
@@ -45,6 +45,25 @@ pub fn run_guided_query(
     let use_time = requested_sort == GuidedSort::ChronologicalAsc && row_time_has_data(conn)?;
     let filter = GuidedFilter::from_intent(&intent, columns)?;
     query_page(conn, columns, &filter, cursor, limit, use_time)
+}
+
+pub fn normalized_raw_sort_direction(
+    conn: &Connection,
+    intent: &GuidedIntent,
+) -> Result<Option<SortDirection>> {
+    let GuidedIntent::RawEvidenceSearch {
+        sort: Some(sort), ..
+    } = intent
+    else {
+        return Ok(None);
+    };
+    if !sort.normalized_time || !row_time_has_data(conn)? {
+        return Ok(None);
+    }
+    Ok(Some(match sort.direction {
+        RawSortDirection::Asc => SortDirection::Asc,
+        RawSortDirection::Desc => SortDirection::Desc,
+    }))
 }
 
 fn query_raw_normalized_time(
