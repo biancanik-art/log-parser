@@ -1451,7 +1451,23 @@
         if (!edited || !guidedParseIsCurrent(request)) return null;
       }
       const result = await invoke("parse_guided_query", { queryText: trimmed });
-      if (!guidedParseIsCurrent(request)) return null;
+      if (!guidedParseIsCurrent(request)) {
+        // If only the text changed while inference was running, retire the now-invisible audit
+        // record. A source change is handled against the old database by the Rust command.
+        if (
+          loadedContextIsCurrent(request) &&
+          result?.aiAssisted &&
+          Number.isInteger(result.auditId) &&
+          typeof result.intentToken === "string"
+        ) {
+          invoke("set_guided_parse_decision", {
+            auditId: result.auditId,
+            intentToken: result.intentToken,
+            decision: "edited",
+          }).catch((err) => console.error("could not retire stale AI interpretation", err));
+        }
+        return null;
+      }
       renderGuidedPreview(result, request.queryText);
       return result;
     } catch (err) {
@@ -1751,16 +1767,14 @@
     });
 
     setControlsEnabled(true);
-    const importedContext = {
-      contextRevision: guidedContextRevision,
-      path: importedPath,
-      sheet: importedSheet,
-    };
-    detectColumnRolesForLoadedFile()
-      .then(() => {
-        if (loadedContextIsCurrent(importedContext)) startSemanticIndexForLoadedFile();
-      })
-      .catch((err) => console.error("data mapping preparation failed", err));
+    // Semantic preparation is independent of optional mapping. Start both immediately so a
+    // slow or failed role detector can never delay AI recall.
+    startSemanticIndexForLoadedFile().catch((err) =>
+      console.error("semantic index preparation failed", err)
+    );
+    detectColumnRolesForLoadedFile().catch((err) =>
+      console.error("data mapping preparation failed", err)
+    );
     const builtTable = table;
     const tableContext = {
       contextRevision: guidedContextRevision,
@@ -1809,6 +1823,14 @@
 
   async function doExport(format) {
     if (sheetLoadInFlight || !controlsEnabled) return;
+    if (
+      format === "csv" &&
+      !window.confirm(
+        "CSV preserves raw cell text. Spreadsheet programs may interpret values beginning with =, +, - or @ as formulas. Export Excel is safer for opening in a spreadsheet. Continue with raw CSV?"
+      )
+    ) {
+      return;
+    }
     const ext = format === "csv" ? "csv" : "xlsx";
     const destPath = await invoke("plugin:dialog|save", {
       options: {
