@@ -4,7 +4,7 @@ use chrono::{
     DateTime, FixedOffset, LocalResult, NaiveDate, NaiveDateTime, SecondsFormat, TimeZone, Utc,
 };
 use chrono_tz::Tz;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use serde::Serialize;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -141,7 +141,7 @@ pub fn analyze_confirmed_timestamp_column(
     conn: &Connection,
     columns: &[ColumnMeta],
 ) -> Result<TimestampAnalysis> {
-    let column = confirmed_timestamp_column(conn, columns)?;
+    let column = resolved_timestamp_column(conn, columns)?;
     let mut counts = TimestampCounts::default();
 
     scan_timestamp_column(conn, &column.sql_name, |_, source_text, parsed| {
@@ -169,7 +169,7 @@ pub fn normalize_confirmed_timestamp_column(
     columns: &[ColumnMeta],
     naive_timezone: Option<&str>,
 ) -> Result<TimestampNormalizationSummary> {
-    let column = confirmed_timestamp_column(conn, columns)?;
+    let column = resolved_timestamp_column(conn, columns)?;
     let resolver = naive_timezone
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -300,23 +300,47 @@ fn row_time_record(
     }
 }
 
-fn confirmed_timestamp_column(conn: &Connection, columns: &[ColumnMeta]) -> Result<ColumnMeta> {
+/// Resolves the timestamp mapping without forcing an examiner through a blocking role-review
+/// workflow. An explicit confirmation always wins. A high-confidence automatic suggestion is
+/// safe to use for analysis because normalization still parses every value and refuses naive
+/// timestamps until a timezone is supplied. As a final fallback, a single imported column whose
+/// inferred type is timestamp-like is unambiguous enough to analyze; multiple candidates require
+/// the user to choose in the optional Data mapping panel.
+fn resolved_timestamp_column(conn: &Connection, columns: &[ColumnMeta]) -> Result<ColumnMeta> {
+    const AUTOMATIC_CONFIDENCE: f64 = 0.75;
     db::create_column_roles_table(conn)?;
-    let sql_name: String = conn
+    let recorded: Option<(String, String, f64)> = conn
         .query_row(
-            "SELECT sql_name FROM _column_roles
-             WHERE role = 'timestamp' AND status = 'confirmed'
+            "SELECT sql_name, status, confidence FROM _column_roles
+             WHERE role = 'timestamp' AND status != 'rejected'
+             ORDER BY CASE status WHEN 'confirmed' THEN 0 ELSE 1 END, confidence DESC
              LIMIT 1",
             [],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
-        .map_err(|_| anyhow!("confirm a timestamp column role before timestamp normalization"))?;
+        .optional()?;
 
-    columns
+    if let Some((sql_name, status, confidence)) = recorded {
+        if status == "confirmed" || confidence >= AUTOMATIC_CONFIDENCE {
+            return columns
+                .iter()
+                .find(|column| column.sql_name == sql_name)
+                .cloned()
+                .ok_or_else(|| anyhow!("timestamp mapping no longer exists: {sql_name}"));
+        }
+    }
+
+    let mut inferred = columns
         .iter()
-        .find(|column| column.sql_name == sql_name)
-        .cloned()
-        .ok_or_else(|| anyhow!("confirmed timestamp column no longer exists: {sql_name}"))
+        .filter(|column| column.inferred_type == "timestamp");
+    let only = inferred.next().cloned();
+    if only.is_some() && inferred.next().is_none() {
+        return Ok(only.expect("one inferred timestamp"));
+    }
+
+    bail!(
+        "timestamp mapping is ambiguous; choose the event-time column in Data mapping before building a timeline"
+    )
 }
 
 fn scan_timestamp_column(
@@ -555,6 +579,39 @@ mod tests {
             .timestamp_millis();
         assert_eq!(epoch_ms, expected);
         assert_eq!(utc_text, "2026-01-01T00:30:00Z");
+    }
+
+    #[test]
+    fn high_confidence_automatic_timestamp_mapping_does_not_need_confirmation() {
+        let (mut conn, columns) = setup_with_timestamp(&["2026-01-01T02:30:00+02:00"]);
+        conn.execute(
+            "UPDATE _column_roles
+             SET confidence = 0.93, status = 'suggested'
+             WHERE role = 'timestamp'",
+            [],
+        )
+        .unwrap();
+
+        let analysis = analyze_confirmed_timestamp_column(&conn, &columns).unwrap();
+        assert_eq!(analysis.timestamp_column, "timegenerated");
+        assert!(!analysis.needs_timezone);
+        let normalized = normalize_confirmed_timestamp_column(&mut conn, &columns, None).unwrap();
+        assert_eq!(normalized.rows_written, 1);
+    }
+
+    #[test]
+    fn weak_automatic_timestamp_mapping_requests_a_data_mapping_choice() {
+        let (conn, columns) = setup_with_timestamp(&["2026-01-01T02:30:00+02:00"]);
+        conn.execute(
+            "UPDATE _column_roles
+             SET confidence = 0.40, status = 'suggested'
+             WHERE role = 'timestamp'",
+            [],
+        )
+        .unwrap();
+
+        let error = analyze_confirmed_timestamp_column(&conn, &columns).unwrap_err();
+        assert!(error.to_string().contains("Data mapping"));
     }
 
     #[test]
