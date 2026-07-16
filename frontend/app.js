@@ -10,6 +10,8 @@
   const guidedSearchForm = document.getElementById("guided-search-form");
   const guidedSearchBox = document.getElementById("guided-search-box");
   const guidedSearchSubmit = document.getElementById("guided-search-submit");
+  const aiSearchAvailability = document.getElementById("ai-search-availability");
+  const semanticIndexStatus = document.getElementById("semantic-index-status");
   const reportExportBtn = document.getElementById("report-export-btn");
   const exportCsvBtn = document.getElementById("export-csv-btn");
   const exportXlsxBtn = document.getElementById("export-xlsx-btn");
@@ -31,6 +33,7 @@
   const roleList = document.getElementById("role-list");
   const rolePanelStatus = document.getElementById("role-panel-status");
   const rolePanelClose = document.getElementById("role-panel-close");
+  const dataMappingSummary = document.getElementById("data-mapping-summary");
 
   const timezonePanel = document.getElementById("timezone-panel");
   const timezoneSummary = document.getElementById("timezone-summary");
@@ -73,7 +76,7 @@
   let currentPath = null;
   let currentSheet = null;
 
-  let spec = { search: null, filters: [], sort: null, cursor: null, limit: PAGE_SIZE };
+  let spec = { search: null, filters: [], sort: null, expression: null, cursor: null, limit: PAGE_SIZE };
   let cursorStack = []; // for Prev navigation
   let nextCursor = null;
   let hasMore = false;
@@ -85,6 +88,8 @@
   let guidedIntentToken = null;
   let guidedAuditId = null;
   let guidedReviewStatus = null;
+  let guidedQuerySpec = null;
+  let guidedMatchExplanation = [];
   let guidedContextRevision = 0;
   let guidedParseRequestSequence = 0;
   let guidedActiveParse = null;
@@ -101,6 +106,13 @@
   let reportSummaryResult = null;
   let roleDetectionInFlight = false;
   let roleDetectionError = null;
+  let roleDetectionRequestSequence = 0;
+  let activeRoleDetectionRequest = null;
+  let automaticTimestampInFlight = false;
+  let automaticTimestampSqlName = null;
+  let semanticIndexState = { status: "idle", rowsIndexed: 0, summary: null, error: null };
+  let semanticIndexRequestSequence = 0;
+  let activeSemanticIndexRequest = null;
   let intelScanInFlight = false;
 
   const EVIDENCE_ROLES = new Set([
@@ -109,6 +121,30 @@
     "file_name",
     "host",
     "text_evidence",
+  ]);
+
+  const MAPPING_ROLES = [
+    "timestamp",
+    "user",
+    "command_line",
+    "process_name",
+    "file_name",
+    "host",
+    "ip",
+    "text_evidence",
+  ];
+
+  const FILTER_OPERATORS = new Set([
+    "equals",
+    "notEquals",
+    "contains",
+    "notContains",
+    "startsWith",
+    "endsWith",
+    "isEmpty",
+    "isNotEmpty",
+    "greaterThan",
+    "lessThan",
   ]);
 
   // -- helpers --------------------------------------------------------------
@@ -126,6 +162,10 @@
     applyBtn.disabled = !enabled;
     clearBtn.disabled = !enabled;
     reviewRolesBtn.disabled = !enabled;
+    aiSearchAvailability.textContent = enabled
+      ? "Ready to search every imported row. No enrichment scan is required."
+      : "Import a file to search its evidence.";
+    aiSearchAvailability.classList.toggle("ready", enabled);
     if (enabled) {
       updateEvidenceColumnsUi();
     } else {
@@ -170,6 +210,8 @@
     guidedIntentToken = null;
     guidedAuditId = null;
     guidedReviewStatus = null;
+    guidedQuerySpec = null;
+    guidedMatchExplanation = [];
 
     guidedSearchBox.value = "";
     guidedQueryPanel.classList.add("hidden");
@@ -178,7 +220,7 @@
     guidedAiStatus.classList.add("hidden");
     guidedClarification.textContent = "";
     guidedClarification.classList.add("hidden");
-    guidedRunBtn.textContent = "Run";
+    guidedRunBtn.textContent = "Search evidence";
     guidedRunBtn.classList.add("hidden");
     guidedRejectBtn.classList.add("hidden");
     guidedResetBtn.classList.add("hidden");
@@ -194,11 +236,20 @@
     reportSummaryResult = null;
     roleDetectionInFlight = false;
     roleDetectionError = null;
+    activeRoleDetectionRequest = null;
+    automaticTimestampInFlight = false;
+    automaticTimestampSqlName = null;
+    activeSemanticIndexRequest = null;
+    semanticIndexState = { status: "idle", rowsIndexed: 0, summary: null, error: null };
+    semanticIndexStatus.className = "semantic-index-status";
+    semanticIndexStatus.textContent = "Semantic matching starts automatically after import.";
     intelScanInFlight = false;
 
     roleList.innerHTML = "";
     rolePanelStatus.textContent = "";
     roleReviewPanel.classList.add("hidden");
+    roleReviewPanel.open = false;
+    dataMappingSummary.textContent = "Waiting for a file";
 
     timezoneInput.value = "";
     timezoneSummary.textContent = "";
@@ -243,6 +294,7 @@
       contextRevision: guidedContextRevision,
       auditId: guidedAuditId,
       intentToken: guidedIntentToken,
+      querySpec: guidedQuerySpec,
     };
     guidedActiveAction = action;
     updateGuidedInteractionControls();
@@ -254,7 +306,8 @@
       guidedActiveAction === action &&
       guidedContextRevision === action.contextRevision &&
       guidedAuditId === action.auditId &&
-      guidedIntentToken === action.intentToken
+      guidedIntentToken === action.intentToken &&
+      guidedQuerySpec === action.querySpec
     );
   }
 
@@ -270,11 +323,21 @@
     if (guidedParseResult) {
       guidedParseResult = { ...guidedParseResult, reviewStatus: status };
     }
-    guidedAiStatus.textContent = `AI-assisted interpretation \u2022 ${status} by examiner \u2022 processed locally`;
+    guidedAiStatus.textContent = `Offline AI interpretation \u2022 ${status} \u2022 processed locally`;
   }
 
   function formatRoleName(role) {
-    return role.replace(/_/g, " ");
+    const labels = {
+      timestamp: "Timestamp",
+      user: "User / account",
+      command_line: "Command line",
+      process_name: "Process",
+      file_name: "File",
+      host: "Host / device",
+      ip: "IP address",
+      text_evidence: "Evidence text",
+    };
+    return labels[role] || role.replace(/_/g, " ");
   }
 
   function columnDisplayName(sqlName) {
@@ -301,15 +364,36 @@
     return out;
   }
 
+  function inferredEvidenceColumns() {
+    const out = [];
+    columnRoleSuggestions.forEach((row) => {
+      if (
+        row.status !== "rejected" &&
+        EVIDENCE_ROLES.has(row.role) &&
+        row.sqlName &&
+        !out.includes(row.sqlName)
+      ) {
+        out.push(row.sqlName);
+      }
+    });
+    return out;
+  }
+
   function updateEvidenceColumnsUi() {
-    const evidenceColumns = confirmedEvidenceColumns();
-    suspiciousScanBtn.disabled = columns.length === 0 || evidenceColumns.length === 0 || intelScanInFlight;
+    const evidenceColumns = inferredEvidenceColumns();
+    suspiciousScanBtn.disabled =
+      columns.length === 0 ||
+      evidenceColumns.length === 0 ||
+      roleDetectionInFlight ||
+      intelScanInFlight;
     if (columns.length === 0) {
-      evidenceColumnsLabel.textContent = "Load a file first.";
+      evidenceColumnsLabel.textContent = "Automatic evidence mapping starts after import.";
+    } else if (roleDetectionInFlight) {
+      evidenceColumnsLabel.textContent = "Detecting optional evidence mappings...";
     } else if (evidenceColumns.length === 0) {
-      evidenceColumnsLabel.textContent = "Confirm evidence roles first.";
+      evidenceColumnsLabel.textContent = "No evidence mapping was inferred. AI search is still available.";
     } else {
-      evidenceColumnsLabel.textContent = `Evidence: ${evidenceColumns
+      evidenceColumnsLabel.textContent = `Enrichment will inspect: ${evidenceColumns
         .map(columnDisplayName)
         .join(", ")}`;
     }
@@ -317,94 +401,123 @@
 
   function renderRoleSuggestions() {
     roleList.innerHTML = "";
+    roleReviewPanel.classList.toggle("hidden", columns.length === 0);
 
-    if (columnRoleSuggestions.length === 0) {
-      roleReviewPanel.classList.remove("hidden");
-      rolePanelStatus.textContent = roleDetectionInFlight
-        ? "Detecting column roles..."
-        : roleDetectionError
-          ? `Column role detection failed: ${roleDetectionError}`
-        : "No column role suggestions were found.";
+    if (roleDetectionInFlight) {
+      dataMappingSummary.textContent = "Detecting likely columns...";
+      rolePanelStatus.textContent = "Automatic mapping is running in the background. AI evidence search is ready now.";
       updateEvidenceColumnsUi();
       return;
     }
 
-    columnRoleSuggestions.forEach((suggestion) => {
+    if (roleDetectionError) {
+      dataMappingSummary.textContent = "Automatic mapping unavailable";
+      rolePanelStatus.textContent = `Automatic mapping failed: ${roleDetectionError}. AI evidence search is unaffected.`;
+    }
+
+    MAPPING_ROLES.forEach((role) => {
+      const suggestion = columnRoleSuggestions.find((row) => row.role === role) || {
+        role,
+        sqlName: "",
+        originalName: "",
+        confidence: 0,
+        status: "unmapped",
+        reasons: [],
+      };
       const row = document.createElement("div");
       row.className = "role-row";
 
       const roleTitle = document.createElement("div");
-      const roleName = document.createElement("div");
-      roleName.className = "role-title";
-      roleName.textContent = formatRoleName(suggestion.role);
-      roleTitle.appendChild(roleName);
-      if (suggestion.role === "command_line" && suggestion.status !== "confirmed") {
-        const warning = document.createElement("div");
-        warning.className = "role-warning";
-        warning.textContent = "Requires examiner confirmation before trusted.";
-        roleTitle.appendChild(warning);
-      }
+      roleTitle.className = "role-title";
+      roleTitle.textContent = formatRoleName(role);
 
-      const column = document.createElement("div");
-      column.className = "role-column";
-      column.textContent = `${suggestion.originalName || columnDisplayName(suggestion.sqlName)} (${suggestion.sqlName})`;
+      const columnSelect = document.createElement("select");
+      columnSelect.className = "mapping-column-select";
+      columnSelect.setAttribute("aria-label", `Column mapped to ${formatRoleName(role)}`);
+      const emptyOption = document.createElement("option");
+      emptyOption.value = "";
+      emptyOption.textContent = "(not mapped)";
+      columnSelect.appendChild(emptyOption);
+      columns.forEach((candidate) => {
+        const option = document.createElement("option");
+        option.value = candidate.sqlName;
+        option.textContent = candidate.originalName;
+        columnSelect.appendChild(option);
+      });
+      columnSelect.value = suggestion.sqlName || "";
 
       const meta = document.createElement("div");
       const badge = document.createElement("span");
       badge.className = `role-badge ${suggestion.status}`;
-      badge.textContent = suggestion.status;
+      badge.textContent =
+        suggestion.status === "suggested"
+          ? "automatic"
+          : suggestion.status === "rejected"
+            ? "ignored"
+            : suggestion.status;
       meta.appendChild(badge);
       const confidence = document.createElement("div");
       confidence.className = "role-confidence";
-      confidence.textContent = `${Math.round((suggestion.confidence || 0) * 100)}% confidence`;
+      confidence.textContent = suggestion.sqlName
+        ? `${Math.round((suggestion.confidence || 0) * 100)}% confidence`
+        : "No automatic match";
       meta.appendChild(confidence);
 
       const actions = document.createElement("div");
       actions.className = "role-actions";
       const confirmBtn = document.createElement("button");
       confirmBtn.className = "btn btn-small";
-      confirmBtn.textContent = "Confirm";
-      confirmBtn.disabled = suggestion.status === "confirmed";
+      const updateConfirmButton = () => {
+        const isSameConfirmed = suggestion.status === "confirmed" && columnSelect.value === suggestion.sqlName;
+        confirmBtn.textContent =
+          suggestion.sqlName && columnSelect.value && columnSelect.value !== suggestion.sqlName
+            ? "Use override"
+            : suggestion.sqlName
+              ? "Confirm"
+              : "Use mapping";
+        confirmBtn.disabled = !columnSelect.value || isSameConfirmed;
+      };
+      updateConfirmButton();
+      columnSelect.addEventListener("change", updateConfirmButton);
       confirmBtn.addEventListener("click", () => {
-        setColumnRoleStatus(suggestion.role, suggestion.sqlName, "confirmed").catch((err) =>
-          alert(`Role update failed: ${err}`)
+        const selectedColumn = columnSelect.value;
+        if (!selectedColumn) return;
+        setColumnRoleStatus(role, selectedColumn, "confirmed").catch((err) =>
+          alert(`Data mapping update failed: ${err}`)
         );
       });
+
       const rejectBtn = document.createElement("button");
       rejectBtn.className = "btn btn-small";
       rejectBtn.textContent = "Reject";
-      rejectBtn.disabled = suggestion.status === "rejected";
+      rejectBtn.disabled = !suggestion.sqlName || suggestion.status === "rejected";
       rejectBtn.addEventListener("click", () => {
-        setColumnRoleStatus(suggestion.role, suggestion.sqlName, "rejected").catch((err) =>
-          alert(`Role update failed: ${err}`)
+        setColumnRoleStatus(role, suggestion.sqlName, "rejected").catch((err) =>
+          alert(`Data mapping update failed: ${err}`)
         );
       });
       actions.append(confirmBtn, rejectBtn);
 
-      row.append(roleTitle, column, meta, actions);
-
+      row.append(roleTitle, columnSelect, meta, actions);
       if (suggestion.reasons && suggestion.reasons.length > 0) {
         const reasons = document.createElement("div");
         reasons.className = "role-reasons";
         reasons.textContent = suggestion.reasons.join("; ");
         row.appendChild(reasons);
       }
-
       roleList.appendChild(row);
     });
 
-    const commandLine = columnRoleSuggestions.find((row) => row.role === "command_line");
-    rolePanelStatus.textContent =
-      commandLine && commandLine.status !== "confirmed"
-        ? "Command-line evidence is not trusted until confirmed."
-        : "Confirmed evidence roles can be scanned for suspicious matches.";
+    if (!roleDetectionError) {
+      const automaticCount = columnRoleSuggestions.filter((row) => row.status === "suggested").length;
+      const confirmedCount = columnRoleSuggestions.filter((row) => row.status === "confirmed").length;
+      const mappedCount = columnRoleSuggestions.filter((row) => row.status !== "rejected").length;
+      dataMappingSummary.textContent = `${mappedCount} inferred${confirmedCount ? `, ${confirmedCount} confirmed` : ""}`;
+      rolePanelStatus.textContent = automaticCount
+        ? "Automatic mappings are active for optional enrichment and timeline hints. Confirm only when you want to lock in an override."
+        : "Mappings are optional. AI evidence search always searches the imported table directly.";
+    }
     updateEvidenceColumnsUi();
-
-    // Once every suggestion has been explicitly confirmed or rejected, there's nothing
-    // left for the examiner to decide — collapse the panel automatically so the sheet
-    // gets full screen room. "Review column roles" in the sidebar brings it back.
-    const allResolved = columnRoleSuggestions.every((row) => row.status !== "suggested");
-    roleReviewPanel.classList.toggle("hidden", allResolved);
   }
 
   function renderScanSummary(summary) {
@@ -445,32 +558,166 @@
     });
   }
 
+  function normalizeQueryExpression(expression, depth = 0, state = { nodes: 0 }) {
+    if (expression == null) return null;
+    state.nodes += 1;
+    if (depth > 8 || state.nodes > 128 || typeof expression !== "object" || Array.isArray(expression)) {
+      throw new Error("AI search plan contains an invalid expression");
+    }
+
+    switch (expression.type) {
+      case "and":
+      case "or": {
+        if (
+          !Array.isArray(expression.children) ||
+          expression.children.length === 0 ||
+          expression.children.length > 128
+        ) {
+          throw new Error("AI search plan contains an invalid expression group");
+        }
+        return {
+          type: expression.type,
+          children: expression.children.map((child) => normalizeQueryExpression(child, depth + 1, state)),
+        };
+      }
+      case "not": {
+        const child = normalizeQueryExpression(expression.child, depth + 1, state);
+        if (!child) throw new Error("AI search plan contains an empty NOT expression");
+        return { type: "not", child };
+      }
+      case "search":
+        if (typeof expression.value !== "string" || expression.value.length > 4096) {
+          throw new Error("AI search plan contains an invalid search term");
+        }
+        return { type: "search", value: expression.value };
+      case "predicate":
+        if (
+          !columns.some((column) => column.sqlName === expression.column) ||
+          !FILTER_OPERATORS.has(expression.op) ||
+          typeof expression.value !== "string" ||
+          expression.value.length > 4096
+        ) {
+          throw new Error("AI search plan contains an invalid column predicate");
+        }
+        return {
+          type: "predicate",
+          column: expression.column,
+          op: expression.op,
+          value: expression.value,
+        };
+      case "rowIds":
+        if (
+          !Array.isArray(expression.values) ||
+          expression.values.length === 0 ||
+          expression.values.length > 1000 ||
+          !expression.values.every((value) => Number.isSafeInteger(value) && value > 0)
+        ) {
+          throw new Error("AI search plan contains invalid row candidates");
+        }
+        // Row IDs are only accepted by copying a trusted backend-built QuerySpec. They are
+        // never derived from the request text or synthesized in the frontend.
+        return { type: "rowIds", values: [...expression.values] };
+      default:
+        throw new Error("AI search plan contains an unknown expression type");
+    }
+  }
+
+  function normalizeBackendQuerySpec(candidate) {
+    if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return null;
+    const normalized = {
+      search: candidate.search == null ? null : candidate.search,
+      filters: [],
+      sort: null,
+      expression: normalizeQueryExpression(candidate.expression),
+      cursor: null,
+      limit: PAGE_SIZE,
+    };
+    if (
+      normalized.search !== null &&
+      (typeof normalized.search !== "string" || normalized.search.length > 4096)
+    ) {
+      throw new Error("AI search plan contains an invalid full-table search");
+    }
+    const candidateFilters = candidate.filters == null ? [] : candidate.filters;
+    if (!Array.isArray(candidateFilters) || candidateFilters.length > 128) {
+      throw new Error("AI search plan contains invalid filters");
+    }
+    normalized.filters = candidateFilters.map((filter) => {
+      if (
+        !filter ||
+        !columns.some((column) => column.sqlName === filter.column) ||
+        !FILTER_OPERATORS.has(filter.op) ||
+        typeof filter.value !== "string" ||
+        filter.value.length > 4096
+      ) {
+        throw new Error("AI search plan contains an invalid filter");
+      }
+      return { column: filter.column, op: filter.op, value: filter.value };
+    });
+    if (candidate.sort != null) {
+      if (
+        !columns.some((column) => column.sqlName === candidate.sort.column) ||
+        !["asc", "desc"].includes(candidate.sort.direction)
+      ) {
+        throw new Error("AI search plan contains an invalid sort");
+      }
+      normalized.sort = {
+        column: candidate.sort.column,
+        direction: candidate.sort.direction,
+      };
+    }
+    return normalized;
+  }
+
   function renderGuidedPreview(result) {
     guidedParseResult = result;
-    guidedIntentToken = result.intentToken || null;
+    guidedIntentToken = typeof result.intentToken === "string" && result.intentToken ? result.intentToken : null;
     guidedAuditId = Number.isInteger(result.auditId) ? result.auditId : null;
     guidedReviewStatus = result.reviewStatus || null;
-    guidedRunBtn.textContent = "Run";
+    guidedMatchExplanation = Array.isArray(result.matchExplanation)
+      ? result.matchExplanation.filter((item) => typeof item === "string" && item.trim())
+      : [];
+    try {
+      guidedQuerySpec = normalizeBackendQuerySpec(result.querySpec);
+    } catch (error) {
+      guidedQuerySpec = null;
+      result = {
+        ...result,
+        needsClarification: true,
+        clarificationMessage: `The returned search plan was rejected by the frontend safety check: ${error.message}`,
+      };
+      guidedParseResult = result;
+    }
+
+    guidedRunBtn.textContent = "Search evidence";
     guidedQueryPanel.classList.remove("hidden");
-    guidedPreviewText.textContent = result.previewText || "No preview was returned.";
+    const previewLines = [result.previewText || "No search plan was returned."];
+    if (guidedMatchExplanation.length > 0) {
+      previewLines.push("", "Why rows will match:", ...guidedMatchExplanation.map((item) => `\u2022 ${item}`));
+    }
+    guidedPreviewText.textContent = previewLines.join("\n");
 
     if (result.aiAssisted) {
-      const validation = result.validationStatus ? ` • ${result.validationStatus.replace(/_/g, " ")}` : "";
-      guidedAiStatus.textContent = `AI-assisted interpretation • ${guidedReviewStatus || "unreviewed"}${validation} • processed locally`;
+      const validation = result.validationStatus ? ` \u2022 ${result.validationStatus.replace(/_/g, " ")}` : "";
+      guidedAiStatus.textContent = `Offline AI interpretation \u2022 ${guidedReviewStatus || "unreviewed"}${validation}`;
       guidedAiStatus.classList.remove("hidden");
       guidedRejectBtn.classList.toggle("hidden", guidedReviewStatus !== "unreviewed");
     } else {
-      guidedAiStatus.textContent = "Deterministic safety check • no model inference used";
+      guidedAiStatus.textContent = "Deterministic local search plan \u2022 no model inference";
       guidedAiStatus.classList.remove("hidden");
       guidedRejectBtn.classList.add("hidden");
     }
 
-    if (
-      result.needsClarification ||
-      guidedAuditId === null ||
-      !["unreviewed", "accepted"].includes(guidedReviewStatus)
-    ) {
-      guidedClarification.textContent = result.clarificationMessage || "Clarification is needed before this can run.";
+    const auditedPlanReady =
+      result.aiAssisted &&
+      guidedIntentToken !== null &&
+      guidedAuditId !== null &&
+      ["unreviewed", "accepted"].includes(guidedReviewStatus);
+    const deterministicPlanReady = !result.aiAssisted && guidedAuditId === null && guidedQuerySpec !== null;
+    if (result.needsClarification || (!auditedPlanReady && !deterministicPlanReady)) {
+      guidedClarification.textContent =
+        result.clarificationMessage ||
+        "More detail is needed before a safe evidence search can run.";
       guidedClarification.classList.remove("hidden");
       guidedRunBtn.classList.add("hidden");
     } else {
@@ -478,7 +725,7 @@
       guidedClarification.classList.add("hidden");
       guidedRunBtn.classList.remove("hidden");
     }
-    guidedResetBtn.classList.toggle("hidden", queryMode !== "guided");
+    guidedResetBtn.classList.toggle("hidden", !["guided", "querySpec"].includes(queryMode));
     updateGuidedInteractionControls();
   }
 
@@ -550,6 +797,7 @@
       sort: sortColumn.value
         ? { column: sortColumn.value, direction: sortDirection.value }
         : null,
+      expression: null,
       cursor: forExport ? null : spec.cursor,
       limit: PAGE_SIZE,
     };
@@ -575,9 +823,11 @@
     const shown = table ? table.getDataCount() : 0;
     if (totalCount === null) {
       rowCountLabel.textContent =
-        queryMode === "guided" ? `${shown} guided rows on this page` : `${shown} rows on this page`;
+        ["guided", "querySpec"].includes(queryMode)
+          ? `${shown} AI evidence rows on this page`
+          : `${shown} rows on this page`;
     } else {
-      rowCountLabel.textContent = `${totalCount.toLocaleString()} matching rows`;
+      rowCountLabel.textContent = `${totalCount.toLocaleString()} ${queryMode === "querySpec" ? "evidence" : "matching"} rows`;
     }
     pageLabel.textContent = `page ${pageIndex}`;
   }
@@ -588,15 +838,20 @@
     // stale nextCursor — the button is unclickable for the whole round trip either way.
     const modeAtStart = queryMode;
     const isGuidedRequest = modeAtStart === "guided";
-    if (isGuidedRequest && guidedActiveQuery !== null) return null;
+    const isQuerySpecRequest = modeAtStart === "querySpec";
+    const isTrackedEvidenceRequest = isGuidedRequest || isQuerySpecRequest;
+    if (isTrackedEvidenceRequest && guidedActiveQuery !== null) return null;
 
-    const guidedQueryRequest = isGuidedRequest
+    const guidedQueryRequest = isTrackedEvidenceRequest
       ? {
           contextRevision: guidedContextRevision,
+          mode: modeAtStart,
           auditId: guidedAuditId,
           intentToken: guidedIntentToken,
+          querySpec: guidedQuerySpec,
           cursor: spec.cursor,
           limit: spec.limit,
+          spec: isQuerySpecRequest ? { ...spec, cursor: spec.cursor } : null,
           table,
         }
       : null;
@@ -608,14 +863,22 @@
     const guidedQueryIsCurrent = () =>
       !guidedQueryRequest ||
       (guidedContextRevision === guidedQueryRequest.contextRevision &&
-        queryMode === "guided" &&
+        queryMode === guidedQueryRequest.mode &&
         guidedAuditId === guidedQueryRequest.auditId &&
         guidedIntentToken === guidedQueryRequest.intentToken &&
+        guidedQuerySpec === guidedQueryRequest.querySpec &&
         table === guidedQueryRequest.table);
 
     prevPageBtn.disabled = true;
     nextPageBtn.disabled = true;
-    showProgress(isGuidedRequest ? "Running guided query..." : "Filtering...", 0.5);
+    showProgress(
+      isGuidedRequest
+        ? "Searching evidence..."
+        : queryMode === "querySpec"
+          ? "Applying evidence search plan..."
+          : "Filtering...",
+      0.5
+    );
     try {
       const page =
         isGuidedRequest
@@ -625,7 +888,7 @@
               cursor: guidedQueryRequest.cursor,
               limit: guidedQueryRequest.limit,
             })
-          : await invoke("query_rows", { spec });
+          : await invoke("query_rows", { spec: guidedQueryRequest ? guidedQueryRequest.spec : spec });
       if (!guidedQueryIsCurrent() || !table) return null;
       table.setData(page.rows);
       nextCursor = page.nextCursor;
@@ -653,13 +916,13 @@
 
   function applyControlsAndReload() {
     queryMode = "normal";
-    guidedIntentToken = null;
     guidedResetBtn.classList.add("hidden");
     spec.search = searchBox.value.trim() || null;
     spec.filters = currentFilterValues();
     spec.sort = sortColumn.value
       ? { column: sortColumn.value, direction: sortDirection.value }
       : null;
+    spec.expression = null;
     resetPagination();
     refreshData();
     refreshCount();
@@ -671,39 +934,189 @@
     searchDebounceHandle = setTimeout(applyControlsAndReload, 300);
   }
 
+  function loadedContextIsCurrent(request) {
+    return (
+      guidedContextRevision === request.contextRevision &&
+      currentPath === request.path &&
+      currentSheet === request.sheet
+    );
+  }
+
+  function semanticIndexRequestIsCurrent(request) {
+    return activeSemanticIndexRequest === request && loadedContextIsCurrent(request);
+  }
+
+  function renderSemanticIndexState() {
+    semanticIndexStatus.className = `semantic-index-status ${semanticIndexState.status}`;
+    if (semanticIndexState.status === "ready") {
+      semanticIndexStatus.textContent = `Semantic matching ready (${semanticIndexState.rowsIndexed.toLocaleString()} rows indexed).`;
+    } else if (semanticIndexState.status === "building") {
+      const progress = semanticIndexState.rowsIndexed
+        ? ` ${semanticIndexState.rowsIndexed.toLocaleString()} rows processed.`
+        : "";
+      semanticIndexStatus.textContent = `Semantic matching is building in the background.${progress} Exact and structured AI search are ready now.`;
+    } else if (semanticIndexState.status === "error") {
+      semanticIndexStatus.textContent = "Semantic matching is unavailable; exact and structured AI search remain ready.";
+    } else {
+      semanticIndexStatus.textContent = "Semantic matching starts automatically after import.";
+    }
+  }
+
+  async function startSemanticIndexForLoadedFile() {
+    const request = {
+      id: ++semanticIndexRequestSequence,
+      contextRevision: guidedContextRevision,
+      path: currentPath,
+      sheet: currentSheet,
+    };
+    activeSemanticIndexRequest = request;
+    semanticIndexState = { status: "building", rowsIndexed: 0, summary: null, error: null };
+    renderSemanticIndexState();
+    try {
+      const status = await invoke("semantic_index_status");
+      if (!semanticIndexRequestIsCurrent(request)) return null;
+      if (status.ready) {
+        semanticIndexState = {
+          status: "ready",
+          rowsIndexed: status.rowsIndexed || 0,
+          summary: null,
+          error: null,
+        };
+        renderSemanticIndexState();
+        return status;
+      }
+
+      const summary = await invoke("build_semantic_index");
+      if (!semanticIndexRequestIsCurrent(request)) return null;
+      semanticIndexState = {
+        status: "ready",
+        rowsIndexed: summary.rowsIndexed || 0,
+        summary,
+        error: null,
+      };
+      renderSemanticIndexState();
+      return summary;
+    } catch (err) {
+      if (!semanticIndexRequestIsCurrent(request)) return null;
+      console.error("semantic index build failed", err);
+      semanticIndexState = { status: "error", rowsIndexed: 0, summary: null, error: String(err) };
+      renderSemanticIndexState();
+      return null;
+    } finally {
+      if (semanticIndexRequestIsCurrent(request)) activeSemanticIndexRequest = null;
+    }
+  }
+
+  function automaticTimestampMappingIsCurrent(suggestion, request) {
+    const current = columnRoleSuggestions.find((row) => row.role === "timestamp");
+    return (
+      loadedContextIsCurrent(request) &&
+      current &&
+      current.sqlName === suggestion.sqlName &&
+      current.status !== "rejected"
+    );
+  }
+
+  async function analyzeAutomaticTimestampMapping(suggestion, request) {
+    if (
+      automaticTimestampInFlight ||
+      !suggestion ||
+      suggestion.status === "rejected" ||
+      suggestion.confidence < 0.75 ||
+      !automaticTimestampMappingIsCurrent(suggestion, request)
+    ) {
+      return null;
+    }
+
+    automaticTimestampInFlight = true;
+    automaticTimestampSqlName = suggestion.sqlName;
+    dataMappingSummary.textContent = "Checking timestamp format...";
+    rolePanelStatus.textContent = "The high-confidence timestamp mapping is being checked in the background.";
+    try {
+      const analysis = await invoke("analyze_timestamp_column");
+      if (!automaticTimestampMappingIsCurrent(suggestion, request)) return null;
+      timestampAnalysis = analysis;
+      if (analysis.needsTimezone) {
+        showTimezonePrompt(analysis);
+        dataMappingSummary.textContent = "Timestamp timezone needed";
+        rolePanelStatus.textContent = "Choose a timezone only if chronological ordering is needed. AI evidence search remains available.";
+        return null;
+      }
+
+      const summary = await invoke("normalize_timestamp_column", { naiveTimezone: null });
+      if (!automaticTimestampMappingIsCurrent(suggestion, request)) return null;
+      timestampNormalizationSummary = summary;
+      timezonePanel.classList.add("hidden");
+      dataMappingSummary.textContent = `${columnRoleSuggestions.filter((row) => row.status !== "rejected").length} inferred, time ready`;
+      rolePanelStatus.textContent = `Unambiguous timestamp values (explicit timezone or epoch) were normalized to UTC automatically (${summary.rowsWritten.toLocaleString()} rows).`;
+      return summary;
+    } catch (err) {
+      if (!automaticTimestampMappingIsCurrent(suggestion, request)) return null;
+      console.error("automatic timestamp analysis/normalization failed", err);
+      rolePanelStatus.textContent = `Automatic timestamp preparation was skipped: ${err}. AI evidence search is unaffected.`;
+      return null;
+    } finally {
+      if (loadedContextIsCurrent(request) && automaticTimestampSqlName === suggestion.sqlName) {
+        automaticTimestampInFlight = false;
+        automaticTimestampSqlName = null;
+      }
+    }
+  }
+
   async function detectColumnRolesForLoadedFile({ throwOnError = false } = {}) {
+    const request = {
+      id: ++roleDetectionRequestSequence,
+      contextRevision: guidedContextRevision,
+      path: currentPath,
+      sheet: currentSheet,
+    };
+    activeRoleDetectionRequest = request;
     roleDetectionInFlight = true;
     roleDetectionError = null;
     renderRoleSuggestions();
     try {
-      columnRoleSuggestions = await invoke("detect_column_roles");
-      return columnRoleSuggestions;
+      const suggestions = await invoke("detect_column_roles");
+      if (activeRoleDetectionRequest !== request || !loadedContextIsCurrent(request)) return [];
+      columnRoleSuggestions = suggestions;
+      return suggestions;
     } catch (err) {
+      if (activeRoleDetectionRequest !== request || !loadedContextIsCurrent(request)) return [];
       console.error("detect_column_roles failed", err);
       roleDetectionError = err;
-      roleReviewPanel.classList.remove("hidden");
-      rolePanelStatus.textContent = `Column role detection failed: ${err}`;
       if (throwOnError) throw err;
       return [];
     } finally {
-      roleDetectionInFlight = false;
-      renderRoleSuggestions();
+      if (activeRoleDetectionRequest === request && loadedContextIsCurrent(request)) {
+        activeRoleDetectionRequest = null;
+        roleDetectionInFlight = false;
+        renderRoleSuggestions();
+        const timestampSuggestion = columnRoleSuggestions.find(
+          (row) => row.role === "timestamp" && row.status !== "rejected" && row.confidence >= 0.75
+        );
+        if (timestampSuggestion) {
+          analyzeAutomaticTimestampMapping(timestampSuggestion, request);
+        }
+      }
     }
   }
 
   async function setColumnRoleStatus(role, sqlName, status) {
-    rolePanelStatus.textContent = `Updating ${formatRoleName(role)}...`;
+    rolePanelStatus.textContent = `Updating ${formatRoleName(role)} mapping...`;
     try {
       const updated = await invoke("set_column_role_status", { role, sqlName, status });
       upsertRoleSuggestion(updated);
       renderRoleSuggestions();
-      if (role === "timestamp" && status === "confirmed") {
+      if (
+        role === "timestamp" &&
+        status === "confirmed" &&
+        (!automaticTimestampInFlight || automaticTimestampSqlName !== sqlName)
+      ) {
         await handleTimestampConfirmed();
       }
       return updated;
     } catch (err) {
       console.error("set_column_role_status failed", err);
-      rolePanelStatus.textContent = `Role update failed: ${err}`;
+      rolePanelStatus.textContent = `Data mapping update failed: ${err}`;
       throw err;
     }
   }
@@ -747,14 +1160,14 @@
     }
   }
 
-  async function runIntelScan(evidenceColumns = confirmedEvidenceColumns()) {
+  async function runIntelScan(evidenceColumns = inferredEvidenceColumns()) {
     if (!evidenceColumns || evidenceColumns.length === 0) {
-      throw new Error("confirm at least one evidence column role before scanning");
+      throw new Error("no evidence columns were inferred; choose columns in Data mapping first");
     }
 
     intelScanInFlight = true;
     updateEvidenceColumnsUi();
-    showProgress("Scanning suspicious matches...", 0);
+    showProgress("Running optional threat enrichment...", 0);
     try {
       const summary = await invoke("scan_intel_matches", { evidenceColumns });
       intelScanSummaryResult = summary;
@@ -787,11 +1200,11 @@
 
     updateGuidedInteractionControls();
     guidedQueryPanel.classList.remove("hidden");
-    guidedPreviewText.textContent = "Parsing guided query...";
+    guidedPreviewText.textContent = "Building an evidence search plan...";
     guidedClarification.classList.add("hidden");
     guidedRunBtn.classList.add("hidden");
     guidedRejectBtn.classList.add("hidden");
-    showProgress("Parsing guided query...", 0.3);
+    showProgress("Local AI is planning the evidence search...", 0.3);
     try {
       if (guidedAuditId !== null && guidedReviewStatus === "unreviewed") {
         const edited = await decideGuidedParse("edited", { allowDuringParse: true });
@@ -804,7 +1217,7 @@
     } catch (err) {
       if (!guidedParseIsCurrent(request)) return null;
       console.error("parse_guided_query failed", err);
-      guidedPreviewText.textContent = `Guided query preview failed: ${err}`;
+      guidedPreviewText.textContent = `Evidence search preview failed: ${err}`;
       throw err;
     } finally {
       const stillCurrent = guidedParseIsCurrent(request);
@@ -817,8 +1230,35 @@
   }
 
   async function runGuidedQuery(intentToken = guidedIntentToken) {
+    const deterministicPlanReady =
+      guidedParseResult &&
+      !guidedParseResult.aiAssisted &&
+      guidedAuditId === null &&
+      guidedQuerySpec !== null;
+    if (deterministicPlanReady) {
+      const action = beginGuidedAction("run-deterministic");
+      if (!action) return null;
+      try {
+        queryMode = "querySpec";
+        spec = { ...guidedQuerySpec, cursor: null, limit: PAGE_SIZE };
+        totalCount = null;
+        resetPagination();
+        guidedResetBtn.classList.remove("hidden");
+        guidedRunBtn.textContent = "Searching...";
+        const page = await refreshData();
+        if (guidedActionIsCurrent(action)) {
+          guidedRunBtn.textContent = page ? "Search evidence" : "Retry";
+          guidedRunBtn.classList.remove("hidden");
+          refreshCount();
+        }
+        return page;
+      } finally {
+        finishGuidedAction(action);
+      }
+    }
+
     if (!intentToken || guidedAuditId === null) {
-      throw new Error("no reviewed AI-assisted intent is ready to run");
+      throw new Error("no safe evidence search plan is ready to run");
     }
     if (!["unreviewed", "accepted"].includes(guidedReviewStatus)) {
       throw new Error(`AI-assisted interpretation was ${guidedReviewStatus || "not reviewable"} and cannot be run`);
@@ -828,7 +1268,7 @@
     if (!action) return null;
 
     try {
-      guidedRunBtn.textContent = "Accepting...";
+      guidedRunBtn.textContent = "Accepting plan...";
       // Make the audit transition explicit so an acceptance failure (stale scan/library,
       // rejected preview, or token mismatch) cannot be displayed as accepted. The query command
       // repeats this check idempotently for direct-IPC safety.
@@ -844,18 +1284,18 @@
       totalCount = null;
       resetPagination();
       guidedResetBtn.classList.remove("hidden");
-      guidedRunBtn.textContent = "Running...";
+      guidedRunBtn.textContent = "Searching...";
 
       const page = await refreshData();
       if (guidedActionIsCurrent(action)) {
-        guidedRunBtn.textContent = page ? "Run" : "Retry";
+        guidedRunBtn.textContent = page ? "Search evidence" : "Retry";
         guidedRunBtn.classList.remove("hidden");
         refreshCount();
       }
       return page;
     } catch (err) {
       if (guidedActionIsCurrent(action) && guidedReviewStatus !== "accepted") {
-        guidedRunBtn.textContent = "Run";
+        guidedRunBtn.textContent = "Search evidence";
         guidedRunBtn.classList.remove("hidden");
         guidedRejectBtn.classList.remove("hidden");
       }
@@ -978,7 +1418,7 @@
       sortColumn.appendChild(opt);
     });
 
-    spec = { search: null, filters: [], sort: null, cursor: null, limit: PAGE_SIZE };
+    spec = { search: null, filters: [], sort: null, expression: null, cursor: null, limit: PAGE_SIZE };
     resetPagination();
 
     const tabulatorColumns = [
@@ -1004,6 +1444,7 @@
 
     setControlsEnabled(true);
     detectColumnRolesForLoadedFile();
+    startSemanticIndexForLoadedFile();
     table.on("tableBuilt", () => {
       refreshData();
       refreshCount();
@@ -1023,7 +1464,7 @@
     sortColumn.innerHTML = '<option value="">(row order)</option>';
     filterList.innerHTML = "";
     searchBox.value = "";
-    spec = { search: null, filters: [], sort: null, cursor: null, limit: PAGE_SIZE };
+    spec = { search: null, filters: [], sort: null, expression: null, cursor: null, limit: PAGE_SIZE };
     resetPagination();
     resetIntelUiState();
     setControlsEnabled(false);
@@ -1089,6 +1530,7 @@
 
   reviewRolesBtn.addEventListener("click", () => {
     roleReviewPanel.classList.remove("hidden");
+    roleReviewPanel.open = true;
   });
 
   sheetLoadBtn.addEventListener("click", () => {
@@ -1098,21 +1540,16 @@
   searchBox.addEventListener("input", debouncedApply);
   guidedSearchForm.addEventListener("submit", (event) => {
     event.preventDefault();
-    previewGuidedQuery().catch((err) => alert(`Guided query preview failed: ${err}`));
+    previewGuidedQuery().catch((err) => alert(`Evidence search preview failed: ${err}`));
   });
   guidedRunBtn.addEventListener("click", () => {
-    runGuidedQuery().catch((err) => alert(`Guided query failed: ${err}`));
+    runGuidedQuery().catch((err) => alert(`Evidence search failed: ${err}`));
   });
   guidedRejectBtn.addEventListener("click", () => {
     decideGuidedParse("rejected").catch((err) => alert(`Could not record decision: ${err}`));
   });
   guidedResetBtn.addEventListener("click", () => {
-    queryMode = "normal";
-    guidedIntentToken = null;
-    guidedResetBtn.classList.add("hidden");
-    resetPagination();
-    refreshData();
-    refreshCount();
+    applyControlsAndReload();
   });
   guidedPanelClose.addEventListener("click", () => {
     cancelActiveGuidedParse();
@@ -1130,11 +1567,11 @@
   });
 
   suspiciousScanBtn.addEventListener("click", () => {
-    runIntelScan().catch((err) => alert(`Suspicious scan failed: ${err}`));
+    runIntelScan().catch((err) => alert(`Threat enrichment failed: ${err}`));
   });
 
   rolePanelClose.addEventListener("click", () => {
-    roleReviewPanel.classList.add("hidden");
+    roleReviewPanel.open = false;
   });
 
   timezoneUtcBtn.addEventListener("click", () => {
@@ -1195,9 +1632,20 @@
     const fraction = rowsTotal > 0 ? rowsDone / rowsTotal : 0;
     const label =
       phase === "complete"
-        ? "Suspicious scan complete"
-        : `Scanning suspicious matches... ${rowsDone.toLocaleString()} / ${rowsTotal.toLocaleString()}`;
+        ? "Optional threat enrichment complete"
+        : `Enriching threat matches... ${rowsDone.toLocaleString()} / ${rowsTotal.toLocaleString()}`;
     showProgress(label, fraction);
+  });
+
+  listen("semantic-index-progress", (event) => {
+    if (semanticIndexState.status !== "building" || !activeSemanticIndexRequest) return;
+    const { rowsDone, phase } = event.payload;
+    semanticIndexState = {
+      ...semanticIndexState,
+      status: phase === "complete" ? "ready" : "building",
+      rowsIndexed: rowsDone || 0,
+    };
+    renderSemanticIndexState();
   });
 
   listen("report-export-progress", (event) => {
@@ -1239,6 +1687,7 @@
         timestampAnalysis,
         timestampNormalizationSummary,
         evidenceColumns: confirmedEvidenceColumns(),
+        inferredEvidenceColumns: inferredEvidenceColumns(),
         intelScanSummary: intelScanSummaryResult,
         reportSummary: reportSummaryResult,
       };
@@ -1250,6 +1699,8 @@
         guidedIntentToken,
         guidedAuditId,
         guidedReviewStatus,
+        guidedQuerySpec,
+        guidedMatchExplanation,
         parseInFlight: guidedActiveParse !== null,
         actionInFlight: guidedActiveAction ? guidedActiveAction.type : null,
         queryInFlight: guidedActiveQuery !== null,
@@ -1271,7 +1722,7 @@
     normalizeTimestampForTest(naiveTimezone = null) {
       return normalizeTimestampColumn(naiveTimezone);
     },
-    scanIntelForTest(evidenceColumns = confirmedEvidenceColumns()) {
+    scanIntelForTest(evidenceColumns = inferredEvidenceColumns()) {
       return runIntelScan(evidenceColumns);
     },
     previewGuidedQueryForTest(queryText) {
@@ -1280,6 +1731,29 @@
     },
     runGuidedQueryForTest(intentToken = guidedIntentToken) {
       return runGuidedQuery(intentToken);
+    },
+    previewAiEvidenceQueryForTest(queryText) {
+      guidedSearchBox.value = queryText;
+      return previewGuidedQuery(queryText);
+    },
+    runAiEvidenceQueryForTest(intentToken = guidedIntentToken) {
+      return runGuidedQuery(intentToken);
+    },
+    getAiSearchState() {
+      return window.__logParserDebug.getGuidedState();
+    },
+    getSemanticIndexState() {
+      return { ...semanticIndexState, inFlight: activeSemanticIndexRequest !== null };
+    },
+    buildSemanticIndexForTest() {
+      return startSemanticIndexForLoadedFile();
+    },
+    openDataMappingForTest() {
+      roleReviewPanel.classList.remove("hidden");
+      roleReviewPanel.open = true;
+    },
+    setMappingForTest(role, sqlName, status = "confirmed") {
+      return setColumnRoleStatus(role, sqlName, status);
     },
     decideGuidedParseForTest(decision) {
       return decideGuidedParse(decision);

@@ -10,61 +10,81 @@
 <body>
   <div id="app">
     <header id="toolbar">
-      <button id="open-file-btn" class="btn btn-primary">Open File…</button>
+      <button id="open-file-btn" class="btn btn-primary">Open File&hellip;</button>
       <button id="remove-file-btn" class="btn" disabled>Remove File</button>
       <div id="file-info" class="file-info">No file loaded</div>
       <div class="toolbar-spacer"></div>
-      <input id="search-box" type="search" placeholder="Search all columns…" disabled />
-      <form id="guided-search-form" class="guided-search-form">
-        <label for="guided-search-box" class="guided-search-label">Local AI (offline)</label>
-        <input id="guided-search-box" type="search" maxlength="4096" placeholder="show credential access for alice chronologically" disabled />
-        <button id="guided-search-submit" class="btn" disabled>Preview</button>
-      </form>
+      <input id="search-box" type="search" placeholder="Quick search all columns&hellip;" disabled />
       <button id="report-export-btn" class="btn" disabled>Generate Report</button>
       <button id="export-csv-btn" class="btn" disabled>Export CSV</button>
       <button id="export-xlsx-btn" class="btn" disabled>Export Excel</button>
     </header>
+
+    <section id="ai-search-workspace" class="ai-search-workspace" aria-labelledby="ai-search-heading">
+      <div class="ai-search-heading-row">
+        <div>
+          <div class="ai-search-title-line">
+            <h1 id="ai-search-heading">AI evidence search (offline)</h1>
+            <span class="offline-badge">On-device</span>
+          </div>
+          <p>Describe the evidence you need. The local AI searches the imported table directly; threat enrichment is optional.</p>
+        </div>
+      </div>
+      <form id="guided-search-form" class="guided-search-form">
+        <label for="guided-search-box" class="sr-only">Describe evidence to find</label>
+        <input id="guided-search-box" type="search" maxlength="4096" placeholder="Example: failed logons for alice, then show related PowerShell activity chronologically" disabled />
+        <button id="guided-search-submit" class="btn btn-primary" disabled>Preview search</button>
+      </form>
+      <div id="ai-search-availability" class="ai-search-availability">Import a file to search its evidence.</div>
+      <div id="semantic-index-status" class="semantic-index-status">Semantic matching starts automatically after import.</div>
+    </section>
 
     <div id="progress-bar-wrap" class="hidden">
       <div id="progress-bar"><div id="progress-fill"></div></div>
       <div id="progress-label"></div>
     </div>
 
-    <section id="guided-query-panel" class="intel-panel hidden">
+    <section id="guided-query-panel" class="intel-panel guided-query-panel hidden">
       <div class="intel-panel-header">
-        <strong>Guided search preview</strong>
-        <button id="guided-panel-close" class="btn btn-small" title="Dismiss preview">&times;</button>
+        <strong>Evidence search plan</strong>
+        <button id="guided-panel-close" class="btn btn-small" title="Dismiss preview" aria-label="Dismiss evidence search preview">&times;</button>
       </div>
       <div id="guided-ai-status" class="guided-ai-status hidden"></div>
       <div id="guided-preview-text" class="intel-panel-body"></div>
       <div id="guided-clarification" class="intel-panel-note hidden"></div>
       <div class="intel-panel-actions">
-        <button id="guided-run-btn" class="btn btn-primary hidden">Run</button>
+        <button id="guided-run-btn" class="btn btn-primary hidden">Search evidence</button>
         <button id="guided-reject-btn" class="btn hidden">Reject interpretation</button>
-        <button id="guided-reset-btn" class="btn hidden">Return to filters</button>
+        <button id="guided-reset-btn" class="btn hidden">Return to table filters</button>
       </div>
     </section>
 
-    <section id="role-review-panel" class="intel-panel hidden">
-      <div class="intel-panel-header">
-        <strong>Column role review</strong>
-        <button id="role-panel-close" class="btn btn-small" title="Dismiss role review">&times;</button>
+    <details id="role-review-panel" class="mapping-panel hidden">
+      <summary>
+        <span class="mapping-summary-title">Data mapping <span class="automatic-badge">Automatic</span></span>
+        <span id="data-mapping-summary" class="mapping-summary-status">Waiting for a file</span>
+      </summary>
+      <div class="mapping-panel-content">
+        <p class="mapping-explainer">Mappings improve timeline ordering and optional threat enrichment. AI evidence search still searches every imported column when mappings are incomplete.</p>
+        <div id="role-list" class="role-list"></div>
+        <div id="role-panel-status" class="intel-panel-note"></div>
+        <div class="intel-panel-actions">
+          <button id="role-panel-close" class="btn btn-small">Collapse data mapping</button>
+        </div>
       </div>
-      <div id="role-list" class="role-list"></div>
-      <div id="role-panel-status" class="intel-panel-note"></div>
-    </section>
+    </details>
 
-    <section id="timezone-panel" class="intel-panel hidden">
+    <section id="timezone-panel" class="intel-panel timezone-panel hidden" aria-live="polite">
       <div class="intel-panel-header">
-        <strong>Timestamp timezone</strong>
-        <button id="timezone-panel-close" class="btn btn-small" title="Dismiss timezone prompt">&times;</button>
+        <strong>Timestamp timezone needed</strong>
+        <button id="timezone-panel-close" class="btn btn-small" title="Dismiss timezone prompt" aria-label="Dismiss timestamp timezone prompt">&times;</button>
       </div>
       <div id="timezone-summary" class="intel-panel-body"></div>
       <div id="timezone-samples" class="intel-panel-note hidden"></div>
       <div class="timezone-controls">
         <input id="timezone-input" type="text" placeholder="UTC offset or IANA timezone, e.g. +02:00 or Europe/Bucharest" />
         <button id="timezone-utc-btn" class="btn">Already UTC</button>
-        <button id="timezone-normalize-btn" class="btn btn-primary">Normalize</button>
+        <button id="timezone-normalize-btn" class="btn btn-primary">Use timezone</button>
       </div>
     </section>
 
@@ -77,7 +97,7 @@
     </section>
 
     <div id="sheet-picker" class="hidden">
-      <label for="sheet-select">This workbook has multiple sheets — pick one:</label>
+      <label for="sheet-select">This workbook has multiple sheets &mdash; pick one:</label>
       <select id="sheet-select"></select>
       <button id="sheet-load-btn" class="btn btn-primary">Load Sheet</button>
     </div>
@@ -104,11 +124,12 @@
           <button id="clear-btn" class="btn" disabled>Clear all</button>
         </div>
 
-        <div class="sidebar-section">
-          <h3>Intel</h3>
-          <button id="suspicious-scan-btn" class="btn btn-primary" disabled>Scan suspicious</button>
-          <button id="review-roles-btn" class="btn btn-small" disabled>Review column roles</button>
-          <div id="evidence-columns-label" class="sidebar-note">Confirm evidence roles first.</div>
+        <div class="sidebar-section optional-enrichment-section">
+          <h3>Optional enrichment</h3>
+          <p class="sidebar-note enrichment-intro">Add known threat-technique matches after import. This is not required for AI evidence search.</p>
+          <button id="suspicious-scan-btn" class="btn" disabled>Run threat enrichment</button>
+          <button id="review-roles-btn" class="btn btn-small" disabled>Open data mapping</button>
+          <div id="evidence-columns-label" class="sidebar-note">Automatic evidence mapping starts after import.</div>
           <div id="intel-scan-summary" class="scan-summary"></div>
         </div>
       </aside>
@@ -116,7 +137,7 @@
       <section id="grid-area">
         <div id="grid"></div>
         <footer id="status-bar">
-          <span id="row-count-label">—</span>
+          <span id="row-count-label">&mdash;</span>
           <div class="toolbar-spacer"></div>
           <button id="prev-page-btn" class="btn btn-small" disabled>&laquo; Prev</button>
           <span id="page-label"></span>
