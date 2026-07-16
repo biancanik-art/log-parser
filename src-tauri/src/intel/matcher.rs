@@ -2,12 +2,17 @@ use crate::db;
 use crate::intel::library::{self, LoadedLibrary, MatchKind, Tactic};
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder};
 use anyhow::{anyhow, Result};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const PROGRESS_INTERVAL_ROWS: i64 = 5000;
+const SCAN_BATCH_ROWS: i64 = 1000;
+const STAGING_TABLE: &str = "temp._intel_match_staging";
+static SCAN_TOKEN_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -96,6 +101,14 @@ pub fn role_hash_for_columns(evidence_columns: &[String]) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+#[derive(Debug)]
+struct PendingMatch {
+    row_num: i64,
+    pattern_idx: usize,
+    tactic_idx: usize,
+    column_idx: usize,
+}
+
 pub fn confirmed_evidence_columns(conn: &Connection) -> Result<Vec<String>> {
     let roles_exist: i64 = conn.query_row(
         "SELECT EXISTS(
@@ -165,6 +178,8 @@ fn scan_with_compiled_library(
     let total_rows = count_rows(conn)?;
 
     db::create_intel_schema(conn)?;
+    create_scan_staging_schema(conn)?;
+    let scan_token = begin_scan(conn)?;
     on_progress(0, total_rows, "scanning");
 
     let select_idents: Vec<String> = scan_columns
@@ -172,7 +187,10 @@ fn scan_with_compiled_library(
         .map(|column| db::quote_ident(column))
         .collect();
     let select_sql = format!(
-        "SELECT row_num, {} FROM rows ORDER BY row_num ASC",
+        "SELECT row_num, {} FROM rows
+         WHERE row_num > ?1
+         ORDER BY row_num ASC
+         LIMIT ?2",
         select_idents.join(", ")
     );
 
@@ -181,88 +199,170 @@ fn scan_with_compiled_library(
     let mut matched_rows = HashSet::new();
     let mut inserted_match_rows = 0i64;
     let mut rows_scanned = 0i64;
+    let mut last_row_num = i64::MIN;
+    let mut next_progress_at = PROGRESS_INTERVAL_ROWS;
 
-    let tx = conn.transaction()?;
-    tx.execute("DELETE FROM _intel_match", [])?;
-    tx.execute("DELETE FROM _intel_scan_info", [])?;
-
-    {
-        let mut select_stmt = tx.prepare(&select_sql)?;
-        let mut insert_stmt = tx.prepare(
-            "INSERT INTO _intel_match (
-                row_num,
-                tactic_id,
-                tactic_name,
-                technique_id,
-                technique_name,
-                pattern_id,
-                keyword,
-                column_name,
-                score
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-        )?;
-        let mut rows = select_stmt.query([])?;
-        while let Some(row) = rows.next()? {
-            let row_num: i64 = row.get(0)?;
-            rows_scanned += 1;
-
-            for (column_idx, column_name) in scan_columns.iter().enumerate() {
-                let value: Option<String> = row.get(column_idx + 1)?;
-                let Some(value) = value.filter(|v| !v.is_empty()) else {
-                    continue;
-                };
-                let mut seen_patterns_in_cell = HashSet::new();
-                for mat in compiled.automaton.find_overlapping_iter(&value) {
-                    let pattern_idx = mat.pattern().as_usize();
-                    if !seen_patterns_in_cell.insert(pattern_idx) {
-                        continue;
+    let scan_result = (|| -> Result<()> {
+        loop {
+            // Materialize one keyset page and release its read statement before matching.
+            // No main-database lock is held during the CPU-heavy Aho-Corasick pass.
+            let batch = {
+                let mut select_stmt = conn.prepare(&select_sql)?;
+                let mut rows =
+                    select_stmt.query(rusqlite::params![last_row_num, SCAN_BATCH_ROWS])?;
+                let mut batch = Vec::new();
+                while let Some(row) = rows.next()? {
+                    let row_num: i64 = row.get(0)?;
+                    let mut values = Vec::with_capacity(scan_columns.len());
+                    for column_idx in 0..scan_columns.len() {
+                        values.push(row.get::<_, Option<String>>(column_idx + 1)?);
                     }
-                    let pattern = &compiled.patterns[pattern_idx];
-                    if !passes_boundary_check(&value, mat.start(), mat.end(), pattern) {
+                    batch.push((row_num, values));
+                }
+                batch
+            };
+
+            if batch.is_empty() {
+                break;
+            }
+
+            let mut pending_matches = Vec::new();
+            for (row_num, values) in &batch {
+                last_row_num = *row_num;
+                rows_scanned += 1;
+
+                for (column_idx, value) in values.iter().enumerate() {
+                    let Some(value) = value.as_deref().filter(|value| !value.is_empty()) else {
                         continue;
-                    }
+                    };
+                    let mut seen_patterns_in_cell = HashSet::new();
+                    for mat in compiled.automaton.find_overlapping_iter(value) {
+                        let pattern_idx = mat.pattern().as_usize();
+                        if !seen_patterns_in_cell.insert(pattern_idx) {
+                            continue;
+                        }
+                        let pattern = &compiled.patterns[pattern_idx];
+                        if !passes_boundary_check(value, mat.start(), mat.end(), pattern) {
+                            continue;
+                        }
 
-                    matched_rows.insert(row_num);
-                    increment_count(
-                        &mut technique_counts,
-                        &pattern.technique_id,
-                        &pattern.technique_name,
-                        row_num,
-                    );
+                        matched_rows.insert(*row_num);
+                        increment_count(
+                            &mut technique_counts,
+                            &pattern.technique_id,
+                            &pattern.technique_name,
+                            *row_num,
+                        );
 
-                    for tactic in &pattern.tactic_refs {
-                        insert_stmt.execute(rusqlite::params![
-                            row_num,
-                            tactic.id,
-                            tactic.name,
-                            pattern.technique_id,
-                            pattern.technique_name,
-                            pattern.pattern_id,
-                            pattern.keyword,
-                            column_name,
-                            pattern.score
-                        ])?;
-                        inserted_match_rows += 1;
-                        increment_count(&mut tactic_counts, &tactic.id, &tactic.name, row_num);
+                        for tactic_idx in 0..pattern.tactic_refs.len() {
+                            pending_matches.push(PendingMatch {
+                                row_num: *row_num,
+                                pattern_idx,
+                                tactic_idx,
+                                column_idx,
+                            });
+                            inserted_match_rows += 1;
+                            let tactic = &pattern.tactic_refs[tactic_idx];
+                            increment_count(&mut tactic_counts, &tactic.id, &tactic.name, *row_num);
+                        }
                     }
                 }
             }
 
-            if rows_scanned % PROGRESS_INTERVAL_ROWS == 0 {
+            // TEMP staging is private to this connection. Each transaction is bounded to one
+            // source-row page and therefore does not block independent main-database writers.
+            let tx = conn.transaction()?;
+            {
+                let mut insert_stmt = tx.prepare(&format!(
+                    "INSERT INTO {STAGING_TABLE} (
+                        row_num, tactic_id, tactic_name, technique_id, technique_name,
+                        pattern_id, keyword, column_name, score
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"
+                ))?;
+                for pending in pending_matches {
+                    let pattern = &compiled.patterns[pending.pattern_idx];
+                    let tactic = &pattern.tactic_refs[pending.tactic_idx];
+                    insert_stmt.execute(rusqlite::params![
+                        pending.row_num,
+                        tactic.id,
+                        tactic.name,
+                        pattern.technique_id,
+                        pattern.technique_name,
+                        pattern.pattern_id,
+                        pattern.keyword,
+                        scan_columns[pending.column_idx],
+                        pattern.score
+                    ])?;
+                }
+            }
+            tx.commit()?;
+
+            if rows_scanned >= next_progress_at {
                 on_progress(rows_scanned, total_rows, "scanning");
+                while next_progress_at <= rows_scanned {
+                    next_progress_at += PROGRESS_INTERVAL_ROWS;
+                }
             }
         }
+
+        // The generation check and replacement share one transaction. Readers see either the
+        // previous complete scan or this complete scan, never staged/partial rows.
+        let tx = conn.transaction()?;
+        let active_token: Option<String> = tx
+            .query_row(
+                "SELECT token FROM _intel_scan_build WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if active_token.as_deref() != Some(scan_token.as_str()) {
+            return Err(anyhow!(
+                "intel scan was superseded by a newer scan before publication"
+            ));
+        }
+        tx.execute("DELETE FROM _intel_match", [])?;
+        tx.execute("DELETE FROM _intel_scan_info", [])?;
+        tx.execute(
+            &format!(
+                "INSERT INTO _intel_match (
+                    row_num, tactic_id, tactic_name, technique_id, technique_name,
+                    pattern_id, keyword, column_name, score
+                 )
+                 SELECT row_num, tactic_id, tactic_name, technique_id, technique_name,
+                        pattern_id, keyword, column_name, score
+                 FROM {STAGING_TABLE}"
+            ),
+            [],
+        )?;
+        tx.execute(
+            "INSERT INTO _intel_scan_info (library_hash, role_hash, completed_at)
+             VALUES (?1, ?2, ?3)",
+            rusqlite::params![
+                compiled.library_hash,
+                role_hash,
+                chrono::Utc::now().to_rfc3339()
+            ],
+        )?;
+        tx.execute(
+            "DELETE FROM _intel_scan_build WHERE singleton = 1 AND token = ?1",
+            [&scan_token],
+        )?;
+        tx.commit()?;
+        Ok(())
+    })();
+
+    if let Err(error) = scan_result {
+        // Conditional cleanup cannot cancel a newer scan. A later upsert also makes restart
+        // safe if cleanup itself is interrupted or the process exits here.
+        let _ = conn.execute(
+            "DELETE FROM _intel_scan_build WHERE singleton = 1 AND token = ?1",
+            [&scan_token],
+        );
+        let _ = conn.execute_batch(&format!("DROP TABLE IF EXISTS {STAGING_TABLE}"));
+        return Err(error);
     }
 
-    tx.execute(
-        "INSERT INTO _intel_scan_info (library_hash, role_hash, completed_at) VALUES (?1, ?2, ?3)",
-        rusqlite::params![
-            compiled.library_hash,
-            role_hash,
-            chrono::Utc::now().to_rfc3339()
-        ],
-    )?;
-    tx.commit()?;
+    let _ = conn.execute_batch(&format!("DROP TABLE IF EXISTS {STAGING_TABLE}"));
 
     on_progress(rows_scanned, total_rows, "complete");
 
@@ -276,6 +376,48 @@ fn scan_with_compiled_library(
         tactics: finalize_counts(tactic_counts),
         techniques: finalize_counts(technique_counts),
     })
+}
+
+fn create_scan_staging_schema(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(&format!(
+        "CREATE TABLE IF NOT EXISTS _intel_scan_build (
+            singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+            token TEXT NOT NULL,
+            started_at TEXT NOT NULL
+         );
+         DROP TABLE IF EXISTS {STAGING_TABLE};
+         CREATE TEMP TABLE _intel_match_staging (
+            row_num INTEGER NOT NULL,
+            tactic_id TEXT NOT NULL,
+            tactic_name TEXT NOT NULL,
+            technique_id TEXT NOT NULL,
+            technique_name TEXT NOT NULL,
+            pattern_id TEXT NOT NULL,
+            keyword TEXT NOT NULL,
+            column_name TEXT NOT NULL,
+            score INTEGER NOT NULL
+         );"
+    ))
+}
+
+fn begin_scan(conn: &mut Connection) -> rusqlite::Result<String> {
+    let timestamp_nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let counter = SCAN_TOKEN_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let token = format!("{}-{timestamp_nanos}-{counter}", std::process::id());
+    let tx = conn.transaction()?;
+    tx.execute(
+        "INSERT INTO _intel_scan_build (singleton, token, started_at)
+         VALUES (1, ?1, ?2)
+         ON CONFLICT(singleton) DO UPDATE SET
+            token = excluded.token,
+            started_at = excluded.started_at",
+        rusqlite::params![token, chrono::Utc::now().to_rfc3339()],
+    )?;
+    tx.commit()?;
+    Ok(token)
 }
 
 fn validate_evidence_columns(
