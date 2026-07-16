@@ -4,7 +4,7 @@ use crate::intel::parser::{
     GuidedIntent, GuidedSort, RawFilterOp, RawSearchAlternative, RawSearchFilter, RawSearchSort,
     RawSortDirection,
 };
-use crate::intel::time::{classify_timestamp_text, TimestampValueKind};
+use crate::intel::time::{self, classify_timestamp_text, TimestampValueKind};
 use anyhow::{bail, Context, Result};
 use candle_core::quantized::gguf_file;
 use candle_core::{Device, Tensor};
@@ -240,10 +240,36 @@ impl LlmContext {
             });
         }
 
-        let normalized_time_available = table_has_rows(conn, "_row_time")?;
         let timeline_candidates = timestamp_candidates(conn, columns)?;
+        let selected_timeline_column =
+            selected_timeline_candidate(query_text, &timeline_candidates).and_then(|candidate| {
+                columns
+                    .iter()
+                    .find(|column| column.sql_name == candidate.column)
+            });
+        let normalized_time_available = if let Some(column) = selected_timeline_column {
+            time::row_time_is_bound_to(conn, columns, &column.sql_name)?
+        } else {
+            false
+        };
+        let date_convention_issue = if query_requests_timeline(query_text) {
+            selected_timeline_column
+                .map(|column| time::analyze_timestamp_column(conn, column))
+                .transpose()?
+                .and_then(|analysis| {
+                    analysis.needs_date_convention.then(|| {
+                        format!(
+                            "The '{}' timestamps contain ambiguous or mixed slash dates. Confirm month_first (MM/DD/YYYY) or day_first (DD/MM/YYYY) before building a timeline.",
+                            analysis.original_name
+                        )
+                    })
+                })
+        } else {
+            None
+        };
         let (recommended_timeline_column, timeline_issue) =
             resolve_timeline_context(query_text, &timeline_candidates, normalized_time_available);
+        let timeline_issue = date_convention_issue.or(timeline_issue);
         let dataset_identity = Some(dataset_identity(conn, columns)?);
 
         Ok(Self {
@@ -532,7 +558,7 @@ fn resolve_timeline_context(
     let explicit = candidates
         .iter()
         .find(|candidate| query_names_column(query_text, candidate));
-    let selected = explicit.or_else(|| candidates.first());
+    let selected = selected_timeline_candidate(query_text, candidates);
     let recommended = selected.map(|candidate| candidate.column.clone());
     if !query_requests_timeline(query_text) {
         return (recommended, None);
@@ -573,7 +599,26 @@ fn resolve_timeline_context(
             )),
         );
     }
+    if !normalized_time_available {
+        return (
+            Some(selected.column.clone()),
+            Some(format!(
+                "The '{}' timestamp column is not normalized for this import. Normalize it before building a timeline.",
+                selected.original_name
+            )),
+        );
+    }
     (Some(selected.column.clone()), None)
+}
+
+fn selected_timeline_candidate<'a>(
+    query_text: &str,
+    candidates: &'a [TimelineCandidate],
+) -> Option<&'a TimelineCandidate> {
+    candidates
+        .iter()
+        .find(|candidate| query_names_column(query_text, candidate))
+        .or_else(|| candidates.first())
 }
 
 fn query_names_column(query_text: &str, candidate: &TimelineCandidate) -> bool {
@@ -629,17 +674,6 @@ pub fn dataset_identity(conn: &Connection, columns: &[ColumnMeta]) -> Result<Dat
         schema_sha256: sha256_text(&schema_json),
         import_sha256: sha256_text(&import_json),
     })
-}
-
-fn table_has_rows(conn: &Connection, table: &str) -> Result<bool> {
-    if !table_exists(conn, table)? {
-        return Ok(false);
-    }
-    let sql = format!(
-        "SELECT EXISTS(SELECT 1 FROM {} LIMIT 1)",
-        db::quote_ident(table)
-    );
-    Ok(conn.query_row(&sql, [], |row| row.get::<_, i64>(0))? != 0)
 }
 
 fn table_exists(conn: &Connection, table: &str) -> rusqlite::Result<bool> {

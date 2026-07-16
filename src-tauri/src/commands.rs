@@ -597,15 +597,17 @@ pub async fn analyze_timestamp_column(
 pub async fn normalize_timestamp_column(
     state: State<'_, AppState>,
     naive_timezone: Option<String>,
+    date_convention: Option<String>,
 ) -> Result<time::TimestampNormalizationSummary, String> {
     let (db_path, columns, _) = state_snapshot(&state)?;
     tauri::async_runtime::spawn_blocking(
         move || -> Result<time::TimestampNormalizationSummary, String> {
             let mut conn = db::open(&db_path).map_err(|e| e.to_string())?;
-            time::normalize_confirmed_timestamp_column(
+            time::normalize_timestamp_column_with_options(
                 &mut conn,
                 &columns,
                 naive_timezone.as_deref(),
+                date_convention.as_deref(),
             )
             .map_err(|e| e.to_string())
         },
@@ -682,28 +684,34 @@ pub async fn export_guided_data(
         }
         let spec = guided_parser::query_spec_from_raw_intent(&intent, None, None)
             .map_err(|error| error.to_string())?;
-        let normalized_direction = guided_query::normalized_raw_sort_direction(&conn, &intent)
+        let normalized_sort = guided_query::normalized_raw_sort_direction(&conn, &columns, &intent)
             .map_err(|error| error.to_string())?;
         let on_progress = |rows_done: i64| {
             let _ = app_for_task.emit("export-progress", ExportProgressPayload { rows_done });
         };
-        let summary = match (format, normalized_direction) {
-            (ExportFormat::Csv, Some(direction)) => export::export_csv_normalized_time(
-                &conn,
-                &columns,
-                &spec,
-                direction,
-                &dest_for_task,
-                on_progress,
-            ),
-            (ExportFormat::Xlsx, Some(direction)) => export::export_xlsx_normalized_time(
-                &conn,
-                &columns,
-                &spec,
-                direction,
-                &dest_for_task,
-                on_progress,
-            ),
+        let summary = match (format, normalized_sort) {
+            (ExportFormat::Csv, Some((source_column, direction))) => {
+                export::export_csv_normalized_time(
+                    &conn,
+                    &columns,
+                    &spec,
+                    &source_column,
+                    direction,
+                    &dest_for_task,
+                    on_progress,
+                )
+            }
+            (ExportFormat::Xlsx, Some((source_column, direction))) => {
+                export::export_xlsx_normalized_time(
+                    &conn,
+                    &columns,
+                    &spec,
+                    &source_column,
+                    direction,
+                    &dest_for_task,
+                    on_progress,
+                )
+            }
             (ExportFormat::Csv, None) => {
                 export::export_csv(&conn, &columns, &spec, &dest_for_task, on_progress)
             }

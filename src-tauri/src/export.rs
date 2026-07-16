@@ -1,4 +1,5 @@
 use crate::db::ColumnMeta;
+use crate::intel::time;
 use crate::query::{self, QuerySpec};
 use anyhow::Result;
 use rusqlite::Connection;
@@ -7,6 +8,7 @@ use std::fs::File;
 use std::io::BufWriter;
 use std::path::Path;
 
+#[derive(Debug)]
 pub struct ExportSummary {
     pub row_count: i64,
 }
@@ -32,10 +34,13 @@ fn build_export_query(
 }
 
 fn build_normalized_time_export_query(
+    conn: &Connection,
     columns: &[ColumnMeta],
     spec: &QuerySpec,
+    source_column: &str,
     direction: query::SortDirection,
 ) -> Result<(String, query::Predicate)> {
+    time::require_row_time_binding(conn, columns, source_column)?;
     let predicate = query::build_predicate(columns, spec)?;
     let raw_columns = columns
         .iter()
@@ -51,8 +56,9 @@ fn build_normalized_time_export_query(
     let sql = format!(
         "SELECT {raw_columns}
          FROM (SELECT * FROM rows {where_sql}) raw
-         JOIN _row_time rt ON rt.row_num = raw.row_num
-         ORDER BY rt.epoch_ms {direction}, raw.row_num {direction}",
+         LEFT JOIN _row_time rt ON rt.row_num = raw.row_num
+         ORDER BY CASE WHEN rt.epoch_ms IS NULL THEN 1 ELSE 0 END ASC,
+                  rt.epoch_ms {direction}, raw.row_num {direction}",
         where_sql = predicate.where_sql,
     );
     Ok((sql, predicate))
@@ -98,11 +104,13 @@ pub fn export_csv_normalized_time(
     conn: &Connection,
     columns: &[ColumnMeta],
     spec: &QuerySpec,
+    source_column: &str,
     direction: query::SortDirection,
     dest_path: &Path,
     mut on_progress: impl FnMut(i64),
 ) -> Result<ExportSummary> {
-    let (sql, predicate) = build_normalized_time_export_query(columns, spec, direction)?;
+    let (sql, predicate) =
+        build_normalized_time_export_query(conn, columns, spec, source_column, direction)?;
 
     let file = File::create(dest_path)?;
     let mut writer = csv::Writer::from_writer(BufWriter::new(file));
@@ -183,11 +191,13 @@ pub fn export_xlsx_normalized_time(
     conn: &Connection,
     columns: &[ColumnMeta],
     spec: &QuerySpec,
+    source_column: &str,
     direction: query::SortDirection,
     dest_path: &Path,
     mut on_progress: impl FnMut(i64),
 ) -> Result<ExportSummary> {
-    let (sql, predicate) = build_normalized_time_export_query(columns, spec, direction)?;
+    let (sql, predicate) =
+        build_normalized_time_export_query(conn, columns, spec, source_column, direction)?;
     let mut workbook = Workbook::new();
     let worksheet = workbook.add_worksheet_with_constant_memory();
     for (column_index, column) in columns.iter().enumerate() {
@@ -380,7 +390,7 @@ mod tests {
 
     #[test]
     fn guided_csv_and_xlsx_follow_normalized_time_and_omit_ai_annotations() {
-        let conn = Connection::open_in_memory().unwrap();
+        let mut conn = Connection::open_in_memory().unwrap();
         let columns = vec![
             ColumnMeta {
                 sql_name: "event_time".into(),
@@ -400,28 +410,16 @@ mod tests {
             "INSERT INTO rows (row_num, event_time, event) VALUES
              (1, '2026-07-17T03:00:00+02:00', 'marker later'),
              (2, '2026-07-17T00:30:00Z', 'marker earlier'),
-             (3, '2026-07-17T04:00:00Z', 'unrelated')",
+             (3, 'not-a-time', 'marker invalid'),
+             (4, '', 'marker blank')",
             [],
         )
         .unwrap();
         db::populate_fts(&conn, &columns).unwrap();
-        db::create_row_time_table(&conn).unwrap();
-        for (row_num, epoch_ms) in [(1_i64, 200_i64), (2, 100), (3, 300)] {
-            conn.execute(
-                "INSERT INTO _row_time (row_num, epoch_ms, utc_text, source_text, parse_status)
-                 VALUES (?1, ?2, 'utc', 'source', 'explicit_offset')",
-                rusqlite::params![row_num, epoch_ms],
-            )
-            .unwrap();
-        }
+        time::normalize_timestamp_column_with_options(&mut conn, &columns, None, None).unwrap();
         let mut spec = empty_spec();
-        spec.expression = Some(query::QueryExpression::Or {
-            children: vec![
-                query::QueryExpression::Search {
-                    value: "marker".into(),
-                },
-                query::QueryExpression::RowIds { values: vec![3] },
-            ],
+        spec.expression = Some(query::QueryExpression::Search {
+            value: "marker".into(),
         });
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -439,12 +437,13 @@ mod tests {
             &conn,
             &columns,
             &spec,
+            "event_time",
             query::SortDirection::Asc,
             &csv_path,
             |_| {},
         )
         .unwrap();
-        assert_eq!(csv.row_count, 3);
+        assert_eq!(csv.row_count, 4);
         let csv_text = std::fs::read_to_string(&csv_path).unwrap();
         assert!(!csv_text.contains("__aiMatch"));
         let csv_rows = csv_text.lines().skip(1).collect::<Vec<_>>();
@@ -453,7 +452,8 @@ mod tests {
             vec![
                 "2026-07-17T00:30:00Z,marker earlier",
                 "2026-07-17T03:00:00+02:00,marker later",
-                "2026-07-17T04:00:00Z,unrelated"
+                "not-a-time,marker invalid",
+                ",marker blank"
             ]
         );
 
@@ -461,12 +461,13 @@ mod tests {
             &conn,
             &columns,
             &spec,
+            "event_time",
             query::SortDirection::Asc,
             &xlsx_path,
             |_| {},
         )
         .unwrap();
-        assert_eq!(xlsx.row_count, 3);
+        assert_eq!(xlsx.row_count, 4);
         let mut workbook = calamine::open_workbook_auto(&xlsx_path).unwrap();
         let sheet_name = workbook.sheet_names()[0].clone();
         let range = workbook.worksheet_range(&sheet_name).unwrap();
@@ -474,8 +475,49 @@ mod tests {
         assert!(rows[0].iter().all(|cell| cell.to_string() != "__aiMatch"));
         assert_eq!(rows[1][1].to_string(), "marker earlier");
         assert_eq!(rows[2][1].to_string(), "marker later");
-        assert_eq!(rows[3][1].to_string(), "unrelated");
+        assert_eq!(rows[3][1].to_string(), "marker invalid");
+        assert_eq!(rows[4][1].to_string(), "marker blank");
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn normalized_export_rejects_stale_binding() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        let columns = vec![ColumnMeta {
+            sql_name: "event_time".into(),
+            original_name: "Event Time".into(),
+            col_index: 0,
+            inferred_type: "timestamp".into(),
+        }];
+        db::create_schema(&conn, &columns).unwrap();
+        conn.execute(
+            "INSERT INTO rows (row_num, event_time) VALUES (1, '2026-07-17T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        time::normalize_timestamp_column_with_options(&mut conn, &columns, None, None).unwrap();
+        conn.execute(
+            "INSERT INTO rows (row_num, event_time) VALUES (2, '2026-07-17T01:00:00Z')",
+            [],
+        )
+        .unwrap();
+
+        let path = std::env::temp_dir().join(format!(
+            "log-parser-stale-export-{}.csv",
+            std::process::id()
+        ));
+        let error = export_csv_normalized_time(
+            &conn,
+            &columns,
+            &empty_spec(),
+            "event_time",
+            query::SortDirection::Asc,
+            &path,
+            |_| {},
+        )
+        .expect_err("changed imports must invalidate normalized export ordering");
+        assert!(error.to_string().contains("stale"));
+        let _ = std::fs::remove_file(path);
     }
 }

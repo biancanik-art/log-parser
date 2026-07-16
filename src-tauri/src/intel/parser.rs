@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 const CORRELATION_ENGINE_VERSION: &str = "matcher:v1;guided-grounding:v3";
-const RAW_QUERY_ENGINE_VERSION: &str = "raw-table-search:v1";
+const RAW_QUERY_ENGINE_VERSION: &str = "raw-table-search:v2";
 const MAX_GROUNDED_USER_CHARS: usize = 256;
 const MAX_USER_CANDIDATES: usize = 16;
 const MAX_RAW_USER_MATCHES: usize = 16;

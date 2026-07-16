@@ -2,7 +2,7 @@ use crate::db::{self, ColumnMeta};
 use crate::intel::parser::{
     self, GuidedIntent, GuidedSort, RawFilterOp, RawSearchAlternative, RawSortDirection,
 };
-use crate::intel::{library, matcher};
+use crate::intel::{library, matcher, time};
 use crate::query::{Cursor, QueryPage, SortDirection};
 use anyhow::{anyhow, bail, Result};
 use rusqlite::{Connection, OptionalExtension};
@@ -26,7 +26,7 @@ pub fn run_guided_query(
             GuidedIntent::RawEvidenceSearch {
                 sort: Some(sort),
                 ..
-            } if sort.normalized_time && row_time_has_data(conn)?
+            } if sort.normalized_time
         );
         let mut page = if normalized {
             query_raw_normalized_time(conn, columns, &intent, &spec)?
@@ -49,21 +49,24 @@ pub fn run_guided_query(
 
 pub fn normalized_raw_sort_direction(
     conn: &Connection,
+    columns: &[ColumnMeta],
     intent: &GuidedIntent,
-) -> Result<Option<SortDirection>> {
+) -> Result<Option<(String, SortDirection)>> {
     let GuidedIntent::RawEvidenceSearch {
         sort: Some(sort), ..
     } = intent
     else {
         return Ok(None);
     };
-    if !sort.normalized_time || !row_time_has_data(conn)? {
+    if !sort.normalized_time {
         return Ok(None);
     }
-    Ok(Some(match sort.direction {
+    time::require_row_time_binding(conn, columns, &sort.column)?;
+    let direction = match sort.direction {
         RawSortDirection::Asc => SortDirection::Asc,
         RawSortDirection::Desc => SortDirection::Desc,
-    }))
+    };
+    Ok(Some((sort.column.clone(), direction)))
 }
 
 fn query_raw_normalized_time(
@@ -84,6 +87,7 @@ fn query_raw_normalized_time(
     if !columns.iter().any(|column| column.sql_name == sort.column) {
         bail!("raw timeline references an unavailable timestamp column");
     }
+    time::require_row_time_binding(conn, columns, &sort.column)?;
     let predicate = crate::query::build_predicate(columns, spec)?;
     let limit = spec.limit.clamp(1, 5000);
     let direction = match sort.direction {
@@ -97,15 +101,24 @@ fn query_raw_normalized_time(
     let mut cursor_clause = String::new();
     let mut cursor_params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
     if let Some(cursor) = &spec.cursor {
-        let epoch_ms = cursor
-            .sort_value
-            .as_deref()
-            .ok_or_else(|| anyhow!("normalized timeline cursor is missing its timestamp"))?
-            .parse::<i64>()
-            .map_err(|_| anyhow!("normalized timeline cursor has an invalid timestamp"))?;
-        cursor_clause = format!("WHERE (rt.epoch_ms, raw.row_num) {cursor_operator} (?, ?)");
-        cursor_params.push(Box::new(epoch_ms));
-        cursor_params.push(Box::new(cursor.row_num));
+        if let Some(sort_value) = cursor.sort_value.as_deref() {
+            let epoch_ms = sort_value
+                .parse::<i64>()
+                .map_err(|_| anyhow!("normalized timeline cursor has an invalid timestamp"))?;
+            cursor_clause = format!(
+                "WHERE ((rt.epoch_ms IS NOT NULL AND \
+                 (rt.epoch_ms {cursor_operator} ? OR \
+                  (rt.epoch_ms = ? AND raw.row_num {cursor_operator} ?))) \
+                 OR rt.epoch_ms IS NULL)"
+            );
+            cursor_params.push(Box::new(epoch_ms));
+            cursor_params.push(Box::new(epoch_ms));
+            cursor_params.push(Box::new(cursor.row_num));
+        } else {
+            cursor_clause =
+                format!("WHERE rt.epoch_ms IS NULL AND raw.row_num {cursor_operator} ?");
+            cursor_params.push(Box::new(cursor.row_num));
+        }
     }
     let raw_columns = columns
         .iter()
@@ -116,9 +129,10 @@ fn query_raw_normalized_time(
     let sql = format!(
         "SELECT raw.row_num, {raw_columns}, rt.epoch_ms
          FROM (SELECT * FROM rows {predicate_where}) raw
-         JOIN _row_time rt ON rt.row_num = raw.row_num
+         LEFT JOIN _row_time rt ON rt.row_num = raw.row_num
          {cursor_clause}
-         ORDER BY rt.epoch_ms {direction}, raw.row_num {direction}
+         ORDER BY CASE WHEN rt.epoch_ms IS NULL THEN 1 ELSE 0 END ASC,
+                  rt.epoch_ms {direction}, raw.row_num {direction}
          LIMIT ?",
         predicate_where = predicate.where_sql,
     );
@@ -148,7 +162,7 @@ fn query_raw_normalized_time(
                 serde_json::json!(value.unwrap_or_default()),
             );
         }
-        let epoch_ms: i64 = row.get(columns.len() + 1)?;
+        let epoch_ms: Option<i64> = row.get(columns.len() + 1)?;
         fetched.push((row_num, epoch_ms, serde_json::Value::Object(object)));
     }
     let has_more = fetched.len() > limit as usize;
@@ -157,7 +171,7 @@ fn query_raw_normalized_time(
     }
     let next_cursor = if has_more {
         fetched.last().map(|(row_num, epoch_ms, _)| Cursor {
-            sort_value: Some(epoch_ms.to_string()),
+            sort_value: epoch_ms.map(|value| value.to_string()),
             row_num: *row_num,
         })
     } else {
@@ -879,8 +893,8 @@ mod tests {
     }
 
     #[test]
-    fn raw_timeline_uses_normalized_epoch_and_keyset_cursor() {
-        let conn = Connection::open_in_memory().unwrap();
+    fn raw_timeline_keeps_unparsed_rows_last_across_keyset_pages() {
+        let mut conn = Connection::open_in_memory().unwrap();
         let columns = vec![
             ColumnMeta {
                 sql_name: "event_time".into(),
@@ -899,20 +913,14 @@ mod tests {
         conn.execute(
             "INSERT INTO rows (row_num, event_time, event) VALUES
              (1, '2026-01-01T03:00:00+02:00', 'evidence marker'),
-             (2, '2025-12-31T23:30:00-01:00', 'evidence marker')",
+             (2, '2025-12-31T23:30:00-01:00', 'evidence marker'),
+             (3, 'not-a-time', 'evidence marker invalid'),
+             (4, '', 'evidence marker blank')",
             [],
         )
         .unwrap();
         db::populate_fts(&conn, &columns).unwrap();
-        db::create_row_time_table(&conn).unwrap();
-        for (row_num, epoch_ms) in [(1_i64, 200_i64), (2, 100)] {
-            conn.execute(
-                "INSERT INTO _row_time (row_num, epoch_ms, utc_text, source_text, parse_status)
-                 VALUES (?1, ?2, 'utc', 'source', 'explicit_offset')",
-                rusqlite::params![row_num, epoch_ms],
-            )
-            .unwrap();
-        }
+        time::normalize_timestamp_column_with_options(&mut conn, &columns, None, None).unwrap();
         let token = serde_json::to_string(&GuidedIntent::RawEvidenceSearch {
             alternatives: vec![RawSearchAlternative {
                 terms: vec!["evidence marker".into()],
@@ -930,5 +938,82 @@ mod tests {
         assert_eq!(first.rows[0]["row_num"], 2);
         let second = run_guided_query(&conn, &columns, &token, first.next_cursor, Some(1)).unwrap();
         assert_eq!(second.rows[0]["row_num"], 1);
+        let third = run_guided_query(&conn, &columns, &token, second.next_cursor, Some(1)).unwrap();
+        assert_eq!(third.rows[0]["row_num"], 3);
+        assert!(third.next_cursor.as_ref().unwrap().sort_value.is_none());
+        let fourth = run_guided_query(&conn, &columns, &token, third.next_cursor, Some(1)).unwrap();
+        assert_eq!(fourth.rows[0]["row_num"], 4);
+        assert!(!fourth.has_more);
+    }
+
+    #[test]
+    fn raw_timeline_rejects_wrong_column_and_stale_binding() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        let columns = vec![
+            ColumnMeta {
+                sql_name: "event_time".into(),
+                original_name: "Event Time".into(),
+                col_index: 0,
+                inferred_type: "timestamp".into(),
+            },
+            ColumnMeta {
+                sql_name: "ingest_time".into(),
+                original_name: "Ingest Time".into(),
+                col_index: 1,
+                inferred_type: "timestamp".into(),
+            },
+            ColumnMeta {
+                sql_name: "event".into(),
+                original_name: "Event".into(),
+                col_index: 2,
+                inferred_type: "text".into(),
+            },
+        ];
+        db::create_schema(&conn, &columns).unwrap();
+        db::create_column_roles_table(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO _column_roles (role, sql_name, confidence, status, reasons_json)
+             VALUES ('timestamp', 'event_time', 1.0, 'confirmed', '[]')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO rows (row_num, event_time, ingest_time, event)
+             VALUES (1, '2026-01-01T00:00:00Z', '2026-01-02T00:00:00Z', 'marker')",
+            [],
+        )
+        .unwrap();
+        db::populate_fts(&conn, &columns).unwrap();
+        time::normalize_timestamp_column_with_options(&mut conn, &columns, None, None).unwrap();
+
+        let token_for = |column: &str| {
+            serde_json::to_string(&GuidedIntent::RawEvidenceSearch {
+                alternatives: vec![RawSearchAlternative {
+                    terms: vec!["marker".into()],
+                    filters: vec![],
+                }],
+                sort: Some(RawSearchSort {
+                    column: column.into(),
+                    direction: RawSortDirection::Asc,
+                    normalized_time: true,
+                }),
+                semantic_row_ids: vec![],
+            })
+            .unwrap()
+        };
+
+        let wrong = run_guided_query(&conn, &columns, &token_for("ingest_time"), None, Some(10))
+            .unwrap_err();
+        assert!(wrong.to_string().contains("bound to column 'event_time'"));
+
+        conn.execute(
+            "INSERT INTO rows (row_num, event_time, ingest_time, event)
+             VALUES (2, '2026-01-03T00:00:00Z', '2026-01-04T00:00:00Z', 'marker')",
+            [],
+        )
+        .unwrap();
+        let stale = run_guided_query(&conn, &columns, &token_for("event_time"), None, Some(10))
+            .unwrap_err();
+        assert!(stale.to_string().contains("stale"));
     }
 }

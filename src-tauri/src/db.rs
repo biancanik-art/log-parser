@@ -186,7 +186,17 @@ pub fn create_row_time_table(conn: &Connection) -> rusqlite::Result<()> {
             source_text TEXT NOT NULL,
             parse_status TEXT NOT NULL
          );
-         CREATE INDEX IF NOT EXISTS idx_row_time_epoch ON _row_time(epoch_ms, row_num);",
+         CREATE INDEX IF NOT EXISTS idx_row_time_epoch ON _row_time(epoch_ms, row_num);
+         CREATE TABLE IF NOT EXISTS _row_time_info (
+            binding_version TEXT NOT NULL,
+            source_column TEXT NOT NULL,
+            schema_sha256 TEXT NOT NULL,
+            import_sha256 TEXT NOT NULL,
+            row_count INTEGER NOT NULL,
+            date_convention TEXT,
+            timezone_applied TEXT,
+            completed_at TEXT NOT NULL
+         );",
     )
 }
 

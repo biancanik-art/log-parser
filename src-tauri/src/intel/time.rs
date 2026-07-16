@@ -5,7 +5,10 @@ use chrono::{
 };
 use chrono_tz::Tz;
 use rusqlite::{Connection, OptionalExtension};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+const ROW_TIME_BINDING_VERSION: &str = "row-time-v2";
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum TimestampValueKind {
@@ -28,8 +31,11 @@ pub struct TimestampAnalysis {
     pub blank_count: i64,
     pub invalid_count: i64,
     pub needs_timezone: bool,
+    pub needs_date_convention: bool,
+    pub inferred_date_convention: Option<String>,
     pub sample_naive_values: Vec<String>,
     pub sample_invalid_values: Vec<String>,
+    pub sample_ambiguous_date_values: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -45,6 +51,33 @@ pub struct TimestampNormalizationSummary {
     pub blank_count: i64,
     pub invalid_count: i64,
     pub timezone_applied: Option<String>,
+    pub date_convention_applied: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DateConvention {
+    MonthFirst,
+    DayFirst,
+}
+
+impl DateConvention {
+    fn from_answer(value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "month_first" | "monthfirst" | "mdy" | "us" => Ok(Self::MonthFirst),
+            "day_first" | "dayfirst" | "dmy" | "eu" => Ok(Self::DayFirst),
+            _ => {
+                bail!("date convention must be month_first (MM/DD/YYYY) or day_first (DD/MM/YYYY)")
+            }
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::MonthFirst => "month_first",
+            Self::DayFirst => "day_first",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -54,6 +87,7 @@ enum ParsedTimestamp {
         parse_status: &'static str,
     },
     Naive(NaiveDateTime),
+    AmbiguousDate,
     Blank,
     Invalid,
 }
@@ -125,13 +159,13 @@ impl TimezoneResolver {
 }
 
 pub fn classify_timestamp_text(value: &str) -> TimestampValueKind {
-    match parse_timestamp(value) {
+    match parse_timestamp(value, None) {
         ParsedTimestamp::Absolute {
             parse_status: "epoch",
             ..
         } => TimestampValueKind::Epoch,
         ParsedTimestamp::Absolute { .. } => TimestampValueKind::ExplicitOffset,
-        ParsedTimestamp::Naive(_) => TimestampValueKind::Naive,
+        ParsedTimestamp::Naive(_) | ParsedTimestamp::AmbiguousDate => TimestampValueKind::Naive,
         ParsedTimestamp::Blank => TimestampValueKind::Blank,
         ParsedTimestamp::Invalid => TimestampValueKind::Invalid,
     }
@@ -142,16 +176,29 @@ pub fn analyze_confirmed_timestamp_column(
     columns: &[ColumnMeta],
 ) -> Result<TimestampAnalysis> {
     let column = resolved_timestamp_column(conn, columns)?;
+    analyze_timestamp_column(conn, &column)
+}
+
+pub fn analyze_timestamp_column(
+    conn: &Connection,
+    column: &ColumnMeta,
+) -> Result<TimestampAnalysis> {
+    let date_analysis = analyze_date_convention(conn, &column.sql_name)?;
     let mut counts = TimestampCounts::default();
 
-    scan_timestamp_column(conn, &column.sql_name, |_, source_text, parsed| {
-        counts.record(&source_text, &parsed);
-        Ok(())
-    })?;
+    scan_timestamp_column(
+        conn,
+        &column.sql_name,
+        date_analysis.inferred,
+        |_, source_text, parsed| {
+            counts.record(&source_text, &parsed);
+            Ok(())
+        },
+    )?;
 
     Ok(TimestampAnalysis {
-        timestamp_column: column.sql_name,
-        original_name: column.original_name,
+        timestamp_column: column.sql_name.clone(),
+        original_name: column.original_name.clone(),
         total_rows: counts.total_rows,
         explicit_count: counts.explicit_count,
         epoch_count: counts.epoch_count,
@@ -159,8 +206,14 @@ pub fn analyze_confirmed_timestamp_column(
         blank_count: counts.blank_count,
         invalid_count: counts.invalid_count,
         needs_timezone: counts.naive_count > 0,
+        needs_date_convention: date_analysis.conflicting
+            || (!date_analysis.ambiguous_samples.is_empty() && date_analysis.inferred.is_none()),
+        inferred_date_convention: date_analysis
+            .inferred
+            .map(|convention| convention.label().to_string()),
         sample_naive_values: counts.sample_naive_values,
         sample_invalid_values: counts.sample_invalid_values,
+        sample_ambiguous_date_values: date_analysis.ambiguous_samples,
     })
 }
 
@@ -169,7 +222,43 @@ pub fn normalize_confirmed_timestamp_column(
     columns: &[ColumnMeta],
     naive_timezone: Option<&str>,
 ) -> Result<TimestampNormalizationSummary> {
+    normalize_timestamp_column_with_options(conn, columns, naive_timezone, None)
+}
+
+pub fn normalize_timestamp_column_with_options(
+    conn: &mut Connection,
+    columns: &[ColumnMeta],
+    naive_timezone: Option<&str>,
+    date_convention: Option<&str>,
+) -> Result<TimestampNormalizationSummary> {
     let column = resolved_timestamp_column(conn, columns)?;
+    let date_analysis = analyze_date_convention(conn, &column.sql_name)?;
+    if date_analysis.conflicting {
+        bail!(
+            "timestamp column mixes unambiguous MM/DD/YYYY and DD/MM/YYYY values; separate or correct the source data before normalization"
+        );
+    }
+    let supplied_convention = date_convention
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(DateConvention::from_answer)
+        .transpose()?;
+    if let (Some(supplied), Some(inferred)) = (supplied_convention, date_analysis.inferred) {
+        if supplied != inferred {
+            bail!(
+                "date convention '{}' contradicts unambiguous source values indicating '{}'",
+                supplied.label(),
+                inferred.label()
+            );
+        }
+    }
+    let resolved_date_convention = supplied_convention.or(date_analysis.inferred);
+    if !date_analysis.ambiguous_samples.is_empty() && resolved_date_convention.is_none() {
+        bail!(
+            "timestamp column contains ambiguous slash dates such as '{}'; supply date_convention month_first or day_first in addition to any timezone",
+            date_analysis.ambiguous_samples[0]
+        );
+    }
     let resolver = naive_timezone
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -179,27 +268,35 @@ pub fn normalize_confirmed_timestamp_column(
     let mut counts = TimestampCounts::default();
     let mut rows_to_write = Vec::new();
 
-    scan_timestamp_column(conn, &column.sql_name, |row_num, source_text, parsed| {
-        counts.record(&source_text, &parsed);
-        match parsed {
-            ParsedTimestamp::Absolute { utc, parse_status } => {
-                rows_to_write.push(row_time_record(row_num, utc, &source_text, parse_status));
-            }
-            ParsedTimestamp::Naive(naive) => {
-                if let Some(resolver) = resolver.as_ref() {
-                    let utc = resolver.apply(naive, &source_text, row_num)?;
-                    rows_to_write.push(row_time_record(
-                        row_num,
-                        utc,
-                        &source_text,
-                        resolver.parse_status(),
-                    ));
+    scan_timestamp_column(
+        conn,
+        &column.sql_name,
+        resolved_date_convention,
+        |row_num, source_text, parsed| {
+            counts.record(&source_text, &parsed);
+            match parsed {
+                ParsedTimestamp::Absolute { utc, parse_status } => {
+                    rows_to_write.push(row_time_record(row_num, utc, &source_text, parse_status));
                 }
+                ParsedTimestamp::Naive(naive) => {
+                    if let Some(resolver) = resolver.as_ref() {
+                        let utc = resolver.apply(naive, &source_text, row_num)?;
+                        rows_to_write.push(row_time_record(
+                            row_num,
+                            utc,
+                            &source_text,
+                            resolver.parse_status(),
+                        ));
+                    }
+                }
+                ParsedTimestamp::AmbiguousDate => {
+                    bail!("ambiguous slash date escaped date-convention validation")
+                }
+                ParsedTimestamp::Blank | ParsedTimestamp::Invalid => {}
             }
-            ParsedTimestamp::Blank | ParsedTimestamp::Invalid => {}
-        }
-        Ok(())
-    })?;
+            Ok(())
+        },
+    )?;
 
     if counts.naive_count > 0 && resolver.is_none() {
         bail!(
@@ -209,8 +306,10 @@ pub fn normalize_confirmed_timestamp_column(
     }
 
     db::create_row_time_table(conn)?;
+    let binding = current_binding_values(conn, columns)?;
     let tx = conn.transaction()?;
     tx.execute("DELETE FROM _row_time", [])?;
+    tx.execute("DELETE FROM _row_time_info", [])?;
     {
         let mut stmt = tx.prepare(
             "INSERT INTO _row_time (row_num, epoch_ms, utc_text, source_text, parse_status)
@@ -226,6 +325,22 @@ pub fn normalize_confirmed_timestamp_column(
             ])?;
         }
     }
+    tx.execute(
+        "INSERT INTO _row_time_info (
+            binding_version, source_column, schema_sha256, import_sha256, row_count,
+            date_convention, timezone_applied, completed_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        rusqlite::params![
+            ROW_TIME_BINDING_VERSION,
+            column.sql_name,
+            binding.schema_sha256,
+            binding.import_sha256,
+            binding.row_count,
+            resolved_date_convention.map(DateConvention::label),
+            resolver.as_ref().map(TimezoneResolver::label),
+            chrono::Utc::now().to_rfc3339(),
+        ],
+    )?;
     tx.commit()?;
 
     Ok(TimestampNormalizationSummary {
@@ -239,6 +354,8 @@ pub fn normalize_confirmed_timestamp_column(
         blank_count: counts.blank_count,
         invalid_count: counts.invalid_count,
         timezone_applied: resolver.map(|resolver| resolver.label().to_string()),
+        date_convention_applied: resolved_date_convention
+            .map(|convention| convention.label().to_string()),
     })
 }
 
@@ -263,7 +380,7 @@ impl TimestampCounts {
                 ..
             } => self.epoch_count += 1,
             ParsedTimestamp::Absolute { .. } => self.explicit_count += 1,
-            ParsedTimestamp::Naive(_) => {
+            ParsedTimestamp::Naive(_) | ParsedTimestamp::AmbiguousDate => {
                 self.naive_count += 1;
                 push_sample(&mut self.sample_naive_values, source_text);
             }
@@ -297,6 +414,181 @@ fn row_time_record(
         utc_text: utc.to_rfc3339_opts(SecondsFormat::AutoSi, true),
         source_text: source_text.to_string(),
         parse_status,
+    }
+}
+
+#[derive(Debug)]
+struct BindingValues {
+    schema_sha256: String,
+    import_sha256: String,
+    row_count: i64,
+}
+
+#[derive(Debug)]
+struct StoredBinding {
+    binding_version: String,
+    source_column: String,
+    schema_sha256: String,
+    import_sha256: String,
+    row_count: i64,
+}
+
+pub fn row_time_is_bound_to(
+    conn: &Connection,
+    columns: &[ColumnMeta],
+    source_column: &str,
+) -> Result<bool> {
+    let Some(stored) = load_row_time_binding(conn)? else {
+        return Ok(false);
+    };
+    let current = current_binding_values(conn, columns)?;
+    Ok(stored.binding_version == ROW_TIME_BINDING_VERSION
+        && stored.source_column == source_column
+        && stored.schema_sha256 == current.schema_sha256
+        && stored.import_sha256 == current.import_sha256
+        && stored.row_count == current.row_count)
+}
+
+pub fn require_row_time_binding(
+    conn: &Connection,
+    columns: &[ColumnMeta],
+    source_column: &str,
+) -> Result<()> {
+    let Some(stored) = load_row_time_binding(conn)? else {
+        bail!(
+            "normalized timeline metadata is missing; normalize timestamp column '{source_column}' for this import"
+        );
+    };
+    if stored.binding_version != ROW_TIME_BINDING_VERSION {
+        bail!("timestamp normalization was created by an older unbound format; normalize it again");
+    }
+    if stored.source_column != source_column {
+        bail!(
+            "timestamp normalization is bound to column '{}', not '{}'; normalize the selected timeline column",
+            stored.source_column,
+            source_column
+        );
+    }
+    let current = current_binding_values(conn, columns)?;
+    if stored.schema_sha256 != current.schema_sha256
+        || stored.import_sha256 != current.import_sha256
+        || stored.row_count != current.row_count
+    {
+        bail!("timestamp normalization is stale for the current import; normalize it again");
+    }
+    Ok(())
+}
+
+fn load_row_time_binding(conn: &Connection) -> Result<Option<StoredBinding>> {
+    if !table_exists(conn, "_row_time")? || !table_exists(conn, "_row_time_info")? {
+        return Ok(None);
+    }
+    conn.query_row(
+        "SELECT binding_version, source_column, schema_sha256, import_sha256, row_count
+         FROM _row_time_info ORDER BY rowid DESC LIMIT 1",
+        [],
+        |row| {
+            Ok(StoredBinding {
+                binding_version: row.get(0)?,
+                source_column: row.get(1)?,
+                schema_sha256: row.get(2)?,
+                import_sha256: row.get(3)?,
+                row_count: row.get(4)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+fn current_binding_values(conn: &Connection, columns: &[ColumnMeta]) -> Result<BindingValues> {
+    let schema_json = serde_json::to_string(columns)?;
+    let import_info = db::load_import_info(conn).optional()?;
+    let import_json = serde_json::to_string(&import_info)?;
+    let row_count = conn.query_row("SELECT COUNT(*) FROM rows", [], |row| row.get(0))?;
+    Ok(BindingValues {
+        schema_sha256: sha256_text(&schema_json),
+        import_sha256: sha256_text(&import_json),
+        row_count,
+    })
+}
+
+fn sha256_text(value: &str) -> String {
+    Sha256::digest(value.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+#[derive(Debug, Default)]
+struct DateConventionAnalysis {
+    inferred: Option<DateConvention>,
+    conflicting: bool,
+    ambiguous_samples: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum SlashDateEvidence {
+    MonthFirst,
+    DayFirst,
+    Ambiguous,
+}
+
+fn analyze_date_convention(conn: &Connection, sql_name: &str) -> Result<DateConventionAnalysis> {
+    let ident = db::quote_ident(sql_name);
+    let sql = format!("SELECT {ident} FROM rows ORDER BY row_num ASC");
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query([])?;
+    let mut month_first = false;
+    let mut day_first = false;
+    let mut ambiguous_samples = Vec::new();
+    while let Some(row) = rows.next()? {
+        let value: Option<String> = row.get(0)?;
+        let Some(value) = value else { continue };
+        match slash_date_evidence(&value) {
+            Some(SlashDateEvidence::MonthFirst) => month_first = true,
+            Some(SlashDateEvidence::DayFirst) => day_first = true,
+            Some(SlashDateEvidence::Ambiguous) => push_sample(&mut ambiguous_samples, &value),
+            None => {}
+        }
+    }
+    let conflicting = month_first && day_first;
+    let inferred = if conflicting {
+        None
+    } else if month_first {
+        Some(DateConvention::MonthFirst)
+    } else if day_first {
+        Some(DateConvention::DayFirst)
+    } else {
+        None
+    };
+    Ok(DateConventionAnalysis {
+        inferred,
+        conflicting,
+        ambiguous_samples,
+    })
+}
+
+fn slash_date_evidence(value: &str) -> Option<SlashDateEvidence> {
+    let date = value
+        .trim()
+        .split(|character: char| character.is_whitespace() || character == 'T')
+        .next()?;
+    let parts = date.split('/').collect::<Vec<_>>();
+    if parts.len() != 3 || parts[2].len() != 4 {
+        return None;
+    }
+    let first = parts[0].parse::<u32>().ok()?;
+    let second = parts[1].parse::<u32>().ok()?;
+    let year = parts[2].parse::<u32>().ok()?;
+    if year < 1000 || first == 0 || second == 0 || first > 31 || second > 31 {
+        return None;
+    }
+    match (first <= 12, second <= 12) {
+        (true, true) => Some(SlashDateEvidence::Ambiguous),
+        (true, false) => Some(SlashDateEvidence::MonthFirst),
+        (false, true) => Some(SlashDateEvidence::DayFirst),
+        (false, false) => None,
     }
 }
 
@@ -346,6 +638,7 @@ fn resolved_timestamp_column(conn: &Connection, columns: &[ColumnMeta]) -> Resul
 fn scan_timestamp_column(
     conn: &Connection,
     sql_name: &str,
+    date_convention: Option<DateConvention>,
     mut on_row: impl FnMut(i64, String, ParsedTimestamp) -> Result<()>,
 ) -> Result<()> {
     let ident = db::quote_ident(sql_name);
@@ -356,13 +649,13 @@ fn scan_timestamp_column(
         let row_num: i64 = row.get(0)?;
         let source_text: Option<String> = row.get(1)?;
         let source_text = source_text.unwrap_or_default();
-        let parsed = parse_timestamp(&source_text);
+        let parsed = parse_timestamp(&source_text, date_convention);
         on_row(row_num, source_text, parsed)?;
     }
     Ok(())
 }
 
-fn parse_timestamp(value: &str) -> ParsedTimestamp {
+fn parse_timestamp(value: &str, date_convention: Option<DateConvention>) -> ParsedTimestamp {
     let trimmed = value.trim();
     if trimmed.is_empty() {
         return ParsedTimestamp::Blank;
@@ -379,7 +672,12 @@ fn parse_timestamp(value: &str) -> ParsedTimestamp {
             parse_status: "explicit_offset",
         };
     }
-    if let Some(naive) = parse_naive(trimmed) {
+    if slash_date_evidence(trimmed) == Some(SlashDateEvidence::Ambiguous)
+        && date_convention.is_none()
+    {
+        return ParsedTimestamp::AmbiguousDate;
+    }
+    if let Some(naive) = parse_naive(trimmed, date_convention) {
         return ParsedTimestamp::Naive(naive);
     }
     ParsedTimestamp::Invalid
@@ -409,7 +707,7 @@ fn parse_explicit_offset(value: &str) -> Option<DateTime<Utc>> {
 
     if value.ends_with('Z') || value.ends_with('z') {
         let without_z = &value[..value.len() - 1];
-        if let Some(naive) = parse_naive(without_z.trim_end()) {
+        if let Some(naive) = parse_naive(without_z.trim_end(), None) {
             return Some(Utc.from_utc_datetime(&naive));
         }
     }
@@ -431,18 +729,14 @@ fn parse_explicit_offset(value: &str) -> Option<DateTime<Utc>> {
     })
 }
 
-fn parse_naive(value: &str) -> Option<NaiveDateTime> {
+fn parse_naive(value: &str, date_convention: Option<DateConvention>) -> Option<NaiveDateTime> {
     const DATETIME_FORMATS: &[&str] = &[
         "%Y-%m-%dT%H:%M:%S%.f",
         "%Y-%m-%d %H:%M:%S%.f",
         "%Y/%m/%d %H:%M:%S%.f",
-        "%m/%d/%Y %H:%M:%S%.f",
-        "%d/%m/%Y %H:%M:%S%.f",
         "%Y-%m-%dT%H:%M",
         "%Y-%m-%d %H:%M",
         "%Y/%m/%d %H:%M",
-        "%m/%d/%Y %H:%M",
-        "%d/%m/%Y %H:%M",
     ];
     if let Some(parsed) = DATETIME_FORMATS
         .iter()
@@ -451,12 +745,32 @@ fn parse_naive(value: &str) -> Option<NaiveDateTime> {
         return Some(parsed);
     }
 
-    const DATE_FORMATS: &[&str] = &["%Y-%m-%d", "%Y/%m/%d", "%m/%d/%Y", "%d/%m/%Y"];
-    DATE_FORMATS.iter().find_map(|format| {
+    const DATE_FORMATS: &[&str] = &["%Y-%m-%d", "%Y/%m/%d"];
+    if let Some(parsed) = DATE_FORMATS.iter().find_map(|format| {
         NaiveDate::parse_from_str(value, format)
             .ok()
             .and_then(|date| date.and_hms_opt(0, 0, 0))
-    })
+    }) {
+        return Some(parsed);
+    }
+
+    let convention = date_convention.or_else(|| match slash_date_evidence(value) {
+        Some(SlashDateEvidence::MonthFirst) => Some(DateConvention::MonthFirst),
+        Some(SlashDateEvidence::DayFirst) => Some(DateConvention::DayFirst),
+        Some(SlashDateEvidence::Ambiguous) | None => None,
+    })?;
+    let (datetime_formats, date_format): (&[&str], &str) = match convention {
+        DateConvention::MonthFirst => (&["%m/%d/%Y %H:%M:%S%.f", "%m/%d/%Y %H:%M"], "%m/%d/%Y"),
+        DateConvention::DayFirst => (&["%d/%m/%Y %H:%M:%S%.f", "%d/%m/%Y %H:%M"], "%d/%m/%Y"),
+    };
+    datetime_formats
+        .iter()
+        .find_map(|format| NaiveDateTime::parse_from_str(value, format).ok())
+        .or_else(|| {
+            NaiveDate::parse_from_str(value, date_format)
+                .ok()
+                .and_then(|date| date.and_hms_opt(0, 0, 0))
+        })
 }
 
 fn parse_fixed_offset(value: &str) -> Option<FixedOffset> {
@@ -514,6 +828,15 @@ fn push_sample(samples: &mut Vec<String>, value: &str) {
     if samples.len() < 5 {
         samples.push(value.to_string());
     }
+}
+
+fn table_exists(conn: &Connection, table: &str) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+        [table],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|value| value != 0)
 }
 
 #[cfg(test)]
@@ -649,5 +972,130 @@ mod tests {
             .unwrap()
             .timestamp_millis();
         assert_eq!(epoch_ms, expected);
+    }
+
+    #[test]
+    fn infers_month_first_from_unambiguous_us_values() {
+        let (mut conn, columns) = setup_with_timestamp(&["03/14/2026 01:00", "03/04/2026 02:00"]);
+
+        let analysis = analyze_confirmed_timestamp_column(&conn, &columns).unwrap();
+        assert_eq!(
+            analysis.inferred_date_convention.as_deref(),
+            Some("month_first")
+        );
+        assert!(!analysis.needs_date_convention);
+        let summary =
+            normalize_timestamp_column_with_options(&mut conn, &columns, Some("UTC"), None)
+                .unwrap();
+        assert_eq!(
+            summary.date_convention_applied.as_deref(),
+            Some("month_first")
+        );
+        let utc_text: String = conn
+            .query_row(
+                "SELECT utc_text FROM _row_time WHERE row_num = 2",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(utc_text, "2026-03-04T02:00:00Z");
+        let stored: String = conn
+            .query_row("SELECT date_convention FROM _row_time_info", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(stored, "month_first");
+    }
+
+    #[test]
+    fn infers_day_first_from_unambiguous_european_values() {
+        let (mut conn, columns) = setup_with_timestamp(&["14/03/2026 01:00", "03/04/2026 02:00"]);
+
+        let analysis = analyze_confirmed_timestamp_column(&conn, &columns).unwrap();
+        assert_eq!(
+            analysis.inferred_date_convention.as_deref(),
+            Some("day_first")
+        );
+        assert!(!analysis.needs_date_convention);
+        normalize_timestamp_column_with_options(&mut conn, &columns, Some("UTC"), None).unwrap();
+        let utc_text: String = conn
+            .query_row(
+                "SELECT utc_text FROM _row_time WHERE row_num = 2",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(utc_text, "2026-04-03T02:00:00Z");
+    }
+
+    #[test]
+    fn ambiguous_slash_date_requires_convention_even_with_timezone() {
+        let (mut conn, columns) = setup_with_timestamp(&["03/04/2026 02:00"]);
+
+        let analysis = analyze_confirmed_timestamp_column(&conn, &columns).unwrap();
+        assert!(analysis.needs_date_convention);
+        assert!(analysis.needs_timezone);
+        let error = normalize_timestamp_column_with_options(&mut conn, &columns, Some("UTC"), None)
+            .expect_err("timezone must not silently choose the date order");
+        assert!(error.to_string().contains("date_convention"));
+
+        let summary = normalize_timestamp_column_with_options(
+            &mut conn,
+            &columns,
+            Some("UTC"),
+            Some("month_first"),
+        )
+        .unwrap();
+        assert_eq!(
+            summary.date_convention_applied.as_deref(),
+            Some("month_first")
+        );
+    }
+
+    #[test]
+    fn mixed_unambiguous_slash_conventions_are_rejected() {
+        let (mut conn, columns) = setup_with_timestamp(&["03/14/2026 01:00", "14/03/2026 01:00"]);
+
+        let analysis = analyze_confirmed_timestamp_column(&conn, &columns).unwrap();
+        assert!(analysis.needs_date_convention);
+        let error = normalize_timestamp_column_with_options(
+            &mut conn,
+            &columns,
+            Some("UTC"),
+            Some("month_first"),
+        )
+        .expect_err("conflicting source conventions cannot be normalized safely");
+        assert!(error.to_string().contains("mixes unambiguous"));
+    }
+
+    #[test]
+    fn row_time_binding_detects_wrong_column_stale_rows_and_old_tables() {
+        let (mut conn, columns) = setup_with_timestamp(&["2026-01-01T00:00:00Z"]);
+        normalize_confirmed_timestamp_column(&mut conn, &columns, None).unwrap();
+        assert!(row_time_is_bound_to(&conn, &columns, "timegenerated").unwrap());
+        assert!(!row_time_is_bound_to(&conn, &columns, "account").unwrap());
+        let wrong = require_row_time_binding(&conn, &columns, "account").unwrap_err();
+        assert!(wrong
+            .to_string()
+            .contains("bound to column 'timegenerated'"));
+
+        conn.execute(
+            "INSERT INTO rows (row_num, timegenerated, account)
+             VALUES (2, '2026-01-02T00:00:00Z', 'alice')",
+            [],
+        )
+        .unwrap();
+        assert!(!row_time_is_bound_to(&conn, &columns, "timegenerated").unwrap());
+        assert!(require_row_time_binding(&conn, &columns, "timegenerated")
+            .unwrap_err()
+            .to_string()
+            .contains("stale"));
+
+        conn.execute("DELETE FROM _row_time_info", []).unwrap();
+        assert!(!row_time_is_bound_to(&conn, &columns, "timegenerated").unwrap());
+        assert!(require_row_time_binding(&conn, &columns, "timegenerated")
+            .unwrap_err()
+            .to_string()
+            .contains("metadata is missing"));
     }
 }
