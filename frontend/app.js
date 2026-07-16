@@ -124,7 +124,17 @@
   let automaticTimestampSqlName = null;
   let timestampOperationSequence = 0;
   let activeTimestampOperation = null;
-  let semanticIndexState = { status: "idle", rowsIndexed: 0, summary: null, error: null };
+  let semanticIndexState = {
+    status: "idle",
+    phase: null,
+    buildId: null,
+    rowsIndexed: 0,
+    documentsEmbedded: 0,
+    mappingsWritten: 0,
+    resumedFromRow: 0,
+    summary: null,
+    error: null,
+  };
   let semanticIndexRequestSequence = 0;
   let activeSemanticIndexRequest = null;
   let intelScanInFlight = false;
@@ -289,7 +299,17 @@
     automaticTimestampSqlName = null;
     activeTimestampOperation = null;
     activeSemanticIndexRequest = null;
-    semanticIndexState = { status: "idle", rowsIndexed: 0, summary: null, error: null };
+    semanticIndexState = {
+      status: "idle",
+      phase: null,
+      buildId: null,
+      rowsIndexed: 0,
+      documentsEmbedded: 0,
+      mappingsWritten: 0,
+      resumedFromRow: 0,
+      summary: null,
+      error: null,
+    };
     semanticIndexStatus.className = "semantic-index-status";
     semanticIndexStatus.textContent = "Semantic matching starts automatically after import.";
     intelScanInFlight = false;
@@ -701,6 +721,16 @@
         // Row IDs are only accepted by copying a trusted backend-built QuerySpec. They are
         // never derived from the request text or synthesized in the frontend.
         return { type: "rowIds", values: [...expression.values] };
+      case "semanticSelection":
+        if (
+          typeof expression.selectionId !== "string" ||
+          !/^[0-9a-fA-F]{64}$/.test(expression.selectionId)
+        ) {
+          throw new Error("AI search plan contains an invalid semantic selection");
+        }
+        // Selection IDs are opaque backend capabilities. SQLite revalidates the current
+        // dataset/build before every page, count, timeline, and export.
+        return { type: "semanticSelection", selectionId: expression.selectionId };
       default:
         throw new Error("AI search plan contains an unknown expression type");
     }
@@ -777,8 +807,17 @@
     guidedRunBtn.textContent = "Search evidence";
     guidedQueryPanel.classList.remove("hidden");
     const previewLines = [result.previewText || "No search plan was returned."];
-    if (guidedMatchExplanation.length > 0) {
-      previewLines.push("", "Why rows will match:", ...guidedMatchExplanation.map((item) => `\u2022 ${item}`));
+    const searchNotes = guidedMatchExplanation.filter((item) =>
+      ["Semantic document candidates", "Semantic expansion matched", "Semantic selection retained"].some(
+        (prefix) => item.startsWith(prefix)
+      )
+    );
+    const matchRules = guidedMatchExplanation.filter((item) => !searchNotes.includes(item));
+    if (matchRules.length > 0) {
+      previewLines.push("", "Why rows will match:", ...matchRules.map((item) => `\u2022 ${item}`));
+    }
+    if (searchNotes.length > 0) {
+      previewLines.push("", "Semantic search notes:", ...searchNotes.map((item) => `\u2022 ${item}`));
     }
     guidedPreviewText.textContent = previewLines.join("\n");
 
@@ -1114,12 +1153,31 @@
   function renderSemanticIndexState() {
     semanticIndexStatus.className = `semantic-index-status ${semanticIndexState.status}`;
     if (semanticIndexState.status === "ready") {
-      semanticIndexStatus.textContent = `Semantic matching ready (${semanticIndexState.rowsIndexed.toLocaleString()} rows indexed).`;
-    } else if (semanticIndexState.status === "building") {
-      const progress = semanticIndexState.rowsIndexed
-        ? ` ${semanticIndexState.rowsIndexed.toLocaleString()} rows processed.`
+      const documentCount = semanticIndexState.summary?.documentsIndexed;
+      const documentDetail = Number.isFinite(documentCount)
+        ? ` from ${documentCount.toLocaleString()} deduplicated document${documentCount === 1 ? "" : "s"}`
         : "";
-      semanticIndexStatus.textContent = `Semantic matching is building in the background.${progress} Exact and structured AI search are ready now.`;
+      semanticIndexStatus.textContent = `Semantic matching ready (${semanticIndexState.rowsIndexed.toLocaleString()} raw rows mapped${documentDetail}).`;
+    } else if (semanticIndexState.status === "building") {
+      if (semanticIndexState.phase === "loadingModel") {
+        semanticIndexStatus.textContent = "Loading the local semantic model. Exact and structured AI search are ready now.";
+      } else {
+        const progressParts = [];
+        if (semanticIndexState.rowsIndexed) {
+          progressParts.push(`${semanticIndexState.rowsIndexed.toLocaleString()} raw rows processed`);
+        }
+        if (semanticIndexState.documentsEmbedded) {
+          progressParts.push(`${semanticIndexState.documentsEmbedded.toLocaleString()} documents embedded`);
+        }
+        if (semanticIndexState.mappingsWritten) {
+          progressParts.push(`${semanticIndexState.mappingsWritten.toLocaleString()} row mappings saved`);
+        }
+        const progress = progressParts.length ? ` ${progressParts.join("; ")}.` : "";
+        const resumed = semanticIndexState.resumedFromRow
+          ? ` Resumed after row ${semanticIndexState.resumedFromRow.toLocaleString()}.`
+          : "";
+        semanticIndexStatus.textContent = `Semantic matching is preparing in resumable batches.${progress}${resumed} Exact and structured AI search are ready now.`;
+      }
     } else if (semanticIndexState.status === "error") {
       semanticIndexStatus.textContent = "Semantic matching is unavailable; exact and structured AI search remain ready.";
     } else {
@@ -1154,7 +1212,17 @@
       sheet: currentSheet,
     };
     activeSemanticIndexRequest = request;
-    semanticIndexState = { status: "building", rowsIndexed: 0, summary: null, error: null };
+    semanticIndexState = {
+      status: "building",
+      phase: "loadingModel",
+      buildId: null,
+      rowsIndexed: 0,
+      documentsEmbedded: 0,
+      mappingsWritten: 0,
+      resumedFromRow: 0,
+      summary: null,
+      error: null,
+    };
     renderSemanticIndexState();
     try {
       const status = await invoke("semantic_index_status");
@@ -1162,7 +1230,12 @@
       if (status.ready) {
         semanticIndexState = {
           status: "ready",
+          phase: "ready",
+          buildId: null,
           rowsIndexed: status.rowsIndexed || 0,
+          documentsEmbedded: 0,
+          mappingsWritten: 0,
+          resumedFromRow: 0,
           summary: null,
           error: null,
         };
@@ -1173,9 +1246,17 @@
 
       const summary = await invoke("build_semantic_index");
       if (!semanticIndexRequestIsCurrent(request)) return null;
+      if (summary.cancelled) {
+        throw new Error("semantic preparation was superseded before publication");
+      }
       semanticIndexState = {
         status: "ready",
+        phase: "ready",
+        buildId: semanticIndexState.buildId,
         rowsIndexed: summary.rowsIndexed || 0,
+        documentsEmbedded: summary.documentsIndexed || 0,
+        mappingsWritten: summary.mappingsWritten || 0,
+        resumedFromRow: summary.resumed ? semanticIndexState.resumedFromRow : 0,
         summary,
         error: null,
       };
@@ -1185,7 +1266,17 @@
     } catch (err) {
       if (!semanticIndexRequestIsCurrent(request)) return null;
       console.error("semantic index build failed", err);
-      semanticIndexState = { status: "error", rowsIndexed: 0, summary: null, error: String(err) };
+      semanticIndexState = {
+        status: "error",
+        phase: null,
+        buildId: null,
+        rowsIndexed: 0,
+        documentsEmbedded: 0,
+        mappingsWritten: 0,
+        resumedFromRow: 0,
+        summary: null,
+        error: String(err),
+      };
       renderSemanticIndexState();
       return null;
     } finally {
@@ -2070,14 +2161,26 @@
 
   listen("semantic-index-progress", (event) => {
     if (semanticIndexState.status !== "building" || !activeSemanticIndexRequest) return;
-    const { rowsDone } = event.payload;
+    const {
+      buildId,
+      rowsDone,
+      documentsEmbedded,
+      mappingsWritten,
+      resumedFromRow,
+      phase,
+    } = event.payload;
     semanticIndexState = {
       ...semanticIndexState,
       // Progress events are process-global and carry no file generation. Only the scoped
       // command response is authoritative for readiness; a late event from a previous file
       // must never mark the current file ready.
       status: "building",
+      phase: typeof phase === "string" ? phase : semanticIndexState.phase,
+      buildId: Number.isSafeInteger(buildId) && buildId > 0 ? buildId : semanticIndexState.buildId,
       rowsIndexed: rowsDone || 0,
+      documentsEmbedded: documentsEmbedded || 0,
+      mappingsWritten: mappingsWritten || 0,
+      resumedFromRow: resumedFromRow || 0,
     };
     renderSemanticIndexState();
   });
