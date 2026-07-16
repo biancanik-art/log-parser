@@ -25,6 +25,14 @@ pub const TOKENIZER_SHA256: &str =
 pub const CONFIG_SHA256: &str = "953f9c0d463486b10a6871cc2fd59f223b2c70184f49815e7efbcab5d8908b41";
 
 const INDEX_VERSION: &str = "semantic-row-v1";
+pub const V2_INDEX_VERSION: &str = "semantic-document-v2";
+pub const V2_NORMALIZER_VERSION: &str = "dfir-cell-normalizer-v1";
+pub const V2_SOURCE_BATCH_ROWS: usize = 256;
+pub const V2_EMBED_BATCH_DOCUMENTS: usize = 16;
+pub const V2_DEFAULT_DOCUMENT_CANDIDATES: usize = 256;
+pub const V2_MAX_DOCUMENT_CANDIDATES: usize = 1_024;
+pub const V2_DEFAULT_MINIMUM_SCORE: f32 = 0.38;
+pub const V2_BROAD_MINIMUM_SCORE: f32 = 0.30;
 const MAX_TOKENS: usize = 256;
 const INDEX_BATCH_SIZE: usize = 32;
 const MAX_DOCUMENT_CHARS: usize = 4_096;
@@ -172,6 +180,30 @@ pub struct SemanticCandidate {
     pub score: f32,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SemanticBuildProgress {
+    pub build_id: i64,
+    pub phase: String,
+    pub rows_scanned: i64,
+    pub rows_total: i64,
+    pub documents_embedded: i64,
+    pub mappings_written: i64,
+    pub resumed_from_row: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SemanticSelectionSummary {
+    pub selection_id: String,
+    pub documents_above_threshold: usize,
+    pub documents_retained: usize,
+    pub rows_matched: i64,
+    pub documents_truncated: bool,
+    pub broad_row_warning: bool,
+    pub warnings: Vec<String>,
+}
+
 pub fn semantic_schema_hash(columns: &[ColumnMeta]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(INDEX_VERSION.as_bytes());
@@ -187,6 +219,107 @@ pub fn semantic_schema_hash(columns: &[ColumnMeta]) -> String {
         hasher.update((column.col_index as u64).to_le_bytes());
     }
     bytes_to_hex(&hasher.finalize())
+}
+
+/// Stable identity for semantic artifacts. Raw imported rows are immutable; the cache import
+/// record, schema, and row count therefore identify the dataset without depending on optional
+/// role, timestamp, or intelligence-enrichment tables.
+pub fn semantic_dataset_hash(conn: &Connection, columns: &[ColumnMeta]) -> Result<String> {
+    let mut hasher = Sha256::new();
+    hasher.update(V2_INDEX_VERSION.as_bytes());
+    hasher.update(semantic_schema_hash(columns).as_bytes());
+    let row_count: i64 = conn.query_row("SELECT COUNT(*) FROM rows", [], |row| row.get(0))?;
+    hasher.update(row_count.to_le_bytes());
+    if let Ok(info) = db::load_import_info(conn) {
+        for value in [
+            info.source_path.as_str(),
+            info.sheet_name.as_str(),
+            info.imported_at.as_str(),
+        ] {
+            hasher.update((value.len() as u64).to_le_bytes());
+            hasher.update(value.as_bytes());
+        }
+        hasher.update(info.row_count.to_le_bytes());
+    }
+    Ok(bytes_to_hex(&hasher.finalize()))
+}
+
+/// Creates only empty v2 structures. Existing v1 artifacts remain readable until a complete v2
+/// build is atomically published through `_semantic_v2_active`.
+pub fn create_semantic_v2_schema(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS _semantic_v2_build (
+            build_id INTEGER PRIMARY KEY,
+            dataset_hash TEXT NOT NULL,
+            schema_hash TEXT NOT NULL,
+            model_sha256 TEXT NOT NULL,
+            normalizer_version TEXT NOT NULL,
+            status TEXT NOT NULL CHECK(status IN ('building','paused','ready','cancelled','failed')),
+            source_rows INTEGER NOT NULL,
+            cursor_row_num INTEGER NOT NULL DEFAULT 0,
+            rows_scanned INTEGER NOT NULL DEFAULT 0,
+            documents_seen INTEGER NOT NULL DEFAULT 0,
+            documents_embedded INTEGER NOT NULL DEFAULT 0,
+            mappings_written INTEGER NOT NULL DEFAULT 0,
+            started_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            completed_at TEXT,
+            error TEXT
+         );
+         CREATE INDEX IF NOT EXISTS _semantic_v2_build_identity
+            ON _semantic_v2_build(dataset_hash, schema_hash, model_sha256, normalizer_version, status);
+         CREATE TABLE IF NOT EXISTS _semantic_v2_active (
+            singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+            build_id INTEGER NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS _semantic_v2_column_plan (
+            build_id INTEGER NOT NULL,
+            col_index INTEGER NOT NULL,
+            mode TEXT NOT NULL CHECK(mode IN ('exact_only','categorical','text')),
+            sql_name TEXT NOT NULL,
+            original_name TEXT NOT NULL,
+            PRIMARY KEY(build_id, col_index)
+         ) WITHOUT ROWID;
+         CREATE TABLE IF NOT EXISTS _semantic_v2_document (
+            doc_id INTEGER PRIMARY KEY,
+            model_sha256 TEXT NOT NULL,
+            normalizer_version TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            column_key TEXT NOT NULL,
+            text_sha256 TEXT NOT NULL,
+            normalized_text TEXT NOT NULL,
+            embedding BLOB NOT NULL,
+            UNIQUE(model_sha256, normalizer_version, text_sha256)
+         );
+         CREATE TABLE IF NOT EXISTS _semantic_v2_mapping (
+            build_id INTEGER NOT NULL,
+            doc_id INTEGER NOT NULL,
+            row_num INTEGER NOT NULL,
+            PRIMARY KEY(build_id, doc_id, row_num)
+         ) WITHOUT ROWID;
+         CREATE TABLE IF NOT EXISTS _semantic_v2_selection (
+            selection_id TEXT PRIMARY KEY,
+            build_id INTEGER NOT NULL,
+            dataset_hash TEXT NOT NULL,
+            query_sha256 TEXT NOT NULL,
+            policy_version TEXT NOT NULL,
+            minimum_score REAL NOT NULL,
+            documents_above_threshold INTEGER NOT NULL,
+            documents_retained INTEGER NOT NULL,
+            rows_matched INTEGER NOT NULL,
+            documents_truncated INTEGER NOT NULL,
+            broad_row_warning INTEGER NOT NULL,
+            warnings_json TEXT NOT NULL,
+            created_at TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS _semantic_v2_selection_doc (
+            selection_id TEXT NOT NULL,
+            doc_id INTEGER NOT NULL,
+            cosine_score REAL NOT NULL,
+            rank_score REAL NOT NULL,
+            PRIMARY KEY(selection_id, doc_id)
+         ) WITHOUT ROWID;",
+    )
 }
 
 pub fn semantic_index_ready(conn: &Connection, columns: &[ColumnMeta]) -> Result<bool> {
@@ -563,6 +696,38 @@ mod tests {
         let mut changed = columns();
         changed[1].original_name = "Event Description".into();
         assert_ne!(first, semantic_schema_hash(&changed));
+    }
+
+    #[test]
+    fn semantic_v2_schema_is_additive_and_dataset_bound() {
+        let conn = Connection::open_in_memory().unwrap();
+        let columns = columns();
+        db::create_schema(&conn, &columns).unwrap();
+        conn.execute(
+            "INSERT INTO rows (row_num, timestamp, message) VALUES (1, '2026-01-01', 'event')",
+            [],
+        )
+        .unwrap();
+        create_semantic_v2_schema(&conn).unwrap();
+        for table in [
+            "_semantic_v2_build",
+            "_semantic_v2_active",
+            "_semantic_v2_column_plan",
+            "_semantic_v2_document",
+            "_semantic_v2_mapping",
+            "_semantic_v2_selection",
+            "_semantic_v2_selection_doc",
+        ] {
+            assert!(table_exists(&conn, table).unwrap(), "missing {table}");
+        }
+        let first = semantic_dataset_hash(&conn, &columns).unwrap();
+        conn.execute(
+            "INSERT INTO rows (row_num, timestamp, message) VALUES (2, '2026-01-02', 'event')",
+            [],
+        )
+        .unwrap();
+        assert_ne!(first, semantic_dataset_hash(&conn, &columns).unwrap());
+        assert!(!table_exists(&conn, "_semantic_index").unwrap());
     }
 
     #[test]
