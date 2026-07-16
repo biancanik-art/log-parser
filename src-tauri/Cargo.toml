@@ -26,3 +26,7 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 calamine = { version = "0.36", features = ["dates"] }
 csv = "1"
 rust_xlsxwriter = { version = "0.96", features = ["constant_memory"] }
+candle-core = "0.11.0"
+candle-transformers = "0.11.0"
+tokenizers = { version = "0.23.1", default-features = false, features = ["onig"] }
+sha2 = "0.10"

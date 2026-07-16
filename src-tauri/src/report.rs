@@ -198,8 +198,18 @@ pub fn export_report(
         )?);
         used_sheet_names.insert("general".to_string());
 
+        if table_has_rows(conn, "_llm_parse_audit")? {
+            sheets_written.push(write_llm_audit_sheet(conn, &mut write_state)?);
+            used_sheet_names.insert("ai audit".to_string());
+        }
+
         if intel_match_count(conn)? > 0 {
-            sheets_written.push(write_timeline_sheet(conn, columns, &roles, &mut write_state)?);
+            sheets_written.push(write_timeline_sheet(
+                conn,
+                columns,
+                &roles,
+                &mut write_state,
+            )?);
             used_sheet_names.insert("timeline".to_string());
         }
 
@@ -217,6 +227,69 @@ pub fn export_report(
         row_count: source_rows.len() as i64,
         dest_path: dest_path.display().to_string(),
     })
+}
+
+fn write_llm_audit_sheet<F>(
+    conn: &Connection,
+    state: &mut ReportWriteState<'_, F>,
+) -> Result<String>
+where
+    F: FnMut(i64, &str),
+{
+    let sheet_name = "AI Audit".to_string();
+    let worksheet = state.workbook.add_worksheet_with_constant_memory();
+    worksheet.set_name(&sheet_name)?;
+    let headers = [
+        "audit_id",
+        "created_at",
+        "examiner_decision",
+        "decided_at",
+        "provider",
+        "model_name",
+        "model_version",
+        "model_sha256",
+        "tokenizer_sha256",
+        "prompt_template_version",
+        "correlation_engine_version",
+        "input_sha256",
+        "validation_status",
+        "validation_detail",
+        "generation_parameters_json",
+        "artifact_ids_json",
+        "raw_model_output",
+        "trusted_intent_json",
+        "model_load_ms",
+        "inference_latency_ms",
+    ];
+    write_headers(worksheet, &headers)?;
+    for column in 0..headers.len() as u16 {
+        worksheet.set_column_width(column, if column >= 14 { 60 } else { 24 })?;
+    }
+
+    let mut stmt = conn.prepare(
+        "SELECT id, created_at, examiner_decision, COALESCE(decided_at, ''),
+                provider, model_name, model_version, model_sha256, tokenizer_sha256,
+                prompt_template_version, correlation_engine_version, input_sha256,
+                validation_status, COALESCE(validation_detail, ''),
+                generation_parameters_json, artifact_ids_json, raw_output,
+                trusted_intent_json, load_time_ms, inference_latency_ms
+         FROM _llm_parse_audit ORDER BY id",
+    )?;
+    let mut rows = stmt.query([])?;
+    let mut excel_row = 1u32;
+    while let Some(row) = rows.next()? {
+        worksheet.write_number(excel_row, 0, row.get::<_, i64>(0)? as f64)?;
+        for column in 1..18usize {
+            let value: String = row.get(column)?;
+            write_cell_string(worksheet, excel_row, column as u16, &value)?;
+        }
+        worksheet.write_number(excel_row, 18, row.get::<_, i64>(18)? as f64)?;
+        worksheet.write_number(excel_row, 19, row.get::<_, i64>(19)? as f64)?;
+        excel_row += 1;
+        *state.total_rows_written += 1;
+    }
+    (state.on_progress)(*state.total_rows_written, &sheet_name);
+    Ok(sheet_name)
 }
 
 fn validate_report_prerequisites(conn: &Connection) -> Result<()> {
@@ -1837,6 +1910,75 @@ mod tests {
     }
 
     #[test]
+    fn report_export_writes_complete_ai_audit_sheet() {
+        let (conn, columns) = setup_report_fixture(true);
+        conn.execute_batch(
+            "CREATE TABLE _llm_parse_audit (
+                id INTEGER PRIMARY KEY,
+                provider TEXT NOT NULL,
+                model_name TEXT NOT NULL,
+                model_version TEXT NOT NULL,
+                model_sha256 TEXT NOT NULL,
+                tokenizer_sha256 TEXT NOT NULL,
+                prompt_template_version TEXT NOT NULL,
+                correlation_engine_version TEXT NOT NULL,
+                artifact_ids_json TEXT NOT NULL,
+                input_sha256 TEXT NOT NULL,
+                generation_parameters_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                load_time_ms INTEGER NOT NULL,
+                inference_latency_ms INTEGER NOT NULL,
+                raw_output TEXT NOT NULL,
+                validation_status TEXT NOT NULL,
+                validation_detail TEXT,
+                trusted_intent_json TEXT NOT NULL,
+                examiner_decision TEXT NOT NULL,
+                decided_at TEXT
+             );
+             INSERT INTO _llm_parse_audit VALUES (
+                42, 'local-candle', 'Qwen2.5-1.5B-Instruct', 'Q4_K_M@revision',
+                'model-hash', 'tokenizer-hash', 'guided-intent-v2',
+                'intel-library:test;matcher:v1',
+                '{\"techniqueIds\":[\"T1003.001\"]}', 'input-hash',
+                '{\"strategy\":\"greedy_argmax\"}', '2026-07-16T00:00:00Z',
+                2945, 13182, '=untrusted model text', 'validated', NULL,
+                '{\"intent\":\"techniqueTimeline\"}', 'accepted',
+                '2026-07-16T00:01:00Z'
+             );",
+        )
+        .unwrap();
+        let path = temp_report_path("with-ai-audit");
+
+        let summary = export_report(&conn, &columns, &path, |_, _| {}).unwrap();
+        assert_eq!(
+            summary.sheets_written,
+            vec![
+                "General",
+                "AI Audit",
+                "Timeline",
+                "Credential Access",
+                "Execution"
+            ]
+        );
+
+        let mut workbook = calamine::open_workbook_auto(&path).unwrap();
+        let audit = workbook.worksheet_range("AI Audit").unwrap();
+        let rows: Vec<_> = audit.rows().collect();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0][0].to_string(), "audit_id");
+        assert_eq!(rows[0][19].to_string(), "inference_latency_ms");
+        assert_eq!(cell_to_i64(&rows[1][0]), 42);
+        assert_eq!(rows[1][2].to_string(), "accepted");
+        assert_eq!(rows[1][4].to_string(), "local-candle");
+        assert_eq!(rows[1][5].to_string(), "Qwen2.5-1.5B-Instruct");
+        assert_eq!(rows[1][16].to_string(), "=untrusted model text");
+        assert_eq!(cell_to_i64(&rows[1][18]), 2945);
+        assert_eq!(cell_to_i64(&rows[1][19]), 13182);
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
     fn report_export_with_zero_matches_writes_no_timeline_or_category_sheets() {
         let (conn, columns) = setup_report_fixture(false);
         let path = temp_report_path("zero-matches");
@@ -1959,7 +2101,11 @@ mod tests {
             1,
             "expected one case-folded Hosts row, got {host_rows:?}"
         );
-        assert_eq!(cell_to_i64(&host_rows[0][5]), 3, "total observed_count across all casings");
+        assert_eq!(
+            cell_to_i64(&host_rows[0][5]),
+            3,
+            "total observed_count across all casings"
+        );
 
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }

@@ -1,12 +1,33 @@
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::borrow::Cow;
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
-#[cfg(not(test))]
-const BUILTIN_LIBRARY_JSON: &str = include_str!("../../resources/intel/mitre_core.v1.json");
+static BUILTIN_LIBRARY_PATH: OnceLock<PathBuf> = OnceLock::new();
+const BUILTIN_LIBRARY_SHA256: &str =
+    "b5a56e35aa9033b246742460a91a0af6ce58f286c4fbf02e8c93e585aacab33c";
+
+/// Configures the immutable intelligence-library resource bundled with the app.
+///
+/// Keeping the signature corpus out of the PE/Mach-O/ELF binary is intentional:
+/// strings such as credential-dumping tool commands can otherwise trigger endpoint
+/// protection signatures against the application executable itself.
+pub fn configure_builtin_library_path(path: PathBuf) -> Result<()> {
+    if !path.is_file() {
+        bail!(
+            "bundled intelligence library was not found at {}",
+            path.display()
+        );
+    }
+    // Verify during application setup for an early, explicit failure, and verify again on every
+    // read so a resource changed after startup cannot silently alter matching/query semantics.
+    let _ = read_verified_builtin_library(&path)?;
+    BUILTIN_LIBRARY_PATH
+        .set(path)
+        .map_err(|_| anyhow!("built-in intelligence library path was already configured"))
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -124,7 +145,13 @@ pub fn load_merged_library() -> Result<LoadedLibrary> {
 
 #[cfg(not(test))]
 fn builtin_library_json() -> Result<Cow<'static, str>> {
-    Ok(Cow::Borrowed(BUILTIN_LIBRARY_JSON))
+    let path = BUILTIN_LIBRARY_PATH.get().cloned().unwrap_or_else(|| {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("resources")
+            .join("intel")
+            .join("mitre_core.v1.json")
+    });
+    read_verified_builtin_library(&path).map(Cow::Owned)
 }
 
 #[cfg(test)]
@@ -133,9 +160,28 @@ fn builtin_library_json() -> Result<Cow<'static, str>> {
         .join("resources")
         .join("intel")
         .join("mitre_core.v1.json");
-    std::fs::read_to_string(&path)
-        .with_context(|| format!("reading {}", path.display()))
-        .map(Cow::Owned)
+    read_verified_builtin_library(&path).map(Cow::Owned)
+}
+
+fn read_verified_builtin_library(path: &Path) -> Result<String> {
+    let raw =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    verify_builtin_library_checksum(path, &raw)?;
+    Ok(raw)
+}
+
+fn verify_builtin_library_checksum(path: &Path, raw: &str) -> Result<()> {
+    let normalized = normalize_line_endings(raw);
+    let actual = sha256_hex(normalized.as_bytes());
+    if actual != BUILTIN_LIBRARY_SHA256 {
+        bail!(
+            "bundled intelligence library checksum mismatch for {}: expected {}, got {}",
+            path.display(),
+            BUILTIN_LIBRARY_SHA256,
+            actual
+        );
+    }
+    Ok(())
 }
 
 pub fn custom_library_path() -> PathBuf {
@@ -222,11 +268,40 @@ fn validate_library(label: &str, library: &LibraryFile) -> Result<()> {
 }
 
 fn hash_library_sources(sources: &[&str]) -> String {
-    let mut hasher = DefaultHasher::new();
+    let mut hasher = Sha256::new();
+    hasher.update(b"log-parser-intel-library-sources-v1\0");
+    hasher.update((sources.len() as u64).to_le_bytes());
     for source in sources {
-        source.hash(&mut hasher);
+        // Git/source tools can materialize the same JSON with CRLF on Windows. Normalize that
+        // transport detail so the same library snapshot has one cross-platform audit hash.
+        let normalized = normalize_line_endings(source);
+        let bytes = normalized.as_bytes();
+        hasher.update((bytes.len() as u64).to_le_bytes());
+        hasher.update(bytes);
     }
-    format!("{:016x}", hasher.finish())
+    bytes_to_hex(&hasher.finalize())
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    bytes_to_hex(&digest)
+}
+
+fn bytes_to_hex(bytes: &[u8]) -> String {
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(output, "{byte:02x}");
+    }
+    output
+}
+
+fn normalize_line_endings(value: &str) -> Cow<'_, str> {
+    if value.contains("\r\n") {
+        Cow::Owned(value.replace("\r\n", "\n"))
+    } else {
+        Cow::Borrowed(value)
+    }
 }
 
 #[cfg(test)]
@@ -252,6 +327,38 @@ mod tests {
             library.keyword_count()
         );
         assert!(!library.library_hash.is_empty());
+        assert_eq!(library.library_hash.len(), 64);
         assert!(library.custom_library_error.is_none());
+    }
+
+    #[test]
+    fn bundled_library_checksum_rejects_modified_content() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("resources")
+            .join("intel")
+            .join("mitre_core.v1.json");
+        let raw = std::fs::read_to_string(&path).unwrap();
+        verify_builtin_library_checksum(&path, &raw).unwrap();
+        verify_builtin_library_checksum(&path, &raw.replace('\n', "\r\n")).unwrap();
+
+        let modified = format!("{raw}\n");
+        let error = verify_builtin_library_checksum(&path, &modified).unwrap_err();
+        assert!(error.to_string().contains("checksum mismatch"));
+    }
+
+    #[test]
+    fn library_source_hash_is_stable_and_length_delimited() {
+        assert_eq!(
+            hash_library_sources(&["alpha", "beta"]),
+            "d6e396b4c86a646ef8134ef001b3e564c207656820c7eb32ab84f9e5b4579923"
+        );
+        assert_ne!(
+            hash_library_sources(&["ab", "c"]),
+            hash_library_sources(&["a", "bc"])
+        );
+        assert_eq!(
+            hash_library_sources(&["alpha\r\n", "beta"]),
+            hash_library_sources(&["alpha\n", "beta"])
+        );
     }
 }

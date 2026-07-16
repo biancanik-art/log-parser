@@ -1,0 +1,21 @@
+[package]
+name = "llm-bench"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Standalone offline benchmark harness for evaluating candidate local LLMs as the intel guided-query parser. NOT part of the shipped app; not built by src-tauri; never packaged into the Tauri bundle. Do not add a root [workspace] that includes both this crate and src-tauri -- that would pull candle's heavy compile graph into every dev build of the shipped app."
+
+[[bin]]
+name = "llm-bench"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.103"
+candle-core = "0.11.0"
+candle-nn = "0.11.0"
+candle-transformers = "0.11.0"
+clap = { version = "4.6.1", features = ["derive"] }
+hf-hub = { version = "1.0.0", features = ["blocking"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+tokenizers = { version = "0.23.1", default-features = false, features = ["onig"] }

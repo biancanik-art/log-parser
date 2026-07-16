@@ -43,6 +43,20 @@ jobs:
         with:
           workspaces: './src-tauri -> target'
 
+      - name: install Python for the pinned model fetch
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Cache pinned local-AI resources
+        uses: actions/cache@v4
+        with:
+          path: src-tauri/resources/models
+          key: qwen2.5-1.5b-q4-k-m-${{ runner.os }}-6a1a2eb6-c0382117
+
+      - name: Fetch and verify pinned local-AI resources
+        run: python scripts/fetch_llm_resources.py
+
       - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,0 +1,802 @@
+[
+  {
+    "id": "parses_well_credential_access_alice_chrono",
+    "query_text": "show credential access for alice chronologically",
+    "mock_context": {
+      "techniques": [
+        {
+          "technique_id": "T1003.001",
+          "name": "OS Credential Dumping: LSASS Memory",
+          "tactic_id": "TA0006",
+          "tactic_name": "Credential Access",
+          "aliases": [
+            "credential dumping",
+            "credentials dumping",
+            "dump credentials",
+            "lsass dumping",
+            "mimikatz"
+          ]
+        },
+        {
+          "technique_id": "T1566.001",
+          "name": "Phishing: Spearphishing Attachment",
+          "tactic_id": "TA0001",
+          "tactic_name": "Initial Access",
+          "aliases": [
+            "phishing attachment",
+            "malicious attachment",
+            "spearphishing attachment"
+          ]
+        },
+        {
+          "technique_id": "T1566.002",
+          "name": "Phishing: Spearphishing Link",
+          "tactic_id": "TA0001",
+          "tactic_name": "Initial Access",
+          "aliases": [
+            "phishing link",
+            "malicious link",
+            "spearphishing link"
+          ]
+        },
+        {
+          "technique_id": "T1059.001",
+          "name": "Command and Scripting Interpreter: PowerShell",
+          "tactic_id": "TA0002",
+          "tactic_name": "Execution",
+          "aliases": [
+            "powershell",
+            "encoded powershell",
+            "powershell download cradle"
+          ]
+        }
+      ],
+      "confirmed_roles": [
+        {
+          "role": "user",
+          "sql_name": "Account"
+        },
+        {
+          "role": "command_line",
+          "sql_name": "CommandLine"
+        },
+        {
+          "role": "timestamp",
+          "sql_name": "TimeGenerated"
+        }
+      ],
+      "has_normalized_time": true
+    },
+    "expected": {
+      "exact": {
+        "intent": {
+          "intent": "userTechniqueTimeline",
+          "userValue": "alice",
+          "userColumn": "Account",
+          "techniqueIds": [
+            "T1003.001"
+          ],
+          "sort": "chronological_asc"
+        }
+      }
+    },
+    "notes": "Old rule-based parser's canonical 'parses well' example (design doc section C) -- regression check, not a new case."
+  },
+  {
+    "id": "parses_well_mimikatz_alice_in_order",
+    "query_text": "mimikatz activity for alice in order",
+    "mock_context": {
+      "techniques": [
+        {
+          "technique_id": "T1003.001",
+          "name": "OS Credential Dumping: LSASS Memory",
+          "tactic_id": "TA0006",
+          "tactic_name": "Credential Access",
+          "aliases": [
+            "credential dumping",
+            "credentials dumping",
+            "dump credentials",
+            "lsass dumping",
+            "mimikatz"
+          ]
+        }
+      ],
+      "confirmed_roles": [
+        {
+          "role": "user",
+          "sql_name": "Account"
+        }
+      ],
+      "has_normalized_time": true
+    },
+    "expected": {
+      "exact": {
+        "intent": {
+          "intent": "userTechniqueTimeline",
+          "userValue": "alice",
+          "userColumn": "Account",
+          "techniqueIds": [
+            "T1003.001"
+          ],
+          "sort": "chronological_asc"
+        }
+      }
+    },
+    "notes": "Old rule-based parser's 'parses well' example."
+  },
+  {
+    "id": "parses_well_attacks_of_user_alice",
+    "query_text": "show attacks of user alice",
+    "mock_context": {
+      "techniques": [
+        {
+          "technique_id": "T1003.001",
+          "name": "OS Credential Dumping: LSASS Memory",
+          "tactic_id": "TA0006",
+          "tactic_name": "Credential Access",
+          "aliases": [
+            "credential dumping",
+            "credentials dumping",
+            "dump credentials",
+            "lsass dumping",
+            "mimikatz"
+          ]
+        },
+        {
+          "technique_id": "T1059.001",
+          "name": "Command and Scripting Interpreter: PowerShell",
+          "tactic_id": "TA0002",
+          "tactic_name": "Execution",
+          "aliases": [
+            "powershell",
+            "encoded powershell",
+            "powershell download cradle"
+          ]
+        }
+      ],
+      "confirmed_roles": [
+        {
+          "role": "user",
+          "sql_name": "Account"
+        }
+      ],
+      "has_normalized_time": true
+    },
+    "expected": {
+      "any_of": {
+        "intents": [
+          {
+            "intent": "userTechniqueTimeline",
+            "userValue": "alice",
+            "userColumn": "Account",
+            "techniqueIds": [
+              "T1003.001",
+              "T1059.001"
+            ],
+            "sort": "chronological_asc"
+          },
+          {
+            "intent": "userTechniqueTimeline",
+            "userValue": "alice",
+            "userColumn": "Account",
+            "techniqueIds": [],
+            "sort": "chronological_asc"
+          }
+        ]
+      }
+    },
+    "notes": "Vague 'attacks' with no specific technique named -- judgment call: accept either 'all known techniques' or empty-list-means-everything as valid interpretations of a user timeline."
+  },
+  {
+    "id": "parses_well_suspicious_scan",
+    "query_text": "find suspicious activity",
+    "mock_context": {
+      "techniques": [
+        {
+          "technique_id": "T1003.001",
+          "name": "OS Credential Dumping: LSASS Memory",
+          "tactic_id": "TA0006",
+          "tactic_name": "Credential Access",
+          "aliases": [
+            "credential dumping",
+            "credentials dumping",
+            "dump credentials",
+            "lsass dumping",
+            "mimikatz"
+          ]
+        },
+        {
+          "technique_id": "T1059.001",
+          "name": "Command and Scripting Interpreter: PowerShell",
+          "tactic_id": "TA0002",
+          "tactic_name": "Execution",
+          "aliases": [
+            "powershell",
+            "encoded powershell",
+            "powershell download cradle"
+          ]
+        }
+      ],
+      "confirmed_roles": [
+        {
+          "role": "user",
+          "sql_name": "Account"
+        }
+      ],
+      "has_normalized_time": true
+    },
+    "expected": {
+      "any_of": {
+        "intents": [
+          {
+            "intent": "suspiciousScan",
+            "tacticIds": [],
+            "techniqueIds": [],
+            "sort": "row_num_asc"
+          },
+          {
+            "intent": "suspiciousScan",
+            "tacticIds": [],
+            "techniqueIds": [],
+            "sort": "chronological_asc"
+          }
+        ]
+      }
+    },
+    "notes": "Old rule-based parser's 'parses well' example. Sort choice ambiguous by design -- not the point of this case."
+  },
+  {
+    "id": "parses_well_suspicious_dfir_manner",
+    "query_text": "find anything suspicious in dfir manner",
+    "mock_context": {
+      "techniques": [
+        {
+          "technique_id": "T1003.001",
+          "name": "OS Credential Dumping: LSASS Memory",
+          "tactic_id": "TA0006",
+          "tactic_name": "Credential Access",
+          "aliases": [
+            "credential dumping",
+            "credentials dumping",
+            "dump credentials",
+            "lsass dumping",
+            "mimikatz"
+          ]
+        }
+      ],
+      "confirmed_roles": [],
+      "has_normalized_time": false
+    },
+    "expected": {
+      "any_of": {
+        "intents": [
+          {
+            "intent": "suspiciousScan",
+            "tacticIds": [],
+            "techniqueIds": [],
+            "sort": "row_num_asc"
+          },
+          {
+            "intent": "suspiciousScan",
+            "tacticIds": [],
+            "techniqueIds": [],
+            "sort": "chronological_asc"
+          }
+        ]
+      }
+    },
+    "notes": "Old rule-based parser's 'parses well' example, with no confirmed roles / no normalized time at all -- should still produce a broad scan, not Unknown."
+  },
+  {
+    "id": "parses_well_filter_user_credential_dumping",
+    "query_text": "filter user CORP\\alice by credential dumping",
+    "mock_context": {
+      "techniques": [
+        {
+          "technique_id": "T1003.001",
+          "name": "OS Credential Dumping: LSASS Memory",
+          "tactic_id": "TA0006",
+          "tactic_name": "Credential Access",
+          "aliases": [
+            "credential dumping",
+            "credentials dumping",
+            "dump credentials",
+            "lsass dumping",
+            "mimikatz"
+          ]
+        }
+      ],
+      "confirmed_roles": [
+        {
+          "role": "user",
+          "sql_name": "Account"
+        }
+      ],
+      "has_normalized_time": true
+    },
+    "expected": {
+      "exact": {
+        "intent": {
+          "intent": "userTechniqueTimeline",
+          "userValue": "CORP\\alice",
+          "userColumn": "Account",
+          "techniqueIds": [
+            "T1003.001"
+          ],
+          "sort": "chronological_asc"
+        }
+      }
+    },
+    "notes": "Old rule-based parser's 'parses well' example -- also tests DOMAIN\\user identity strings are preserved verbatim in userValue."
+  },
+  {
+    "id": "short_loose_mimikatz_alice",
+    "query_text": "mimikatz alice",
+    "mock_context": {
+      "techniques": [
+        {
+          "technique_id": "T1003.001",
+          "name": "OS Credential Dumping: LSASS Memory",
+          "tactic_id": "TA0006",
+          "tactic_name": "Credential Access",
+          "aliases": [
+            "credential dumping",
+            "credentials dumping",
+            "dump credentials",
+            "lsass dumping",
+            "mimikatz"
+          ]
+        }
+      ],
+      "confirmed_roles": [
+        {
+          "role": "user",
+          "sql_name": "Account"
+        }
+      ],
+      "has_normalized_time": true
+    },
+    "expected": {
+      "exact": {
+        "intent": {
+          "intent": "userTechniqueTimeline",
+          "userValue": "alice",
+          "userColumn": "Account",
+          "techniqueIds": [
+            "T1003.001"
+          ],
+          "sort": "chronological_asc"
+        }
+      }
+    },
+    "notes": "The exact class of 2-word query that motivated this whole redesign -- highest-priority case."
+  },
+  {
+    "id": "short_loose_creds_bob",
+    "query_text": "creds bob",
+    "mock_context": {
+      "techniques": [
+        {
+          "technique_id": "T1003.001",
+          "name": "OS Credential Dumping: LSASS Memory",
+          "tactic_id": "TA0006",
+          "tactic_name": "Credential Access",
+          "aliases": [
+            "credential dumping",
+            "credentials dumping",
+            "dump credentials",
+            "lsass dumping",
+            "mimikatz"
+          ]
+        }
+      ],
+      "confirmed_roles": [
+        {
+          "role": "user",
+          "sql_name": "Account"
+        }
+      ],
+      "has_normalized_time": true
+    },
+    "expected": {
+      "exact": {
+        "intent": {
+          "intent": "userTechniqueTimeline",
+          "userValue": "bob",
+          "userColumn": "Account",
+          "techniqueIds": [
+            "T1003.001"
+          ],
+          "sort": "chronological_asc"
+        }
+      }
+    },
+    "notes": "Production's bounded, auditable shorthand retriever maps the sole significant term 'creds' to the injected T1003.001 candidate before Qwen performs structured parsing. This case tests the retrieved-candidate + model pipeline; it is not evidence that an unconstrained model may choose any library ID."
+  },
+  {
+    "id": "short_loose_alice_today",
+    "query_text": "alice today",
+    "mock_context": {
+      "techniques": [
+        {
+          "technique_id": "T1003.001",
+          "name": "OS Credential Dumping: LSASS Memory",
+          "tactic_id": "TA0006",
+          "tactic_name": "Credential Access",
+          "aliases": [
+            "credential dumping",
+            "credentials dumping",
+            "dump credentials",
+            "lsass dumping",
+            "mimikatz"
+          ]
+        }
+      ],
+      "confirmed_roles": [
+        {
+          "role": "user",
+          "sql_name": "Account"
+        }
+      ],
+      "has_normalized_time": true
+    },
+    "expected": {
+      "any_of": {
+        "intents": [
+          {
+            "intent": "userTechniqueTimeline",
+            "userValue": "alice",
+            "userColumn": "Account",
+            "techniqueIds": [],
+            "sort": "chronological_asc"
+          }
+        ]
+      }
+    },
+    "notes": "'today' has no representation in GuidedIntent (no date field) -- judgment call to accept 'show everything for alice chronologically' as reasonable graceful degradation rather than requiring Unknown. Revisit if eval shows models instead hallucinate a date filter."
+  },
+  {
+    "id": "short_loose_powershell_bob",
+    "query_text": "powershell bob",
+    "mock_context": {
+      "techniques": [
+        {
+          "technique_id": "T1059.001",
+          "name": "Command and Scripting Interpreter: PowerShell",
+          "tactic_id": "TA0002",
+          "tactic_name": "Execution",
+          "aliases": [
+            "powershell",
+            "encoded powershell",
+            "powershell download cradle"
+          ]
+        }
+      ],
+      "confirmed_roles": [
+        {
+          "role": "user",
+          "sql_name": "Account"
+        }
+      ],
+      "has_normalized_time": true
+    },
+    "expected": {
+      "exact": {
+        "intent": {
+          "intent": "userTechniqueTimeline",
+          "userValue": "bob",
+          "userColumn": "Account",
+          "techniqueIds": [
+            "T1059.001"
+          ],
+          "sort": "chronological_asc"
+        }
+      }
+    },
+    "notes": "Short/loose regression case."
+  },
+  {
+    "id": "short_loose_bob_mimikatz_reordered",
+    "query_text": "bob mimikatz",
+    "mock_context": {
+      "techniques": [
+        {
+          "technique_id": "T1003.001",
+          "name": "OS Credential Dumping: LSASS Memory",
+          "tactic_id": "TA0006",
+          "tactic_name": "Credential Access",
+          "aliases": [
+            "credential dumping",
+            "credentials dumping",
+            "dump credentials",
+            "lsass dumping",
+            "mimikatz"
+          ]
+        }
+      ],
+      "confirmed_roles": [
+        {
+          "role": "user",
+          "sql_name": "Account"
+        }
+      ],
+      "has_normalized_time": true
+    },
+    "expected": {
+      "exact": {
+        "intent": {
+          "intent": "userTechniqueTimeline",
+          "userValue": "bob",
+          "userColumn": "Account",
+          "techniqueIds": [
+            "T1003.001"
+          ],
+          "sort": "chronological_asc"
+        }
+      }
+    },
+    "notes": "Word-order-reversed version of mimikatz_alice -- tests it's not just position-sensitive pattern matching."
+  },
+  {
+    "id": "short_loose_lsass_dump",
+    "query_text": "lsass dump",
+    "mock_context": {
+      "techniques": [
+        {
+          "technique_id": "T1003.001",
+          "name": "OS Credential Dumping: LSASS Memory",
+          "tactic_id": "TA0006",
+          "tactic_name": "Credential Access",
+          "aliases": [
+            "credential dumping",
+            "credentials dumping",
+            "dump credentials",
+            "lsass dumping",
+            "mimikatz"
+          ]
+        }
+      ],
+      "confirmed_roles": [
+        {
+          "role": "user",
+          "sql_name": "Account"
+        }
+      ],
+      "has_normalized_time": true
+    },
+    "expected": {
+      "any_of": {
+        "intents": [
+          {
+            "intent": "techniqueTimeline",
+            "techniqueIds": [
+              "T1003.001"
+            ],
+            "sort": "row_num_asc"
+          },
+          {
+            "intent": "techniqueTimeline",
+            "techniqueIds": [
+              "T1003.001"
+            ],
+            "sort": "chronological_asc"
+          },
+          {
+            "intent": "suspiciousScan",
+            "tacticIds": [
+              "TA0006"
+            ],
+            "techniqueIds": [
+              "T1003.001"
+            ],
+            "sort": "row_num_asc"
+          },
+          {
+            "intent": "suspiciousScan",
+            "tacticIds": [
+              "TA0006"
+            ],
+            "techniqueIds": [
+              "T1003.001"
+            ],
+            "sort": "chronological_asc"
+          }
+        ]
+      }
+    },
+    "notes": "No user named -- technique-only query, no user column involved. Accept either techniqueTimeline or suspiciousScan shape."
+  },
+  {
+    "id": "refuse_this_user_no_confirmed_role",
+    "query_text": "show mimikatz activity for this user",
+    "mock_context": {
+      "techniques": [
+        {
+          "technique_id": "T1003.001",
+          "name": "OS Credential Dumping: LSASS Memory",
+          "tactic_id": "TA0006",
+          "tactic_name": "Credential Access",
+          "aliases": [
+            "credential dumping",
+            "credentials dumping",
+            "dump credentials",
+            "lsass dumping",
+            "mimikatz"
+          ]
+        }
+      ],
+      "confirmed_roles": [
+        {
+          "role": "command_line",
+          "sql_name": "CommandLine"
+        },
+        {
+          "role": "timestamp",
+          "sql_name": "TimeGenerated"
+        }
+      ],
+      "has_normalized_time": true
+    },
+    "expected": "must_be_unknown_or_clarify",
+    "notes": "No 'user' role confirmed -- must not fabricate a userColumn. Real requirement from design doc section B: 'never treat a guessed column as confirmed evidence without the examiner approving it.'"
+  },
+  {
+    "id": "refuse_ambiguous_phishing",
+    "query_text": "show phishing activity",
+    "mock_context": {
+      "techniques": [
+        {
+          "technique_id": "T1566.001",
+          "name": "Phishing: Spearphishing Attachment",
+          "tactic_id": "TA0001",
+          "tactic_name": "Initial Access",
+          "aliases": [
+            "phishing attachment",
+            "malicious attachment",
+            "spearphishing attachment"
+          ]
+        },
+        {
+          "technique_id": "T1566.002",
+          "name": "Phishing: Spearphishing Link",
+          "tactic_id": "TA0001",
+          "tactic_name": "Initial Access",
+          "aliases": [
+            "phishing link",
+            "malicious link",
+            "spearphishing link"
+          ]
+        }
+      ],
+      "confirmed_roles": [
+        {
+          "role": "user",
+          "sql_name": "Account"
+        }
+      ],
+      "has_normalized_time": true
+    },
+    "expected": "must_be_unknown_or_clarify",
+    "notes": "Bare 'phishing' matches two techniques equally well (attachment vs link) -- must ask to disambiguate, not silently pick one. Also tests semantic generalization since 'phishing' alone isn't a literal alias of either."
+  },
+  {
+    "id": "refuse_vague_bad_stuff",
+    "query_text": "find bad stuff",
+    "mock_context": {
+      "techniques": [
+        {
+          "technique_id": "T1003.001",
+          "name": "OS Credential Dumping: LSASS Memory",
+          "tactic_id": "TA0006",
+          "tactic_name": "Credential Access",
+          "aliases": [
+            "credential dumping",
+            "credentials dumping",
+            "dump credentials",
+            "lsass dumping",
+            "mimikatz"
+          ]
+        }
+      ],
+      "confirmed_roles": [
+        {
+          "role": "user",
+          "sql_name": "Account"
+        }
+      ],
+      "has_normalized_time": true
+    },
+    "expected": "must_be_unknown_or_clarify",
+    "notes": "Design doc explicitly lists this as a refuse-gracefully case, UNLESS it should map straight to a broad suspicious scan (design doc's own wording is ambivalent: 'unless mapped straight to suspicious scan'). Scored strictly as must-refuse here; revisit if this turns out to be too strict in practice."
+  },
+  {
+    "id": "refuse_causality_how_attack_happened",
+    "query_text": "show how the attack happened",
+    "mock_context": {
+      "techniques": [
+        {
+          "technique_id": "T1003.001",
+          "name": "OS Credential Dumping: LSASS Memory",
+          "tactic_id": "TA0006",
+          "tactic_name": "Credential Access",
+          "aliases": [
+            "credential dumping",
+            "credentials dumping",
+            "dump credentials",
+            "lsass dumping",
+            "mimikatz"
+          ]
+        }
+      ],
+      "confirmed_roles": [
+        {
+          "role": "user",
+          "sql_name": "Account"
+        }
+      ],
+      "has_normalized_time": true
+    },
+    "expected": "must_be_unknown_or_clarify",
+    "notes": "Causality/root-cause request -- explicitly out of scope per design doc section C."
+  },
+  {
+    "id": "refuse_empty_string",
+    "query_text": "",
+    "mock_context": {
+      "techniques": [
+        {
+          "technique_id": "T1003.001",
+          "name": "OS Credential Dumping: LSASS Memory",
+          "tactic_id": "TA0006",
+          "tactic_name": "Credential Access",
+          "aliases": [
+            "credential dumping",
+            "credentials dumping",
+            "dump credentials",
+            "lsass dumping",
+            "mimikatz"
+          ]
+        }
+      ],
+      "confirmed_roles": [
+        {
+          "role": "user",
+          "sql_name": "Account"
+        }
+      ],
+      "has_normalized_time": true
+    },
+    "expected": "must_be_unknown_or_clarify",
+    "notes": "Degenerate input."
+  },
+  {
+    "id": "refuse_hallucination_guard_unknown_technique",
+    "query_text": "show me T1055 process injection activity",
+    "mock_context": {
+      "techniques": [
+        {
+          "technique_id": "T1003.001",
+          "name": "OS Credential Dumping: LSASS Memory",
+          "tactic_id": "TA0006",
+          "tactic_name": "Credential Access",
+          "aliases": [
+            "credential dumping",
+            "credentials dumping",
+            "dump credentials",
+            "lsass dumping",
+            "mimikatz"
+          ]
+        }
+      ],
+      "confirmed_roles": [
+        {
+          "role": "user",
+          "sql_name": "Account"
+        }
+      ],
+      "has_normalized_time": true
+    },
+    "expected": "must_be_unknown_or_clarify",
+    "notes": "Names a real-sounding technique (T1055 Process Injection) that is NOT in the injected library -- must not fabricate a matching entry or silently substitute an unrelated technique it does have. The most important case in this set: a model that instead confidently answers with T1003.001 (a real, valid-looking, but wrong answer) is undetectable by the hallucination validator and represents the worst possible failure mode."
+  }
+]

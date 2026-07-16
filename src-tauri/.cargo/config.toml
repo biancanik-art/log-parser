@@ -1,0 +1,11 @@
+# Candle selects its quantized AVX2 kernels at compile time. These release
+# targets therefore use the benchmarked x86-64 baseline instead of the build
+# machine-specific `target-cpu=native`, which is not portable.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+avx2,+fma"]
+
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "target-feature=+avx2,+fma"]
+
+[target.x86_64-apple-darwin]
+rustflags = ["-C", "target-feature=+avx2,+fma"]

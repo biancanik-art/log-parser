@@ -24,6 +24,8 @@
   },
   "bundle": {
     "active": true,
+    "license": "Apache-2.0",
+    "licenseFile": "../LICENSE",
     "targets": "all",
     "icon": [
       "icons/32x32.png",
@@ -31,6 +33,13 @@
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "resources": {
+      "../LICENSE": "legal/LICENSE",
+      "../NOTICE": "legal/NOTICE",
+      "resources/intel/mitre_core.v1.json": "intel/mitre_core.v1.json",
+      "resources/models/qwen2.5-1.5b-instruct-q4_k_m.gguf": "models/qwen2.5-1.5b-instruct-q4_k_m.gguf",
+      "resources/models/qwen2.5-1.5b-instruct-tokenizer.json": "models/qwen2.5-1.5b-instruct-tokenizer.json"
+    }
   }
 }

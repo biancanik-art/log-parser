@@ -4,5 +4,19 @@
 !/testdata/sentinel_sample_120k.xlsx
 !/testdata/multi_sheet_sample.xlsx
 
+# llm-bench: standalone model benchmark harness (Phase 1, not part of shipped app)
+/llm-bench/target/
+/llm-bench/.model-cache/
+/llm-bench/results/
+/llm-bench/.hf_token
+
+# Pinned local-AI resources are fetched for development/release builds. They are
+# too large for Git and are checksum-verified by scripts/fetch_llm_resources.py.
+/src-tauri/resources/models/*.gguf
+/src-tauri/resources/models/*tokenizer.json
+/src-tauri/resources/models/*.part
+__pycache__/
+*.pyc
+
 *.md
 !/README.md

@@ -19,9 +19,11 @@
   const progressLabel = document.getElementById("progress-label");
 
   const guidedQueryPanel = document.getElementById("guided-query-panel");
+  const guidedAiStatus = document.getElementById("guided-ai-status");
   const guidedPreviewText = document.getElementById("guided-preview-text");
   const guidedClarification = document.getElementById("guided-clarification");
   const guidedRunBtn = document.getElementById("guided-run-btn");
+  const guidedRejectBtn = document.getElementById("guided-reject-btn");
   const guidedResetBtn = document.getElementById("guided-reset-btn");
   const guidedPanelClose = document.getElementById("guided-panel-close");
 
@@ -81,6 +83,16 @@
   let queryMode = "normal";
   let guidedParseResult = null;
   let guidedIntentToken = null;
+  let guidedAuditId = null;
+  let guidedReviewStatus = null;
+  let guidedContextRevision = 0;
+  let guidedParseRequestSequence = 0;
+  let guidedActiveParse = null;
+  let guidedActionSequence = 0;
+  let guidedActiveAction = null;
+  let guidedActiveQuery = null;
+  let sheetLoadInFlight = false;
+  let controlsEnabled = false;
 
   let columnRoleSuggestions = [];
   let timestampAnalysis = null;
@@ -102,6 +114,7 @@
   // -- helpers --------------------------------------------------------------
 
   function setControlsEnabled(enabled) {
+    controlsEnabled = enabled;
     removeFileBtn.disabled = !enabled;
     searchBox.disabled = !enabled;
     guidedSearchBox.disabled = !enabled;
@@ -118,6 +131,7 @@
     } else {
       suspiciousScanBtn.disabled = true;
     }
+    updateGuidedInteractionControls();
   }
 
   function showProgress(label, fraction) {
@@ -130,10 +144,49 @@
     progressWrap.classList.add("hidden");
   }
 
-  function resetIntelUiState() {
+  function updateGuidedInteractionControls() {
+    const parsing = guidedActiveParse !== null;
+    const actionInFlight = guidedActiveAction !== null;
+    const queryInFlight = guidedActiveQuery !== null;
+    guidedSearchSubmit.disabled =
+      !controlsEnabled || columns.length === 0 || sheetLoadInFlight || parsing || actionInFlight || queryInFlight;
+    guidedRunBtn.disabled = actionInFlight || queryInFlight;
+    guidedRejectBtn.disabled = actionInFlight || queryInFlight;
+    guidedResetBtn.disabled = actionInFlight || queryInFlight;
+    // Keep Close available while parsing so it can cancel a slow preview, but do not let it
+    // race the decision implicit in Run or an explicit Reject/Edit request.
+    guidedPanelClose.disabled = actionInFlight || queryInFlight;
+  }
+
+  function invalidateGuidedContext() {
+    guidedContextRevision += 1;
+    guidedActiveParse = null;
+  }
+
+  function resetGuidedQueryUi() {
+    invalidateGuidedContext();
     queryMode = "normal";
     guidedParseResult = null;
     guidedIntentToken = null;
+    guidedAuditId = null;
+    guidedReviewStatus = null;
+
+    guidedSearchBox.value = "";
+    guidedQueryPanel.classList.add("hidden");
+    guidedPreviewText.textContent = "";
+    guidedAiStatus.textContent = "";
+    guidedAiStatus.classList.add("hidden");
+    guidedClarification.textContent = "";
+    guidedClarification.classList.add("hidden");
+    guidedRunBtn.textContent = "Run";
+    guidedRunBtn.classList.add("hidden");
+    guidedRejectBtn.classList.add("hidden");
+    guidedResetBtn.classList.add("hidden");
+    updateGuidedInteractionControls();
+  }
+
+  function resetIntelUiState() {
+    resetGuidedQueryUi();
     columnRoleSuggestions = [];
     timestampAnalysis = null;
     timestampNormalizationSummary = null;
@@ -142,14 +195,6 @@
     roleDetectionInFlight = false;
     roleDetectionError = null;
     intelScanInFlight = false;
-
-    guidedSearchBox.value = "";
-    guidedQueryPanel.classList.add("hidden");
-    guidedPreviewText.textContent = "";
-    guidedClarification.textContent = "";
-    guidedClarification.classList.add("hidden");
-    guidedRunBtn.classList.add("hidden");
-    guidedResetBtn.classList.add("hidden");
 
     roleList.innerHTML = "";
     rolePanelStatus.textContent = "";
@@ -166,6 +211,66 @@
 
     renderScanSummary(null);
     updateEvidenceColumnsUi();
+  }
+
+  function guidedParseIsCurrent(request) {
+    return (
+      guidedActiveParse === request &&
+      guidedContextRevision === request.contextRevision &&
+      currentPath === request.path &&
+      currentSheet === request.sheet
+    );
+  }
+
+  function cancelActiveGuidedParse() {
+    if (guidedActiveParse === null) return;
+    guidedActiveParse = null;
+    hideProgress();
+    updateGuidedInteractionControls();
+  }
+
+  function beginGuidedAction(type, { allowDuringParse = false } = {}) {
+    if (
+      guidedActiveAction !== null ||
+      guidedActiveQuery !== null ||
+      (!allowDuringParse && guidedActiveParse !== null)
+    ) {
+      return null;
+    }
+    const action = {
+      id: ++guidedActionSequence,
+      type,
+      contextRevision: guidedContextRevision,
+      auditId: guidedAuditId,
+      intentToken: guidedIntentToken,
+    };
+    guidedActiveAction = action;
+    updateGuidedInteractionControls();
+    return action;
+  }
+
+  function guidedActionIsCurrent(action) {
+    return (
+      guidedActiveAction === action &&
+      guidedContextRevision === action.contextRevision &&
+      guidedAuditId === action.auditId &&
+      guidedIntentToken === action.intentToken
+    );
+  }
+
+  function finishGuidedAction(action) {
+    if (guidedActiveAction === action) {
+      guidedActiveAction = null;
+      updateGuidedInteractionControls();
+    }
+  }
+
+  function setGuidedReviewStatus(status) {
+    guidedReviewStatus = status;
+    if (guidedParseResult) {
+      guidedParseResult = { ...guidedParseResult, reviewStatus: status };
+    }
+    guidedAiStatus.textContent = `AI-assisted interpretation \u2022 ${status} by examiner \u2022 processed locally`;
   }
 
   function formatRoleName(role) {
@@ -343,10 +448,28 @@
   function renderGuidedPreview(result) {
     guidedParseResult = result;
     guidedIntentToken = result.intentToken || null;
+    guidedAuditId = Number.isInteger(result.auditId) ? result.auditId : null;
+    guidedReviewStatus = result.reviewStatus || null;
+    guidedRunBtn.textContent = "Run";
     guidedQueryPanel.classList.remove("hidden");
     guidedPreviewText.textContent = result.previewText || "No preview was returned.";
 
-    if (result.needsClarification) {
+    if (result.aiAssisted) {
+      const validation = result.validationStatus ? ` • ${result.validationStatus.replace(/_/g, " ")}` : "";
+      guidedAiStatus.textContent = `AI-assisted interpretation • ${guidedReviewStatus || "unreviewed"}${validation} • processed locally`;
+      guidedAiStatus.classList.remove("hidden");
+      guidedRejectBtn.classList.toggle("hidden", guidedReviewStatus !== "unreviewed");
+    } else {
+      guidedAiStatus.textContent = "Deterministic safety check • no model inference used";
+      guidedAiStatus.classList.remove("hidden");
+      guidedRejectBtn.classList.add("hidden");
+    }
+
+    if (
+      result.needsClarification ||
+      guidedAuditId === null ||
+      !["unreviewed", "accepted"].includes(guidedReviewStatus)
+    ) {
       guidedClarification.textContent = result.clarificationMessage || "Clarification is needed before this can run.";
       guidedClarification.classList.remove("hidden");
       guidedRunBtn.classList.add("hidden");
@@ -356,6 +479,7 @@
       guidedRunBtn.classList.remove("hidden");
     }
     guidedResetBtn.classList.toggle("hidden", queryMode !== "guided");
+    updateGuidedInteractionControls();
   }
 
   function renderReportSummary(summary) {
@@ -462,31 +586,68 @@
     // Disabled synchronously (before the first await below) so a rapid double-click on
     // Prev/Next can't fire a second query_rows() while this one is still in flight and read a
     // stale nextCursor — the button is unclickable for the whole round trip either way.
+    const modeAtStart = queryMode;
+    const isGuidedRequest = modeAtStart === "guided";
+    if (isGuidedRequest && guidedActiveQuery !== null) return null;
+
+    const guidedQueryRequest = isGuidedRequest
+      ? {
+          contextRevision: guidedContextRevision,
+          auditId: guidedAuditId,
+          intentToken: guidedIntentToken,
+          cursor: spec.cursor,
+          limit: spec.limit,
+          table,
+        }
+      : null;
+    if (guidedQueryRequest) {
+      guidedActiveQuery = guidedQueryRequest;
+      updateGuidedInteractionControls();
+    }
+
+    const guidedQueryIsCurrent = () =>
+      !guidedQueryRequest ||
+      (guidedContextRevision === guidedQueryRequest.contextRevision &&
+        queryMode === "guided" &&
+        guidedAuditId === guidedQueryRequest.auditId &&
+        guidedIntentToken === guidedQueryRequest.intentToken &&
+        table === guidedQueryRequest.table);
+
     prevPageBtn.disabled = true;
     nextPageBtn.disabled = true;
-    showProgress(queryMode === "guided" ? "Running guided query..." : "Filtering...", 0.5);
+    showProgress(isGuidedRequest ? "Running guided query..." : "Filtering...", 0.5);
     try {
       const page =
-        queryMode === "guided"
+        isGuidedRequest
           ? await invoke("run_guided_query", {
-              intentToken: guidedIntentToken,
-              cursor: spec.cursor,
-              limit: spec.limit,
+              intentToken: guidedQueryRequest.intentToken,
+              auditId: guidedQueryRequest.auditId,
+              cursor: guidedQueryRequest.cursor,
+              limit: guidedQueryRequest.limit,
             })
           : await invoke("query_rows", { spec });
+      if (!guidedQueryIsCurrent() || !table) return null;
       table.setData(page.rows);
       nextCursor = page.nextCursor;
       hasMore = page.hasMore;
       updateRowCountLabel();
       return page;
     } catch (err) {
-      console.error(`${queryMode === "guided" ? "run_guided_query" : "query_rows"} failed`, err);
+      if (!guidedQueryIsCurrent()) return null;
+      console.error(`${isGuidedRequest ? "run_guided_query" : "query_rows"} failed`, err);
       alert(`Query failed: ${err}`);
       return null;
     } finally {
-      prevPageBtn.disabled = cursorStack.length === 0;
-      nextPageBtn.disabled = !hasMore;
-      hideProgress();
+      const stillCurrent = guidedQueryIsCurrent();
+      if (guidedActiveQuery === guidedQueryRequest) {
+        guidedActiveQuery = null;
+        updateGuidedInteractionControls();
+      }
+      if (stillCurrent) {
+        prevPageBtn.disabled = cursorStack.length === 0;
+        nextPageBtn.disabled = !hasMore;
+        hideProgress();
+      }
     }
   }
 
@@ -612,39 +773,116 @@
   async function previewGuidedQuery(queryText = guidedSearchBox.value) {
     const trimmed = queryText.trim();
     if (!trimmed) return null;
+    if (guidedActiveAction !== null || guidedActiveQuery !== null || sheetLoadInFlight) return null;
 
-    guidedSearchSubmit.disabled = true;
+    const request = {
+      id: ++guidedParseRequestSequence,
+      contextRevision: guidedContextRevision,
+      path: currentPath,
+      sheet: currentSheet,
+    };
+    // Replacing this object immediately makes any older inference response stale, even when a
+    // test/debug caller starts a second preview without waiting for the first one.
+    guidedActiveParse = request;
+
+    updateGuidedInteractionControls();
     guidedQueryPanel.classList.remove("hidden");
     guidedPreviewText.textContent = "Parsing guided query...";
     guidedClarification.classList.add("hidden");
     guidedRunBtn.classList.add("hidden");
+    guidedRejectBtn.classList.add("hidden");
     showProgress("Parsing guided query...", 0.3);
     try {
+      if (guidedAuditId !== null && guidedReviewStatus === "unreviewed") {
+        const edited = await decideGuidedParse("edited", { allowDuringParse: true });
+        if (!edited || !guidedParseIsCurrent(request)) return null;
+      }
       const result = await invoke("parse_guided_query", { queryText: trimmed });
+      if (!guidedParseIsCurrent(request)) return null;
       renderGuidedPreview(result);
       return result;
     } catch (err) {
+      if (!guidedParseIsCurrent(request)) return null;
       console.error("parse_guided_query failed", err);
       guidedPreviewText.textContent = `Guided query preview failed: ${err}`;
       throw err;
     } finally {
-      guidedSearchSubmit.disabled = columns.length === 0;
-      hideProgress();
+      const stillCurrent = guidedParseIsCurrent(request);
+      if (guidedActiveParse === request) {
+        guidedActiveParse = null;
+        updateGuidedInteractionControls();
+      }
+      if (stillCurrent) hideProgress();
     }
   }
 
   async function runGuidedQuery(intentToken = guidedIntentToken) {
-    if (!intentToken) {
-      throw new Error("no guided intent token is ready to run");
+    if (!intentToken || guidedAuditId === null) {
+      throw new Error("no reviewed AI-assisted intent is ready to run");
     }
-    queryMode = "guided";
+    if (!["unreviewed", "accepted"].includes(guidedReviewStatus)) {
+      throw new Error(`AI-assisted interpretation was ${guidedReviewStatus || "not reviewable"} and cannot be run`);
+    }
     guidedIntentToken = intentToken;
-    totalCount = null;
-    resetPagination();
-    guidedResetBtn.classList.remove("hidden");
-    const page = await refreshData();
-    refreshCount();
-    return page;
+    const action = beginGuidedAction("run");
+    if (!action) return null;
+
+    try {
+      guidedRunBtn.textContent = "Accepting...";
+      // Make the audit transition explicit so an acceptance failure (stale scan/library,
+      // rejected preview, or token mismatch) cannot be displayed as accepted. The query command
+      // repeats this check idempotently for direct-IPC safety.
+      await invoke("accept_guided_query", {
+        intentToken: action.intentToken,
+        auditId: action.auditId,
+      });
+      if (!guidedActionIsCurrent(action)) return null;
+
+      setGuidedReviewStatus("accepted");
+      guidedRejectBtn.classList.add("hidden");
+      queryMode = "guided";
+      totalCount = null;
+      resetPagination();
+      guidedResetBtn.classList.remove("hidden");
+      guidedRunBtn.textContent = "Running...";
+
+      const page = await refreshData();
+      if (guidedActionIsCurrent(action)) {
+        guidedRunBtn.textContent = page ? "Run" : "Retry";
+        guidedRunBtn.classList.remove("hidden");
+        refreshCount();
+      }
+      return page;
+    } catch (err) {
+      if (guidedActionIsCurrent(action) && guidedReviewStatus !== "accepted") {
+        guidedRunBtn.textContent = "Run";
+        guidedRunBtn.classList.remove("hidden");
+        guidedRejectBtn.classList.remove("hidden");
+      }
+      throw err;
+    } finally {
+      finishGuidedAction(action);
+    }
+  }
+
+  async function decideGuidedParse(decision, { allowDuringParse = false } = {}) {
+    if (guidedAuditId === null || guidedReviewStatus !== "unreviewed") return false;
+    const action = beginGuidedAction(decision, { allowDuringParse });
+    if (!action) return false;
+    try {
+      await invoke("set_guided_parse_decision", {
+        auditId: action.auditId,
+        intentToken: action.intentToken,
+        decision,
+      });
+      if (!guidedActionIsCurrent(action)) return false;
+      setGuidedReviewStatus(decision);
+      guidedRunBtn.classList.add("hidden");
+      guidedRejectBtn.classList.add("hidden");
+      return true;
+    } finally {
+      finishGuidedAction(action);
+    }
   }
 
   async function generateReport(destPath) {
@@ -673,10 +911,17 @@
     if (!path) return;
 
     currentPath = path;
+    sheetLoadInFlight = true;
+    // Choosing a different source invalidates any inference that was started for the previous
+    // file, even before the native sheet listing/import round trip completes.
+    resetGuidedQueryUi();
+    hideProgress();
     let sheets;
     try {
       sheets = await invoke("list_sheets", { path });
     } catch (err) {
+      sheetLoadInFlight = false;
+      updateGuidedInteractionControls();
       alert(`Could not read workbook: ${err}`);
       return;
     }
@@ -696,16 +941,21 @@
   }
 
   async function loadSheet(sheet) {
+    sheetLoadInFlight = true;
+    resetGuidedQueryUi();
     sheetPicker.classList.add("hidden");
     currentSheet = sheet;
     showProgress(`Reading "${sheet}"…`, 0);
 
     try {
       const summary = await invoke("import_sheet", { path: currentPath, sheet });
+      sheetLoadInFlight = false;
       hideProgress();
       onImportComplete(summary);
       return summary;
     } catch (err) {
+      sheetLoadInFlight = false;
+      updateGuidedInteractionControls();
       hideProgress();
       alert(`Import failed: ${err}`);
       throw err;
@@ -761,6 +1011,7 @@
   }
 
   function removeFile() {
+    sheetLoadInFlight = false;
     if (table) {
       table.destroy();
       table = null;
@@ -776,8 +1027,14 @@
     resetPagination();
     resetIntelUiState();
     setControlsEnabled(false);
+    hideProgress();
     rowCountLabel.textContent = "—";
     pageLabel.textContent = "";
+    return invoke("clear_loaded_file").catch((err) => {
+      // The local generation/UI have already been invalidated synchronously. Keep the app in
+      // that safe empty state and surface a backend-clear failure for diagnostics.
+      console.error("clear_loaded_file failed", err);
+    });
   }
 
   // -- export flow --------------------------------------------------------------
@@ -846,6 +1103,9 @@
   guidedRunBtn.addEventListener("click", () => {
     runGuidedQuery().catch((err) => alert(`Guided query failed: ${err}`));
   });
+  guidedRejectBtn.addEventListener("click", () => {
+    decideGuidedParse("rejected").catch((err) => alert(`Could not record decision: ${err}`));
+  });
   guidedResetBtn.addEventListener("click", () => {
     queryMode = "normal";
     guidedIntentToken = null;
@@ -855,6 +1115,8 @@
     refreshCount();
   });
   guidedPanelClose.addEventListener("click", () => {
+    cancelActiveGuidedParse();
+    decideGuidedParse("rejected").catch((err) => console.error("set_guided_parse_decision failed", err));
     guidedQueryPanel.classList.add("hidden");
   });
 
@@ -986,6 +1248,11 @@
         queryMode,
         guidedParseResult,
         guidedIntentToken,
+        guidedAuditId,
+        guidedReviewStatus,
+        parseInFlight: guidedActiveParse !== null,
+        actionInFlight: guidedActiveAction ? guidedActiveAction.type : null,
+        queryInFlight: guidedActiveQuery !== null,
         hasMore,
         pageIndex,
         totalCount,
@@ -1013,6 +1280,9 @@
     },
     runGuidedQueryForTest(intentToken = guidedIntentToken) {
       return runGuidedQuery(intentToken);
+    },
+    decideGuidedParseForTest(decision) {
+      return decideGuidedParse(decision);
     },
     generateReportForTest(destPath) {
       return generateReport(destPath);

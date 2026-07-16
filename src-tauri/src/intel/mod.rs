@@ -1,4 +1,5 @@
 pub mod library;
+pub mod llm_parser;
 pub mod matcher;
 pub mod parser;
 pub mod query;

@@ -10,19 +10,30 @@ pub mod report;
 pub mod tabular_import;
 
 use commands::AppState;
+use tauri::{path::BaseDirectory, Manager};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(AppState::default())
+        .setup(|app| {
+            let library_path = app
+                .path()
+                .resolve("intel/mitre_core.v1.json", BaseDirectory::Resource)?;
+            intel::library::configure_builtin_library_path(library_path)?;
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             commands::list_sheets,
             commands::import_sheet,
             commands::query_rows,
             commands::count_rows,
             commands::parse_guided_query,
+            commands::accept_guided_query,
             commands::run_guided_query,
+            commands::set_guided_parse_decision,
+            commands::clear_loaded_file,
             commands::detect_column_roles,
             commands::set_column_role_status,
             commands::analyze_timestamp_column,

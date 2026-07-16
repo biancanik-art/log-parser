@@ -16,8 +16,8 @@
       <div class="toolbar-spacer"></div>
       <input id="search-box" type="search" placeholder="Search all columns…" disabled />
       <form id="guided-search-form" class="guided-search-form">
-        <label for="guided-search-box" class="guided-search-label">Ask (offline, no AI)</label>
-        <input id="guided-search-box" type="search" placeholder="show credential access for alice chronologically" disabled />
+        <label for="guided-search-box" class="guided-search-label">Local AI (offline)</label>
+        <input id="guided-search-box" type="search" maxlength="4096" placeholder="show credential access for alice chronologically" disabled />
         <button id="guided-search-submit" class="btn" disabled>Preview</button>
       </form>
       <button id="report-export-btn" class="btn" disabled>Generate Report</button>
@@ -35,10 +35,12 @@
         <strong>Guided search preview</strong>
         <button id="guided-panel-close" class="btn btn-small" title="Dismiss preview">&times;</button>
       </div>
+      <div id="guided-ai-status" class="guided-ai-status hidden"></div>
       <div id="guided-preview-text" class="intel-panel-body"></div>
       <div id="guided-clarification" class="intel-panel-note hidden"></div>
       <div class="intel-panel-actions">
         <button id="guided-run-btn" class="btn btn-primary hidden">Run</button>
+        <button id="guided-reject-btn" class="btn hidden">Reject interpretation</button>
         <button id="guided-reset-btn" class="btn hidden">Return to filters</button>
       </div>
     </section>

@@ -23,10 +23,12 @@ See the [wiki](../../wiki) for a full user guide.
 - An offline, built-in MITRE ATT&CK-style keyword library, scanned via
   Aho-Corasick pattern matching, extensible with your own custom
   categories.
-- A local, rule-based "guided search" box — describe what you're looking
-  for in plain language (e.g. *"show credential access for alice
-  chronologically"*) and it previews its interpretation before running
-  anything. No LLM, no network call, ever.
+- A local-AI guided search box powered by an embedded, quantized
+  Qwen2.5-1.5B-Instruct model — describe what you're looking for in plain
+  language (e.g. *"show credential access for alice chronologically"*).
+  Its structured interpretation is validated and previewed for examiner
+  acceptance before anything runs. Inference is in-process and offline; the
+  model never receives direct row, SQL, file, shell, or network access.
 - One-click multi-sheet XLSX report export: a case-summary sheet, a
   chronological MITRE-mapped timeline, and one sheet per matched
   technique category — every row traceable back to its original source
@@ -43,9 +45,12 @@ Sample data is included under `testdata/`:
 
 Requires [Rust](https://rustup.rs/) and the
 [Tauri v2 prerequisites](https://v2.tauri.app/start/prerequisites/) for
-your platform (Windows, macOS, or Linux).
+your platform (Windows, macOS, or Linux). Fetch the checksum-pinned model and
+tokenizer once before building; this is an explicit build-time download, not
+an application runtime download:
 
 ```sh
+python scripts/fetch_llm_resources.py
 cd src-tauri
 cargo tauri build
 ```
@@ -58,9 +63,14 @@ follows the standard Tauri process — see the
 To run in development mode:
 
 ```sh
+python scripts/fetch_llm_resources.py
 cd src-tauri
 cargo tauri dev
 ```
+
+The embedded model adds about 1.12 GB to an unpacked application. Current
+x86-64 builds require AVX2 and FMA CPU support; Apple Silicon uses its native
+ARM SIMD baseline.
 
 ## Stack
 
@@ -68,7 +78,9 @@ Rust + [Tauri v2](https://v2.tauri.app/) · [calamine](https://github.com/tafia/
 (Excel parsing) · SQLite via [rusqlite](https://github.com/rusqlite/rusqlite)
 (bundled, FTS5 full-text search) · [aho-corasick](https://github.com/BurntSushi/aho-corasick)
 (keyword matching) · [rust_xlsxwriter](https://github.com/jmcnamara/rust_xlsxwriter)
-(report export) · plain HTML/CSS/vanilla JS frontend
+(report export) · [Candle](https://github.com/huggingface/candle) with
+[Qwen2.5-1.5B-Instruct](https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct)
+for embedded local inference · plain HTML/CSS/vanilla JS frontend
 ([Tabulator.js](https://tabulator.info/) for the grid), no build step.
 
 ## Downloads

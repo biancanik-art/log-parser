@@ -1,24 +1,27 @@
 use crate::db::{self, ColumnMeta, ImportInfo};
 use crate::export;
 use crate::intel::matcher::{self, IntelScanSummary};
-use crate::intel::{parser as guided_parser, query as guided_query, roles, time};
+use crate::intel::{llm_parser, parser as guided_parser, query as guided_query, roles, time};
 use crate::query::{self, QueryPage, QuerySpec};
 use crate::report::{self, ReportExportSummary};
 use crate::tabular_import;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
-use tauri::{AppHandle, Emitter, State};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use tauri::{path::BaseDirectory, AppHandle, Emitter, Manager, State};
 
 pub struct AppStateInner {
     pub db_path: PathBuf,
     pub columns: Vec<ColumnMeta>,
+    pub generation: u64,
 }
 
 #[derive(Default)]
 pub struct AppState {
     pub loaded: Mutex<Option<AppStateInner>>,
+    pub llm: Arc<Mutex<Option<llm_parser::LlmParser>>>,
+    next_generation: AtomicU64,
     /// Guards against overlapping `import_sheet` calls (e.g. a double-clicked "Load Sheet"
     /// button, or opening a second file while the first is still importing). Without this,
     /// concurrent imports can race on the same cache file and on which result last wins the
@@ -83,7 +86,7 @@ fn now_marker() -> String {
     chrono::Utc::now().to_rfc3339()
 }
 
-fn state_snapshot(state: &State<'_, AppState>) -> Result<(PathBuf, Vec<ColumnMeta>), String> {
+fn state_snapshot(state: &State<'_, AppState>) -> Result<(PathBuf, Vec<ColumnMeta>, u64), String> {
     let guard = state
         .loaded
         .lock()
@@ -91,7 +94,11 @@ fn state_snapshot(state: &State<'_, AppState>) -> Result<(PathBuf, Vec<ColumnMet
     let inner = guard
         .as_ref()
         .ok_or_else(|| "no file loaded — call import_sheet first".to_string())?;
-    Ok((inner.db_path.clone(), inner.columns.clone()))
+    Ok((
+        inner.db_path.clone(),
+        inner.columns.clone(),
+        inner.generation,
+    ))
 }
 
 #[tauri::command]
@@ -115,7 +122,15 @@ pub async fn import_sheet(
             "Another file is already being imported — please wait for it to finish.".to_string(),
         );
     }
-    let result = import_sheet_locked(&app, &state, path, sheet).await;
+    let generation = state.next_generation.fetch_add(1, Ordering::SeqCst) + 1;
+    {
+        let mut guard = state
+            .loaded
+            .lock()
+            .map_err(|_| "app state lock poisoned".to_string())?;
+        *guard = None;
+    }
+    let result = import_sheet_locked(&app, &state, path, sheet, generation).await;
     state.busy.store(false, Ordering::SeqCst);
     result
 }
@@ -132,6 +147,7 @@ async fn import_sheet_locked(
     state: &State<'_, AppState>,
     path: String,
     sheet: String,
+    generation: u64,
 ) -> Result<ImportSummary, String> {
     let start = std::time::Instant::now();
     let source_path = PathBuf::from(&path);
@@ -223,6 +239,11 @@ async fn import_sheet_locked(
     .map_err(|e| format!("import task join error: {e}"))??;
 
     {
+        if state.next_generation.load(Ordering::SeqCst) != generation {
+            return Err(
+                "the file import was canceled because the loaded-file state changed".into(),
+            );
+        }
         let mut guard = state
             .loaded
             .lock()
@@ -230,6 +251,7 @@ async fn import_sheet_locked(
         *guard = Some(AppStateInner {
             db_path: db_path.clone(),
             columns: columns.clone(),
+            generation,
         });
     }
 
@@ -244,46 +266,153 @@ async fn import_sheet_locked(
 
 #[tauri::command]
 pub fn query_rows(state: State<'_, AppState>, spec: QuerySpec) -> Result<QueryPage, String> {
-    let (db_path, columns) = state_snapshot(&state)?;
+    let (db_path, columns, _) = state_snapshot(&state)?;
     let conn = db::open(&db_path).map_err(|e| e.to_string())?;
     query::query_rows(&conn, &columns, &spec).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub fn count_rows(state: State<'_, AppState>, spec: QuerySpec) -> Result<i64, String> {
-    let (db_path, columns) = state_snapshot(&state)?;
+    let (db_path, columns, _) = state_snapshot(&state)?;
     let conn = db::open(&db_path).map_err(|e| e.to_string())?;
     query::count_rows(&conn, &columns, &spec).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-pub fn parse_guided_query(
+pub async fn parse_guided_query(
+    app: AppHandle,
     state: State<'_, AppState>,
     query_text: String,
 ) -> Result<guided_parser::GuidedQueryPreview, String> {
-    let (db_path, columns) = state_snapshot(&state)?;
-    let conn = db::open(&db_path).map_err(|e| e.to_string())?;
-    guided_parser::parse_guided_query(&conn, &columns, &query_text).map_err(|e| e.to_string())
+    let (db_path, columns, generation) = state_snapshot(&state)?;
+    let parsed_db_path = db_path.clone();
+    let model_path = resolve_llm_resource(&app, llm_parser::MODEL_RESOURCE_PATH)?;
+    let tokenizer_path = resolve_llm_resource(&app, llm_parser::TOKENIZER_RESOURCE_PATH)?;
+    let llm = Arc::clone(&state.llm);
+    let preview = tauri::async_runtime::spawn_blocking(
+        move || -> Result<guided_parser::GuidedQueryPreview, String> {
+            let conn = db::open(&db_path).map_err(|e| e.to_string())?;
+            let mut guard = llm
+                .lock()
+                .map_err(|_| "local AI model lock poisoned".to_string())?;
+            if guard.is_none() {
+                *guard = Some(
+                    llm_parser::LlmParser::load(&model_path, &tokenizer_path)
+                        .map_err(|error| error.to_string())?,
+                );
+            }
+            let model = guard
+                .as_mut()
+                .ok_or_else(|| "local AI model failed to initialize".to_string())?;
+            guided_parser::parse_guided_query_with_llm(&conn, &columns, &query_text, model)
+                .map_err(|error| error.to_string())
+        },
+    )
+    .await
+    .map_err(|error| format!("local AI parse task join error: {error}"))??;
+
+    let still_current = state
+        .loaded
+        .lock()
+        .map_err(|_| "app state lock poisoned".to_string())?
+        .as_ref()
+        .is_some_and(|inner| inner.generation == generation && inner.db_path == parsed_db_path);
+    if !still_current {
+        if let Some(audit_id) = preview.audit_id {
+            if let Ok(conn) = db::open(&parsed_db_path) {
+                let _ = guided_parser::set_llm_audit_decision(
+                    &conn,
+                    audit_id,
+                    &preview.intent_token,
+                    guided_parser::ExaminerDecision::Edited,
+                );
+            }
+        }
+        return Err(
+            "the loaded file or sheet changed while local AI was parsing; the stale preview was discarded"
+                .to_string(),
+        );
+    }
+    Ok(preview)
+}
+
+#[tauri::command]
+pub fn accept_guided_query(
+    state: State<'_, AppState>,
+    intent_token: String,
+    audit_id: i64,
+) -> Result<(), String> {
+    let (db_path, _, _) = state_snapshot(&state)?;
+    let conn = db::open(&db_path).map_err(|error| error.to_string())?;
+    guided_parser::accept_llm_audit(&conn, audit_id, &intent_token)
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
 pub fn run_guided_query(
     state: State<'_, AppState>,
     intent_token: String,
+    audit_id: i64,
     cursor: Option<query::Cursor>,
     limit: Option<u32>,
 ) -> Result<QueryPage, String> {
-    let (db_path, columns) = state_snapshot(&state)?;
+    let (db_path, columns, _) = state_snapshot(&state)?;
     let conn = db::open(&db_path).map_err(|e| e.to_string())?;
+    guided_parser::accept_llm_audit(&conn, audit_id, &intent_token)
+        .map_err(|error| error.to_string())?;
     guided_query::run_guided_query(&conn, &columns, &intent_token, cursor, limit)
-        .map_err(|e| e.to_string())
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub fn set_guided_parse_decision(
+    state: State<'_, AppState>,
+    audit_id: i64,
+    intent_token: String,
+    decision: guided_parser::ExaminerDecision,
+) -> Result<(), String> {
+    let (db_path, _, _) = state_snapshot(&state)?;
+    let conn = db::open(&db_path).map_err(|error| error.to_string())?;
+    guided_parser::set_llm_audit_decision(&conn, audit_id, &intent_token, decision)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub fn clear_loaded_file(state: State<'_, AppState>) -> Result<(), String> {
+    let mut guard = state
+        .loaded
+        .lock()
+        .map_err(|_| "app state lock poisoned".to_string())?;
+    *guard = None;
+    state.next_generation.fetch_add(1, Ordering::SeqCst);
+    Ok(())
+}
+
+fn resolve_llm_resource(app: &AppHandle, relative_path: &str) -> Result<PathBuf, String> {
+    let bundled = app
+        .path()
+        .resolve(relative_path, BaseDirectory::Resource)
+        .map_err(|error| format!("resolving local AI resource: {error}"))?;
+    if bundled.is_file() {
+        return Ok(bundled);
+    }
+    let development = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("resources")
+        .join(relative_path);
+    if development.is_file() {
+        return Ok(development);
+    }
+    Err(format!(
+        "local AI resource is missing: {}. Install an AI-enabled build or fetch the pinned model resources before running in development.",
+        bundled.display()
+    ))
 }
 
 #[tauri::command]
 pub fn detect_column_roles(
     state: State<'_, AppState>,
 ) -> Result<Vec<roles::ColumnRoleSuggestion>, String> {
-    let (db_path, columns) = state_snapshot(&state)?;
+    let (db_path, columns, _) = state_snapshot(&state)?;
     let conn = db::open(&db_path).map_err(|e| e.to_string())?;
     roles::detect_column_roles(&conn, &columns).map_err(|e| e.to_string())
 }
@@ -295,7 +424,7 @@ pub fn set_column_role_status(
     sql_name: String,
     status: roles::RoleDecisionStatus,
 ) -> Result<roles::ColumnRoleSuggestion, String> {
-    let (db_path, columns) = state_snapshot(&state)?;
+    let (db_path, columns, _) = state_snapshot(&state)?;
     let conn = db::open(&db_path).map_err(|e| e.to_string())?;
     roles::set_column_role_status(&conn, &columns, &role, &sql_name, status)
         .map_err(|e| e.to_string())
@@ -305,7 +434,7 @@ pub fn set_column_role_status(
 pub async fn analyze_timestamp_column(
     state: State<'_, AppState>,
 ) -> Result<time::TimestampAnalysis, String> {
-    let (db_path, columns) = state_snapshot(&state)?;
+    let (db_path, columns, _) = state_snapshot(&state)?;
     tauri::async_runtime::spawn_blocking(move || -> Result<time::TimestampAnalysis, String> {
         let conn = db::open(&db_path).map_err(|e| e.to_string())?;
         time::analyze_confirmed_timestamp_column(&conn, &columns).map_err(|e| e.to_string())
@@ -319,7 +448,7 @@ pub async fn normalize_timestamp_column(
     state: State<'_, AppState>,
     naive_timezone: Option<String>,
 ) -> Result<time::TimestampNormalizationSummary, String> {
-    let (db_path, columns) = state_snapshot(&state)?;
+    let (db_path, columns, _) = state_snapshot(&state)?;
     tauri::async_runtime::spawn_blocking(
         move || -> Result<time::TimestampNormalizationSummary, String> {
             let mut conn = db::open(&db_path).map_err(|e| e.to_string())?;
@@ -343,7 +472,7 @@ pub async fn export_data(
     format: ExportFormat,
     dest_path: String,
 ) -> Result<ExportSummary, String> {
-    let (db_path, columns) = state_snapshot(&state)?;
+    let (db_path, columns, _) = state_snapshot(&state)?;
     let dest = PathBuf::from(&dest_path);
     let dest_for_task = dest.clone();
     let app_for_task = app.clone();
@@ -379,7 +508,7 @@ pub async fn scan_intel_matches(
     state: State<'_, AppState>,
     evidence_columns: Vec<String>,
 ) -> Result<IntelScanSummary, String> {
-    let (db_path, columns) = state_snapshot(&state)?;
+    let (db_path, columns, _) = state_snapshot(&state)?;
     if evidence_columns.is_empty() {
         return Err("no evidence columns were provided".to_string());
     }
@@ -393,6 +522,17 @@ pub async fn scan_intel_matches(
     let app_for_task = app.clone();
     tauri::async_runtime::spawn_blocking(move || -> Result<IntelScanSummary, String> {
         let mut conn = db::open(&db_path).map_err(|e| e.to_string())?;
+        let mut requested_columns = evidence_columns.clone();
+        requested_columns.sort();
+        requested_columns.dedup();
+        let confirmed_columns = matcher::confirmed_evidence_columns(&conn)
+            .map_err(|error| error.to_string())?;
+        if requested_columns != confirmed_columns {
+            return Err(
+                "evidence columns changed or are not examiner-confirmed; review roles before scanning"
+                    .to_string(),
+            );
+        }
         matcher::scan_connection(
             &mut conn,
             &evidence_columns,
@@ -419,7 +559,7 @@ pub async fn export_report(
     state: State<'_, AppState>,
     dest_path: String,
 ) -> Result<ReportExportSummary, String> {
-    let (db_path, columns) = state_snapshot(&state)?;
+    let (db_path, columns, _) = state_snapshot(&state)?;
     let dest = PathBuf::from(&dest_path);
     let dest_for_task = dest.clone();
     let app_for_task = app.clone();

@@ -4,8 +4,8 @@ use aho_corasick::{AhoCorasick, AhoCorasickBuilder};
 use anyhow::{anyhow, Result};
 use rusqlite::Connection;
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
-use std::hash::{Hash, Hasher};
 
 const PROGRESS_INTERVAL_ROWS: i64 = 5000;
 
@@ -87,12 +87,36 @@ pub fn role_hash_for_columns(evidence_columns: &[String]) -> String {
     columns.sort();
     columns.dedup();
 
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    "evidence-columns-v1".hash(&mut hasher);
+    let mut hasher = Sha256::new();
+    hasher.update(b"evidence-columns-v1\0");
     for column in columns {
-        column.hash(&mut hasher);
+        hasher.update((column.len() as u64).to_le_bytes());
+        hasher.update(column.as_bytes());
     }
-    format!("{:016x}", hasher.finish())
+    format!("{:x}", hasher.finalize())
+}
+
+pub fn confirmed_evidence_columns(conn: &Connection) -> Result<Vec<String>> {
+    let roles_exist: i64 = conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '_column_roles'
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    if roles_exist == 0 {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn.prepare(
+        "SELECT sql_name FROM _column_roles
+         WHERE status = 'confirmed'
+           AND role IN ('command_line', 'process_name', 'file_name', 'host', 'text_evidence')
+         ORDER BY sql_name",
+    )?;
+    let columns = stmt
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(columns)
 }
 
 fn compile_library(library: LoadedLibrary) -> Result<CompiledLibrary> {
@@ -447,5 +471,39 @@ mod tests {
             .query_row("SELECT row_num FROM _intel_match", [], |row| row.get(0))
             .unwrap();
         assert_eq!(matched_row, 2);
+    }
+
+    #[test]
+    fn evidence_role_hash_is_stable_and_uses_only_confirmed_evidence_roles() {
+        let (conn, _) = setup_db(&[]);
+        db::create_column_roles_table(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO _column_roles (role, sql_name, confidence, status, reasons_json)
+             VALUES ('command_line', 'commandline', 1.0, 'confirmed', '[]')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO _column_roles (role, sql_name, confidence, status, reasons_json)
+             VALUES ('user', 'commandline', 1.0, 'confirmed', '[]')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO _column_roles (role, sql_name, confidence, status, reasons_json)
+             VALUES ('host', 'ignored', 1.0, 'rejected', '[]')",
+            [],
+        )
+        .unwrap();
+
+        assert_eq!(
+            confirmed_evidence_columns(&conn).unwrap(),
+            vec!["commandline".to_string()]
+        );
+        let one = role_hash_for_columns(&["commandline".into()]);
+        let reordered_duplicates =
+            role_hash_for_columns(&["commandline".into(), "commandline".into()]);
+        assert_eq!(one, reordered_duplicates);
+        assert_eq!(one.len(), 64);
     }
 }
