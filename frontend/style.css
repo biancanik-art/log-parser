@@ -412,6 +412,18 @@ select { font: inherit; }
   color: var(--text);
 }
 
+.timezone-controls label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.timezone-controls select {
+  min-width: 220px;
+}
+
 #suspicious-scan-btn,
 #review-roles-btn,
 #guided-search-submit,

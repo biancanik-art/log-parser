@@ -76,13 +76,21 @@
 
     <section id="timezone-panel" class="intel-panel timezone-panel hidden" aria-live="polite">
       <div class="intel-panel-header">
-        <strong>Timestamp timezone needed</strong>
+        <strong>Timestamp details needed</strong>
         <button id="timezone-panel-close" class="btn btn-small" title="Dismiss timezone prompt" aria-label="Dismiss timestamp timezone prompt">&times;</button>
       </div>
       <div id="timezone-summary" class="intel-panel-body"></div>
       <div id="timezone-samples" class="intel-panel-note hidden"></div>
       <div class="timezone-controls">
         <input id="timezone-input" type="text" placeholder="UTC offset or IANA timezone, e.g. +02:00 or Europe/Bucharest" />
+        <label id="date-convention-wrap" class="hidden" for="date-convention-select">
+          Slash-date order
+          <select id="date-convention-select">
+            <option value="">Choose date order&hellip;</option>
+            <option value="month_first">MM/DD/YYYY (month first)</option>
+            <option value="day_first">DD/MM/YYYY (day first)</option>
+          </select>
+        </label>
         <button id="timezone-utc-btn" class="btn">Already UTC</button>
         <button id="timezone-normalize-btn" class="btn btn-primary">Use timezone</button>
       </div>

@@ -39,6 +39,8 @@
   const timezoneSummary = document.getElementById("timezone-summary");
   const timezoneSamples = document.getElementById("timezone-samples");
   const timezoneInput = document.getElementById("timezone-input");
+  const dateConventionWrap = document.getElementById("date-convention-wrap");
+  const dateConventionSelect = document.getElementById("date-convention-select");
   const timezoneUtcBtn = document.getElementById("timezone-utc-btn");
   const timezoneNormalizeBtn = document.getElementById("timezone-normalize-btn");
   const timezonePanelClose = document.getElementById("timezone-panel-close");
@@ -301,11 +303,14 @@
     dataMappingSummary.textContent = "Waiting for a file";
 
     timezoneInput.value = "";
+    dateConventionSelect.value = "";
+    dateConventionWrap.classList.add("hidden");
     timezoneSummary.textContent = "";
     timezoneSamples.textContent = "";
     timezoneSamples.classList.add("hidden");
     timezonePanel.classList.add("hidden");
     timezoneNormalizeBtn.disabled = false;
+    timezoneNormalizeBtn.textContent = "Use timezone";
     timezoneUtcBtn.disabled = false;
 
     reportSummaryText.textContent = "";
@@ -565,10 +570,14 @@
         });
       });
       actions.append(confirmBtn, rejectBtn);
-      if (role === "timestamp" && timestampAnalysis && timestampAnalysis.needsTimezone) {
+      if (
+        role === "timestamp" &&
+        timestampAnalysis &&
+        (timestampAnalysis.needsTimezone || timestampAnalysis.needsDateConvention)
+      ) {
         const timezoneBtn = document.createElement("button");
         timezoneBtn.className = "btn btn-small";
-        timezoneBtn.textContent = "Timezone...";
+        timezoneBtn.textContent = "Time format...";
         timezoneBtn.addEventListener("click", () => showTimezonePrompt(timestampAnalysis));
         actions.appendChild(timezoneBtn);
       }
@@ -819,15 +828,28 @@
 
   function showTimezonePrompt(analysis) {
     timestampAnalysis = analysis;
-    timezoneSummary.textContent = `${analysis.originalName} has ${analysis.naiveCount.toLocaleString()} timestamp value(s) without an explicit timezone.`;
-    if (analysis.sampleNaiveValues && analysis.sampleNaiveValues.length > 0) {
-      timezoneSamples.textContent = `Samples: ${analysis.sampleNaiveValues.join("; ")}`;
+    const needsTimezone = Boolean(analysis.needsTimezone);
+    const needsDateConvention = Boolean(analysis.needsDateConvention);
+    const requirements = [];
+    if (needsTimezone) requirements.push("a source timezone");
+    if (needsDateConvention) requirements.push("the slash-date order");
+    timezoneSummary.textContent = `${analysis.originalName} needs ${requirements.join(" and ")} before chronological ordering is safe.`;
+    const samples = needsDateConvention
+      ? analysis.sampleAmbiguousDateValues || []
+      : analysis.sampleNaiveValues || [];
+    if (samples.length > 0) {
+      timezoneSamples.textContent = `Samples: ${samples.join("; ")}`;
       timezoneSamples.classList.remove("hidden");
     } else {
       timezoneSamples.textContent = "";
       timezoneSamples.classList.add("hidden");
     }
     timezoneInput.value = "";
+    dateConventionSelect.value = analysis.inferredDateConvention || "";
+    dateConventionWrap.classList.toggle("hidden", !needsDateConvention);
+    timezoneInput.classList.toggle("hidden", !needsTimezone);
+    timezoneUtcBtn.classList.toggle("hidden", !needsTimezone);
+    timezoneNormalizeBtn.textContent = needsTimezone ? "Use timestamp details" : "Use date order";
     timezonePanel.classList.remove("hidden");
   }
 
@@ -1212,11 +1234,11 @@
       const analysis = await invoke("analyze_timestamp_column");
       if (!automaticTimestampMappingIsCurrent(suggestion, request) || !timestampOperationIsCurrent(operation)) return null;
       timestampAnalysis = analysis;
-      if (analysis.needsTimezone) {
+      if (analysis.needsTimezone || analysis.needsDateConvention) {
         renderRoleSuggestions();
         showTimezonePrompt(analysis);
-        dataMappingSummary.textContent = "Timestamp timezone needed";
-        rolePanelStatus.textContent = "Choose a timezone only if chronological ordering is needed. AI evidence search remains available.";
+        dataMappingSummary.textContent = "Timestamp details needed";
+        rolePanelStatus.textContent = "Confirm timestamp details only if chronological ordering is needed. AI evidence search remains available.";
         return null;
       }
 
@@ -1340,11 +1362,11 @@
       const analysis = await invoke("analyze_timestamp_column");
       if (!timestampOperationIsCurrent(operation)) return null;
       timestampAnalysis = analysis;
-      if (analysis.needsTimezone) {
+      if (analysis.needsTimezone || analysis.needsDateConvention) {
         renderRoleSuggestions();
         showTimezonePrompt(analysis);
-        dataMappingSummary.textContent = "Timestamp timezone needed";
-        rolePanelStatus.textContent = "Timestamp normalization needs examiner timezone input.";
+        dataMappingSummary.textContent = "Timestamp details needed";
+        rolePanelStatus.textContent = "Timestamp normalization needs examiner input.";
         return null;
       }
       const summary = await normalizeTimestampColumn(null, operation);
@@ -1361,7 +1383,7 @@
     }
   }
 
-  async function normalizeTimestampColumn(naiveTimezone, existingOperation = null) {
+  async function normalizeTimestampColumn(naiveTimezone, existingOperation = null, dateConvention = null) {
     const operation = existingOperation || {
       id: ++timestampOperationSequence,
       contextRevision: guidedContextRevision,
@@ -1373,10 +1395,16 @@
     timezoneNormalizeBtn.disabled = true;
     timezoneUtcBtn.disabled = true;
     try {
-      const summary = await invoke("normalize_timestamp_column", { naiveTimezone });
+      const summary = await invoke("normalize_timestamp_column", { naiveTimezone, dateConvention });
       if (!timestampOperationIsCurrent(operation)) return null;
       timestampNormalizationSummary = summary;
-      if (timestampAnalysis) timestampAnalysis = { ...timestampAnalysis, needsTimezone: false };
+      if (timestampAnalysis) {
+        timestampAnalysis = {
+          ...timestampAnalysis,
+          needsTimezone: false,
+          needsDateConvention: false,
+        };
+      }
       timezonePanel.classList.add("hidden");
       renderRoleSuggestions();
       dataMappingSummary.textContent = `${columnRoleSuggestions.filter((row) => row.status !== "rejected").length} inferred, time ready`;
@@ -1964,15 +1992,29 @@
   });
 
   timezoneUtcBtn.addEventListener("click", () => {
-    normalizeTimestampColumn("UTC").catch((err) => alert(`Timestamp normalization failed: ${err}`));
+    const dateConvention = dateConventionSelect.value || null;
+    if (timestampAnalysis?.needsDateConvention && !dateConvention) {
+      alert("Choose whether slash dates are month-first or day-first.");
+      return;
+    }
+    normalizeTimestampColumn("UTC", null, dateConvention).catch((err) =>
+      alert(`Timestamp normalization failed: ${err}`)
+    );
   });
   timezoneNormalizeBtn.addEventListener("click", () => {
     const answer = timezoneInput.value.trim();
-    if (!answer) {
+    const dateConvention = dateConventionSelect.value || null;
+    if (timestampAnalysis?.needsTimezone && !answer) {
       alert("Enter a UTC offset or IANA timezone, or choose Already UTC.");
       return;
     }
-    normalizeTimestampColumn(answer).catch((err) => alert(`Timestamp normalization failed: ${err}`));
+    if (timestampAnalysis?.needsDateConvention && !dateConvention) {
+      alert("Choose whether slash dates are month-first or day-first.");
+      return;
+    }
+    normalizeTimestampColumn(answer || null, null, dateConvention).catch((err) =>
+      alert(`Timestamp normalization failed: ${err}`)
+    );
   });
   timezonePanelClose.addEventListener("click", () => {
     timezonePanel.classList.add("hidden");
@@ -2124,8 +2166,8 @@
     analyzeTimestampForTest() {
       return handleTimestampConfirmed();
     },
-    normalizeTimestampForTest(naiveTimezone = null) {
-      return normalizeTimestampColumn(naiveTimezone);
+    normalizeTimestampForTest(naiveTimezone = null, dateConvention = null) {
+      return normalizeTimestampColumn(naiveTimezone, null, dateConvention);
     },
     scanIntelForTest(evidenceColumns = inferredEvidenceColumns()) {
       return runIntelScan(evidenceColumns);
