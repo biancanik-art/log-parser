@@ -203,6 +203,11 @@ pub fn export_report(
             used_sheet_names.insert("ai audit".to_string());
         }
 
+        if table_has_rows(conn, "_semantic_v2_audit_snapshot")? {
+            sheets_written.push(write_semantic_audit_sheet(conn, &mut write_state)?);
+            used_sheet_names.insert("semantic audit".to_string());
+        }
+
         if intel_match_count(conn)? > 0 {
             sheets_written.push(write_timeline_sheet(
                 conn,
@@ -290,6 +295,192 @@ where
     }
     (state.on_progress)(*state.total_rows_written, &sheet_name);
     Ok(sheet_name)
+}
+
+fn write_semantic_audit_sheet<F>(
+    conn: &Connection,
+    state: &mut ReportWriteState<'_, F>,
+) -> Result<String>
+where
+    F: FnMut(i64, &str),
+{
+    // The three immutable snapshot tables intentionally share one worksheet. The discriminator
+    // makes every exported row self-describing while the common selection_id, mapping digest, and
+    // row-set fields keep the forensic chain easy to follow without cross-sheet joins.
+    let sheet_name = "Semantic Audit".to_string();
+    let worksheet = state.workbook.add_worksheet_with_constant_memory();
+    worksheet.set_name(&sheet_name)?;
+    let headers = [
+        "record_type",
+        "selection_id",
+        "snapshot_version",
+        "build_id",
+        "dataset_hash",
+        "schema_hash",
+        "index_version",
+        "normalizer_version",
+        "model_name",
+        "model_version",
+        "model_sha256",
+        "tokenizer_sha256",
+        "config_sha256",
+        "query_sha256",
+        "policy_version",
+        "minimum_score",
+        "maximum_documents",
+        "documents_above_threshold",
+        "documents_retained",
+        "rows_matched",
+        "documents_truncated",
+        "broad_row_warning",
+        "warnings_json",
+        "source_rows",
+        "index_rows_scanned",
+        "index_documents_seen",
+        "index_documents_embedded",
+        "index_documents_mapped",
+        "index_mappings_written",
+        "index_documents_skipped",
+        "index_mappings_skipped",
+        "index_cells_truncated",
+        "index_columns_omitted",
+        "index_chunks_omitted",
+        "candidate_documents",
+        "candidate_mappings",
+        "candidate_document_limit",
+        "candidate_mapping_limit",
+        "selected_document_count",
+        "mapping_count",
+        "mapping_sha256",
+        "row_count",
+        "row_set_sha256",
+        "row_set_encoding",
+        "selection_created_at",
+        "archived_at",
+        "rank",
+        "source_doc_id",
+        "fingerprint_sha256",
+        "kind",
+        "column_key",
+        "normalized_text",
+        "cosine_score",
+        "rank_score",
+        "chunk_index",
+        "first_row_num",
+        "last_row_num",
+        "encoded_rows_hex",
+        "chunk_sha256",
+    ];
+    write_headers(worksheet, &headers)?;
+    for column in 0..headers.len() as u16 {
+        worksheet.set_column_width(column, 22)?;
+    }
+    for column in [4u16, 5, 10, 11, 12, 13, 22, 40, 42, 48, 51, 57, 58] {
+        worksheet.set_column_width(column, 56)?;
+    }
+
+    let mut excel_row = 1u32;
+    write_semantic_audit_query(
+        conn,
+        worksheet,
+        "snapshot",
+        "SELECT selection_id, snapshot_version, build_id, dataset_hash, schema_hash,
+                index_version, normalizer_version, model_name, model_version, model_sha256,
+                tokenizer_sha256, config_sha256, query_sha256, policy_version, minimum_score,
+                maximum_documents, documents_above_threshold, documents_retained, rows_matched,
+                documents_truncated, broad_row_warning, warnings_json, source_rows,
+                index_rows_scanned, index_documents_seen, index_documents_embedded,
+                index_documents_mapped, index_mappings_written, index_documents_skipped,
+                index_mappings_skipped, index_cells_truncated, index_columns_omitted,
+                index_chunks_omitted, candidate_documents, candidate_mappings,
+                candidate_document_limit, candidate_mapping_limit, selected_document_count,
+                mapping_count, mapping_sha256, row_count, row_set_sha256, row_set_encoding,
+                selection_created_at, archived_at
+         FROM _semantic_v2_audit_snapshot ORDER BY selection_id",
+        &(1u16..=45).collect::<Vec<_>>(),
+        &mut excel_row,
+        state.total_rows_written,
+    )?;
+    write_semantic_audit_query(
+        conn,
+        worksheet,
+        "document",
+        "SELECT selection_id, mapping_count, mapping_sha256, rank, source_doc_id,
+                fingerprint_sha256, kind, column_key, normalized_text, cosine_score, rank_score
+         FROM _semantic_v2_audit_snapshot_document ORDER BY selection_id, rank",
+        &[1, 39, 40, 46, 47, 48, 49, 50, 51, 52, 53],
+        &mut excel_row,
+        state.total_rows_written,
+    )?;
+    write_semantic_audit_query(
+        conn,
+        worksheet,
+        "row_chunk",
+        "SELECT selection_id, row_count, chunk_index, first_row_num, last_row_num,
+                encoded_rows, chunk_sha256
+         FROM _semantic_v2_audit_snapshot_row_chunk ORDER BY selection_id, chunk_index",
+        &[1, 41, 54, 55, 56, 57, 58],
+        &mut excel_row,
+        state.total_rows_written,
+    )?;
+
+    (state.on_progress)(*state.total_rows_written, &sheet_name);
+    Ok(sheet_name)
+}
+
+fn write_semantic_audit_query(
+    conn: &Connection,
+    worksheet: &mut Worksheet,
+    record_type: &str,
+    sql: &str,
+    target_columns: &[u16],
+    excel_row: &mut u32,
+    total_rows_written: &mut i64,
+) -> Result<()> {
+    let mut statement = conn.prepare(sql)?;
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        write_cell_string(worksheet, *excel_row, 0, record_type)?;
+        for (source_column, target_column) in target_columns.iter().copied().enumerate() {
+            match row.get_ref(source_column)? {
+                rusqlite::types::ValueRef::Null => {}
+                rusqlite::types::ValueRef::Integer(value) => {
+                    if (-9_007_199_254_740_992..=9_007_199_254_740_992).contains(&value) {
+                        worksheet.write_number(*excel_row, target_column, value as f64)?;
+                    } else {
+                        worksheet.write_string(*excel_row, target_column, value.to_string())?;
+                    }
+                }
+                rusqlite::types::ValueRef::Real(value) => {
+                    worksheet.write_number(*excel_row, target_column, value)?;
+                }
+                rusqlite::types::ValueRef::Text(value) => {
+                    let value = std::str::from_utf8(value)
+                        .context("decoding semantic audit snapshot text")?;
+                    // Snapshot evidence must never use the report's display-oriented truncation.
+                    // Let the workbook writer reject an impossible cell instead of silently
+                    // changing immutable forensic data.
+                    worksheet.write_string(*excel_row, target_column, value)?;
+                }
+                rusqlite::types::ValueRef::Blob(value) => {
+                    worksheet.write_string(*excel_row, target_column, lowercase_hex(value))?;
+                }
+            }
+        }
+        *excel_row += 1;
+        *total_rows_written += 1;
+    }
+    Ok(())
+}
+
+fn lowercase_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
 }
 
 fn validate_report_prerequisites(conn: &Connection) -> Result<()> {
@@ -1633,6 +1824,14 @@ mod tests {
         }
     }
 
+    fn cell_to_f64(cell: &calamine::Data) -> f64 {
+        match cell {
+            calamine::Data::Int(value) => *value as f64,
+            calamine::Data::Float(value) => *value,
+            _ => cell.to_string().parse::<f64>().unwrap(),
+        }
+    }
+
     fn data_row_nums(range: &calamine::Range<calamine::Data>) -> Vec<i64> {
         range
             .rows()
@@ -1910,7 +2109,7 @@ mod tests {
     }
 
     #[test]
-    fn report_export_writes_complete_ai_audit_sheet() {
+    fn report_export_writes_complete_ai_and_semantic_audit_sheets() {
         let (conn, columns) = setup_report_fixture(true);
         conn.execute_batch(
             "CREATE TABLE _llm_parse_audit (
@@ -1947,6 +2146,113 @@ mod tests {
              );",
         )
         .unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS _semantic_v2_audit_snapshot (
+                selection_id INTEGER PRIMARY KEY,
+                snapshot_version TEXT,
+                build_id INTEGER,
+                dataset_hash TEXT,
+                schema_hash TEXT,
+                index_version TEXT,
+                normalizer_version TEXT,
+                model_name TEXT,
+                model_version TEXT,
+                model_sha256 TEXT,
+                tokenizer_sha256 TEXT,
+                config_sha256 TEXT,
+                query_sha256 TEXT,
+                policy_version TEXT,
+                minimum_score REAL,
+                maximum_documents INTEGER,
+                documents_above_threshold INTEGER,
+                documents_retained INTEGER,
+                rows_matched INTEGER,
+                documents_truncated INTEGER,
+                broad_row_warning INTEGER,
+                warnings_json TEXT,
+                source_rows INTEGER,
+                index_rows_scanned INTEGER,
+                index_documents_seen INTEGER,
+                index_documents_embedded INTEGER,
+                index_documents_mapped INTEGER,
+                index_mappings_written INTEGER,
+                index_documents_skipped INTEGER,
+                index_mappings_skipped INTEGER,
+                index_cells_truncated INTEGER,
+                index_columns_omitted INTEGER,
+                index_chunks_omitted INTEGER,
+                candidate_documents INTEGER,
+                candidate_mappings INTEGER,
+                candidate_document_limit INTEGER,
+                candidate_mapping_limit INTEGER,
+                selected_document_count INTEGER,
+                mapping_count INTEGER,
+                mapping_sha256 TEXT,
+                row_count INTEGER,
+                row_set_sha256 TEXT,
+                row_set_encoding TEXT,
+                selection_created_at TEXT,
+                archived_at TEXT
+             );
+             CREATE TABLE IF NOT EXISTS _semantic_v2_audit_snapshot_document (
+                selection_id INTEGER,
+                rank INTEGER,
+                source_doc_id INTEGER,
+                fingerprint_sha256 TEXT,
+                kind TEXT,
+                column_key TEXT,
+                normalized_text TEXT,
+                cosine_score REAL,
+                rank_score REAL,
+                mapping_count INTEGER,
+                mapping_sha256 TEXT,
+                PRIMARY KEY (selection_id, rank)
+             );
+             CREATE TABLE IF NOT EXISTS _semantic_v2_audit_snapshot_row_chunk (
+                selection_id INTEGER,
+                chunk_index INTEGER,
+                first_row_num INTEGER,
+                last_row_num INTEGER,
+                row_count INTEGER,
+                encoded_rows BLOB,
+                chunk_sha256 TEXT,
+                PRIMARY KEY (selection_id, chunk_index)
+             );
+             INSERT INTO _semantic_v2_audit_snapshot (
+                selection_id, snapshot_version, build_id, dataset_hash, schema_hash,
+                index_version, normalizer_version, model_name, model_version, model_sha256,
+                tokenizer_sha256, config_sha256, query_sha256, policy_version, minimum_score,
+                maximum_documents, documents_above_threshold, documents_retained, rows_matched,
+                documents_truncated, broad_row_warning, warnings_json, source_rows,
+                index_rows_scanned, index_documents_seen, index_documents_embedded,
+                index_documents_mapped, index_mappings_written, index_documents_skipped,
+                index_mappings_skipped, index_cells_truncated, index_columns_omitted,
+                index_chunks_omitted, candidate_documents, candidate_mappings,
+                candidate_document_limit, candidate_mapping_limit, selected_document_count,
+                mapping_count, mapping_sha256, row_count, row_set_sha256, row_set_encoding,
+                selection_created_at, archived_at
+             ) VALUES (
+                9001, 'semantic-audit-snapshot-v1', 77, 'dataset-hash', 'schema-hash',
+                'semantic-document-v3', 'dfir-cell-normalizer-v3', 'all-MiniLM-L6-v2',
+                'onnx@revision', 'model-hash', 'tokenizer-hash', 'config-hash', 'query-hash',
+                'semantic-ranking-v2', 0.42, 250, 10, 4, 7, 0, 1,
+                '[\"bounded evidence\"]', 3, 3, 12, 12, 12, 14, 0, 0, 1, 2, 3, 12, 14,
+                100000, 6000000, 4, 14, 'mapping-hash', 7, 'row-set-hash',
+                'delta-varint-v1', '2026-07-16T00:00:30Z', '2026-07-16T00:02:00Z'
+             );
+             INSERT INTO _semantic_v2_audit_snapshot_document (
+                selection_id, rank, source_doc_id, fingerprint_sha256, kind, column_key,
+                normalized_text, cosine_score, rank_score, mapping_count, mapping_sha256
+             ) VALUES (
+                9001, 1, 123, 'fingerprint-hash', 'cell', 'processcommandline',
+                '=powershell -enc', 0.875, 0.8125, 3, 'document-mapping-hash'
+             );
+             INSERT INTO _semantic_v2_audit_snapshot_row_chunk (
+                selection_id, chunk_index, first_row_num, last_row_num, row_count,
+                encoded_rows, chunk_sha256
+             ) VALUES (9001, 0, 1, 3000, 3, x'00017Fff', 'chunk-hash');",
+        )
+        .unwrap();
         let path = temp_report_path("with-ai-audit");
 
         let summary = export_report(&conn, &columns, &path, |_, _| {}).unwrap();
@@ -1955,6 +2261,7 @@ mod tests {
             vec![
                 "General",
                 "AI Audit",
+                "Semantic Audit",
                 "Timeline",
                 "Credential Access",
                 "Execution"
@@ -1974,6 +2281,57 @@ mod tests {
         assert_eq!(rows[1][16].to_string(), "=untrusted model text");
         assert_eq!(cell_to_i64(&rows[1][18]), 2945);
         assert_eq!(cell_to_i64(&rows[1][19]), 13182);
+
+        let semantic = workbook.worksheet_range("Semantic Audit").unwrap();
+        let semantic_rows: Vec<_> = semantic.rows().collect();
+        assert_eq!(semantic_rows.len(), 4);
+        let column = |name: &str| {
+            semantic_rows[0]
+                .iter()
+                .position(|cell| cell.to_string() == name)
+                .unwrap_or_else(|| panic!("Semantic Audit header {name} should exist"))
+        };
+        let snapshot = semantic_rows
+            .iter()
+            .skip(1)
+            .find(|row| row[column("record_type")].to_string() == "snapshot")
+            .unwrap();
+        assert_eq!(cell_to_i64(&snapshot[column("selection_id")]), 9001);
+        assert_eq!(snapshot[column("model_sha256")].to_string(), "model-hash");
+        assert_eq!(
+            snapshot[column("index_version")].to_string(),
+            "semantic-document-v3"
+        );
+        assert_eq!(
+            snapshot[column("normalizer_version")].to_string(),
+            "dfir-cell-normalizer-v3"
+        );
+
+        let document = semantic_rows
+            .iter()
+            .skip(1)
+            .find(|row| row[column("record_type")].to_string() == "document")
+            .unwrap();
+        assert_eq!(
+            document[column("normalized_text")].to_string(),
+            "=powershell -enc"
+        );
+        assert!((cell_to_f64(&document[column("cosine_score")]) - 0.875).abs() < f64::EPSILON);
+        assert_eq!(
+            document[column("mapping_sha256")].to_string(),
+            "document-mapping-hash"
+        );
+
+        let row_chunk = semantic_rows
+            .iter()
+            .skip(1)
+            .find(|row| row[column("record_type")].to_string() == "row_chunk")
+            .unwrap();
+        assert_eq!(
+            row_chunk[column("encoded_rows_hex")].to_string(),
+            "00017fff"
+        );
+        assert_eq!(row_chunk[column("chunk_sha256")].to_string(), "chunk-hash");
 
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
