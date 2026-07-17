@@ -249,6 +249,8 @@ const V2_AUDIT_SNAPSHOT_VERSION: &str = "semantic-audit-snapshot-v1";
 const V2_AUDIT_ROW_SET_ENCODING: &str = "sorted-positive-delta-varint-chunks-v1";
 const V2_AUDIT_MAPPING_BATCH: usize = 8_192;
 const V2_AUDIT_ROW_CHUNK_ROWS: usize = 1_024;
+const V2_AUDIT_ARCHIVE_STEPS_PER_SLICE: usize = 4;
+const V2_AUDIT_ARCHIVE_SLICE_TIME_BUDGET_MS: u128 = 150;
 
 #[derive(Debug, Clone, Copy)]
 struct SemanticResourceLimits {
@@ -1856,7 +1858,13 @@ fn audit_snapshot_chunk_sha256(
 }
 
 fn pending_audit_snapshot_selection(conn: &Connection) -> Result<Option<String>> {
-    if !table_exists(conn, "_llm_parse_audit")? {
+    if !table_exists(conn, "_llm_parse_audit")?
+        || !sqlite_table_has_columns(
+            conn,
+            "_llm_parse_audit",
+            &["trusted_intent_json", "examiner_decision"],
+        )?
+    {
         return Ok(None);
     }
     conn.query_row(
@@ -1866,24 +1874,45 @@ fn pending_audit_snapshot_selection(conn: &Connection) -> Result<Option<String>>
          LEFT JOIN _semantic_v2_audit_snapshot_stage st
            ON st.selection_id = s.selection_id
          WHERE NOT EXISTS (
-                SELECT 1 FROM _semantic_v2_active a WHERE a.build_id = b.build_id
-             )
-           AND NOT EXISTS (
                 SELECT 1 FROM _semantic_v2_audit_snapshot snap
                 WHERE snap.selection_id = s.selection_id
              )
            AND (
-                st.selection_id IS NOT NULL OR EXISTS (
+                st.selection_id IS NOT NULL
+                OR EXISTS (
                     SELECT 1
                     FROM _llm_parse_audit l,
                          json_tree(CASE WHEN json_valid(l.trusted_intent_json)
                                         THEN l.trusted_intent_json ELSE '{}' END) j
-                    WHERE l.examiner_decision IN ('unreviewed', 'accepted')
+                    WHERE l.examiner_decision = 'accepted'
                       AND j.key = 'semanticSelectionId'
                       AND j.value = s.selection_id
                 )
+                OR (
+                    NOT EXISTS (
+                        SELECT 1 FROM _semantic_v2_active a WHERE a.build_id = b.build_id
+                    )
+                    AND EXISTS (
+                        SELECT 1
+                        FROM _llm_parse_audit l,
+                             json_tree(CASE WHEN json_valid(l.trusted_intent_json)
+                                            THEN l.trusted_intent_json ELSE '{}' END) j
+                        WHERE l.examiner_decision = 'unreviewed'
+                          AND j.key = 'semanticSelectionId'
+                          AND j.value = s.selection_id
+                    )
+                )
              )
          ORDER BY CASE WHEN st.selection_id IS NULL THEN 1 ELSE 0 END,
+                  CASE WHEN EXISTS (
+                    SELECT 1
+                    FROM _llm_parse_audit l,
+                         json_tree(CASE WHEN json_valid(l.trusted_intent_json)
+                                        THEN l.trusted_intent_json ELSE '{}' END) j
+                    WHERE l.examiner_decision = 'accepted'
+                      AND j.key = 'semanticSelectionId'
+                      AND j.value = s.selection_id
+                  ) THEN 0 ELSE 1 END,
                   s.build_id, s.selection_id
          LIMIT 1",
         [],
@@ -1925,10 +1954,7 @@ fn initialize_audit_snapshot_stage(conn: &Connection, selection_id: &str) -> Res
         "SELECT s.build_id, s.documents_retained
          FROM _semantic_v2_selection s
          JOIN _semantic_v2_build b ON b.build_id = s.build_id
-         WHERE s.selection_id = ?1
-           AND NOT EXISTS (
-                SELECT 1 FROM _semantic_v2_active a WHERE a.build_id = b.build_id
-           )",
+         WHERE s.selection_id = ?1",
         [selection_id],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
@@ -2525,17 +2551,33 @@ fn finalize_audit_snapshot(conn: &Connection, stage: &AuditSnapshotStage) -> Res
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SemanticAuditArchiveProgress {
+    pub steps_advanced: usize,
+    pub snapshots_completed: usize,
+    pub pending: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RequiredAuditSnapshotStep {
+    snapshot_completed: bool,
+}
+
 /// Advances at most one bounded archive step. While this returns work, stale v2 deletion is
 /// deliberately backpressured: no selected documents, mappings, or embeddings can disappear
-/// before an accepted/unreviewed plan has a complete immutable evidence snapshot.
-fn advance_required_audit_snapshot(conn: &Connection) -> Result<bool> {
+/// before an accepted plan (or stale unreviewed plan) has a complete immutable evidence snapshot.
+fn advance_required_audit_snapshot(conn: &Connection) -> Result<Option<RequiredAuditSnapshotStep>> {
     let Some(selection_id) = pending_audit_snapshot_selection(conn)? else {
-        return Ok(false);
+        return Ok(None);
     };
     let Some(stage) = load_audit_snapshot_stage(conn, &selection_id)? else {
         initialize_audit_snapshot_stage(conn, &selection_id)?;
-        return Ok(true);
+        return Ok(Some(RequiredAuditSnapshotStep {
+            snapshot_completed: false,
+        }));
     };
+    let mut snapshot_completed = false;
     match stage.phase.as_str() {
         "mappings" => {
             advance_audit_snapshot_mappings(conn, &stage)?;
@@ -2543,11 +2585,85 @@ fn advance_required_audit_snapshot(conn: &Connection) -> Result<bool> {
         "rows" => {
             if !advance_audit_snapshot_rows(conn, &stage)? {
                 finalize_audit_snapshot(conn, &stage)?;
+                snapshot_completed = true;
             }
         }
         other => bail!("semantic audit snapshot has invalid stage phase {other}"),
     }
+    Ok(Some(RequiredAuditSnapshotStep { snapshot_completed }))
+}
+
+fn prepare_required_semantic_audit_archive(conn: &Connection) -> Result<bool> {
+    if !table_exists(conn, "_llm_parse_audit")?
+        || !table_exists(conn, "_semantic_v2_build")?
+        || !table_exists(conn, "_semantic_v2_selection")?
+    {
+        return Ok(false);
+    }
+    create_semantic_v2_schema(conn)?;
     Ok(true)
+}
+
+fn advance_required_semantic_audit_archive_transaction(
+    conn: &mut Connection,
+) -> Result<SemanticAuditArchiveProgress> {
+    let tx = conn.transaction()?;
+    let advanced = advance_required_audit_snapshot(&tx)?;
+    let pending = pending_audit_snapshot_selection(&tx)?.is_some();
+    let progress = SemanticAuditArchiveProgress {
+        steps_advanced: usize::from(advanced.is_some()),
+        snapshots_completed: usize::from(advanced.is_some_and(|step| step.snapshot_completed)),
+        pending,
+    };
+    tx.commit()?;
+    Ok(progress)
+}
+
+/// Advances required accepted/stale-unreviewed semantic evidence archival for a short bounded
+/// slice. Every step commits independently, including its staging cursor, so callers can safely
+/// retry while `pending` is true without holding a long writer transaction.
+pub fn archive_required_semantic_audits_slice(
+    conn: &mut Connection,
+) -> Result<SemanticAuditArchiveProgress> {
+    if !prepare_required_semantic_audit_archive(conn)? {
+        return Ok(SemanticAuditArchiveProgress::default());
+    }
+    let started = Instant::now();
+    let mut total = SemanticAuditArchiveProgress::default();
+    for _ in 0..V2_AUDIT_ARCHIVE_STEPS_PER_SLICE {
+        let progress = advance_required_semantic_audit_archive_transaction(conn)?;
+        total.steps_advanced += progress.steps_advanced;
+        total.snapshots_completed += progress.snapshots_completed;
+        total.pending = progress.pending;
+        if !total.pending || started.elapsed().as_millis() >= V2_AUDIT_ARCHIVE_SLICE_TIME_BUDGET_MS
+        {
+            break;
+        }
+    }
+    Ok(total)
+}
+
+/// Completes every currently required immutable semantic evidence snapshot. Work may take time on
+/// very large evidence sets, but no transaction contains more than one bounded archive step.
+pub fn complete_required_semantic_audits(
+    conn: &mut Connection,
+) -> Result<SemanticAuditArchiveProgress> {
+    if !prepare_required_semantic_audit_archive(conn)? {
+        return Ok(SemanticAuditArchiveProgress::default());
+    }
+    let mut total = SemanticAuditArchiveProgress::default();
+    loop {
+        let progress = advance_required_semantic_audit_archive_transaction(conn)?;
+        total.steps_advanced += progress.steps_advanced;
+        total.snapshots_completed += progress.snapshots_completed;
+        total.pending = progress.pending;
+        if !total.pending {
+            return Ok(total);
+        }
+        if progress.steps_advanced == 0 {
+            bail!("semantic audit archival remained pending without making progress");
+        }
+    }
 }
 
 /// Removes a bounded slice of superseded semantic artifacts after a current build is active.
@@ -2596,7 +2712,7 @@ fn prune_stale_semantic_artifacts_pass(conn: &mut Connection) -> Result<usize> {
         // also globally backpressures stale v2 deletion: a failed or incomplete required
         // snapshot leaves every source selection document, mapping, build, and embedding live
         // for the next bounded retry.
-        if advance_required_audit_snapshot(&tx)? {
+        if advance_required_audit_snapshot(&tx)?.is_some() {
             tx.commit()?;
             return Ok(removed.saturating_add(1));
         }
@@ -5817,6 +5933,154 @@ mod tests {
                 [&accepted_selection],
             )
             .is_err());
+    }
+
+    #[test]
+    fn active_accepted_selection_archival_is_bounded_exact_and_idempotent() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        let columns = message_columns();
+        populate_messages(&mut conn, &columns, 9_000, false);
+        let embedder = FakeEmbedder::default();
+        ensure_semantic_index_v2(&mut conn, &columns, &embedder, || false, |_| {}).unwrap();
+        let active_build = active_build_identity(&conn).unwrap().0;
+        let policy = SemanticSearchPolicy {
+            maximum_documents: 1,
+            minimum_score: -1.0,
+        };
+        let accepted = create_semantic_selection(
+            &mut conn,
+            &columns,
+            &embedder,
+            "accepted active evidence",
+            policy,
+        )
+        .unwrap();
+        let unreviewed = create_semantic_selection(
+            &mut conn,
+            &columns,
+            &embedder,
+            "unreviewed active evidence",
+            policy,
+        )
+        .unwrap();
+        let rejected = create_semantic_selection(
+            &mut conn,
+            &columns,
+            &embedder,
+            "rejected active evidence",
+            policy,
+        )
+        .unwrap();
+        let retrieval_only = create_semantic_selection(
+            &mut conn,
+            &columns,
+            &embedder,
+            "retrieval only active evidence",
+            policy,
+        )
+        .unwrap();
+        conn.execute_batch(
+            "CREATE TABLE _llm_parse_audit (
+                trusted_intent_json TEXT NOT NULL,
+                examiner_decision TEXT NOT NULL
+             );
+             CREATE TABLE _semantic_retrieval_audit(selection_id TEXT NOT NULL);",
+        )
+        .unwrap();
+        for (selection_id, decision) in [
+            (&accepted.selection_id, "accepted"),
+            (&unreviewed.selection_id, "unreviewed"),
+            (&rejected.selection_id, "rejected"),
+        ] {
+            conn.execute(
+                "INSERT INTO _llm_parse_audit(trusted_intent_json, examiner_decision)
+                 VALUES (?1, ?2)",
+                params![
+                    serde_json::json!({ "semanticSelectionId": selection_id }).to_string(),
+                    decision,
+                ],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO _semantic_retrieval_audit(selection_id) VALUES (?1)",
+            [&retrieval_only.selection_id],
+        )
+        .unwrap();
+
+        let first_slice = archive_required_semantic_audits_slice(&mut conn).unwrap();
+        assert!(first_slice.steps_advanced > 0);
+        assert!(first_slice.pending);
+        assert_eq!(first_slice.snapshots_completed, 0);
+
+        let completed = complete_required_semantic_audits(&mut conn).unwrap();
+        assert!(completed.steps_advanced > 0);
+        assert_eq!(completed.snapshots_completed, 1);
+        assert!(!completed.pending);
+        let repeated = complete_required_semantic_audits(&mut conn).unwrap();
+        assert_eq!(repeated, SemanticAuditArchiveProgress::default());
+
+        let header: (i64, i64, i64, i64) = conn
+            .query_row(
+                "SELECT build_id, selected_document_count, mapping_count, row_count
+                 FROM _semantic_v2_audit_snapshot WHERE selection_id = ?1",
+                [&accepted.selection_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(header, (active_build, 1, 9_000, 9_000));
+        let document_mapping_count: i64 = conn
+            .query_row(
+                "SELECT mapping_count FROM _semantic_v2_audit_snapshot_document
+                 WHERE selection_id = ?1",
+                [&accepted.selection_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(document_mapping_count, 9_000);
+        let encoded_chunks = {
+            let mut statement = conn
+                .prepare(
+                    "SELECT encoded_rows FROM _semantic_v2_audit_snapshot_row_chunk
+                     WHERE selection_id = ?1 ORDER BY chunk_index",
+                )
+                .unwrap();
+            let collected = statement
+                .query_map([&accepted.selection_id], |row| row.get::<_, Vec<u8>>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            collected
+        };
+        let decoded_rows = encoded_chunks
+            .iter()
+            .flat_map(|chunk| decode_sorted_positive_delta_varints(chunk).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(decoded_rows, (1..=9_000).collect::<Vec<_>>());
+
+        for selection_id in [
+            &unreviewed.selection_id,
+            &rejected.selection_id,
+            &retrieval_only.selection_id,
+        ] {
+            let archived_or_staged: bool = conn
+                .query_row(
+                    "SELECT EXISTS(
+                        SELECT 1 FROM _semantic_v2_audit_snapshot WHERE selection_id = ?1
+                        UNION ALL
+                        SELECT 1 FROM _semantic_v2_audit_snapshot_stage WHERE selection_id = ?1
+                     )",
+                    [selection_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(
+                !archived_or_staged,
+                "{selection_id} must remain unsnapshotted"
+            );
+        }
+        assert_eq!(active_build_identity(&conn).unwrap().0, active_build);
+        validate_semantic_selection(&conn, &columns, &accepted.selection_id).unwrap();
     }
 
     #[test]
