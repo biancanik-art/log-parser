@@ -11,6 +11,7 @@ use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet};
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::time::Instant;
 use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer, TruncationParams};
 
@@ -25,7 +26,7 @@ pub const TOKENIZER_SHA256: &str =
 pub const CONFIG_SHA256: &str = "953f9c0d463486b10a6871cc2fd59f223b2c70184f49815e7efbcab5d8908b41";
 
 pub const V2_INDEX_VERSION: &str = "semantic-document-v2";
-pub const V2_NORMALIZER_VERSION: &str = "dfir-cell-normalizer-v1";
+pub const V2_NORMALIZER_VERSION: &str = "dfir-cell-normalizer-v3";
 pub const V2_SOURCE_BATCH_ROWS: usize = 256;
 pub const V2_EMBED_BATCH_DOCUMENTS: usize = 16;
 pub const V2_DEFAULT_DOCUMENT_CANDIDATES: usize = 256;
@@ -36,6 +37,7 @@ const MAX_TOKENS: usize = 256;
 const MAX_QUERY_CHARS: usize = 4_096;
 const MAX_TOP_K: usize = 1_000;
 const EMBEDDING_DIMENSIONS: usize = 384;
+static V2_WORKER_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 pub struct SemanticModel {
     model: BertModel,
@@ -223,12 +225,68 @@ const V2_COLUMN_SAMPLE_ROWS: usize = 4_096;
 const V2_PRIMARY_CHUNK_WORDS: usize = 72;
 const V2_CHUNK_OVERLAP_WORDS: usize = 12;
 const V2_MAX_CHUNKS_PER_CELL: usize = 4;
-const V2_MAX_ADDITIONAL_CHUNKS_PER_ROW: usize = 32;
+const V2_MAX_PRIMARY_DOCUMENTS_PER_ROW: usize = 48;
+const V2_MAX_ADDITIONAL_CHUNKS_PER_ROW: usize = 15;
+const V2_MAX_DOCUMENTS_PER_ROW: usize = 64;
+const V2_MAX_CELL_INPUT_CHARS: usize = 16_384;
+const V2_MAX_DOCUMENT_CHARS: usize = 2_048;
+const V2_MAX_MAPPED_DOCUMENTS_PER_BUILD: i64 = 100_000;
+const V2_MAX_MAPPINGS_PER_BUILD: i64 = 6_000_000;
+const V2_MAX_SELECTIONS_PER_BUILD: i64 = 512;
+const V2_MAX_SELECTION_CLEANUP_PER_REQUEST: i64 = 64;
+const V2_SELECTION_POLICY_VERSION: &str = "semantic-doc-search-v2";
+
+#[derive(Debug, Clone, Copy)]
+struct SemanticResourceLimits {
+    mapped_documents: i64,
+    mappings: i64,
+}
+
+impl SemanticResourceLimits {
+    const PRODUCTION: Self = Self {
+        mapped_documents: V2_MAX_MAPPED_DOCUMENTS_PER_BUILD,
+        mappings: V2_MAX_MAPPINGS_PER_BUILD,
+    };
+}
 
 fn header_key(column: &ColumnMeta) -> String {
-    format!("{} {}", column.sql_name, column.original_name)
-        .to_ascii_lowercase()
-        .replace(['_', '-'], " ")
+    format!(
+        "{} {}",
+        normalized_header_component(&column.sql_name),
+        normalized_header_component(&column.original_name)
+    )
+}
+
+fn normalized_header_component(value: &str) -> String {
+    let characters = value.chars().collect::<Vec<_>>();
+    let mut normalized = String::with_capacity(value.len() + 4);
+    for (index, character) in characters.iter().copied().enumerate() {
+        let previous = index
+            .checked_sub(1)
+            .and_then(|at| characters.get(at))
+            .copied();
+        let next = characters.get(index + 1).copied();
+        let camel_boundary = character.is_uppercase()
+            && previous.is_some_and(|value| value.is_lowercase() || value.is_ascii_digit());
+        let acronym_boundary = character.is_uppercase()
+            && previous.is_some_and(char::is_uppercase)
+            && next.is_some_and(char::is_lowercase);
+        if camel_boundary || acronym_boundary {
+            normalized.push(' ');
+        }
+        if character.is_alphanumeric() {
+            normalized.extend(character.to_lowercase());
+        } else {
+            normalized.push(' ');
+        }
+    }
+    normalized.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn header_has_phrase(key: &str, phrase: &str) -> bool {
+    let padded_key = format!(" {key} ");
+    let padded_phrase = format!(" {phrase} ");
+    padded_key.contains(&padded_phrase)
 }
 
 fn exact_only_header(column: &ColumnMeta) -> bool {
@@ -253,7 +311,7 @@ fn exact_only_header_name(column: &ColumnMeta) -> bool {
         "hash",
         "guid",
         "uuid",
-        " sid",
+        "sid",
         "account",
         "user name",
         "username",
@@ -266,9 +324,8 @@ fn exact_only_header_name(column: &ColumnMeta) -> bool {
         "port",
     ]
     .iter()
-    .any(|needle| key.contains(needle))
-        || key.ends_with(" id")
-        || key.contains(" event id")
+    .any(|phrase| header_has_phrase(&key, phrase))
+        || header_has_phrase(&key, "id")
 }
 
 fn force_text_header(column: &ColumnMeta) -> bool {
@@ -290,9 +347,15 @@ fn force_text_header(column: &ColumnMeta) -> bool {
         "threat",
         "action",
         "operation",
+        "detail",
+        "summary",
+        "narrative",
+        "evidence",
+        "payload",
+        "reason",
     ]
     .iter()
-    .any(|needle| key.contains(needle))
+    .any(|phrase| header_has_phrase(&key, phrase))
 }
 
 fn value_is_dynamic_identifier(value: &str) -> bool {
@@ -383,13 +446,34 @@ fn word_chunks(value: &str) -> Vec<String> {
     let mut start = 0usize;
     while start < words.len() && chunks.len() < V2_MAX_CHUNKS_PER_CELL {
         let end = (start + V2_PRIMARY_CHUNK_WORDS).min(words.len());
-        chunks.push(words[start..end].join(" "));
+        chunks.push(
+            words[start..end]
+                .join(" ")
+                .chars()
+                .take(V2_MAX_DOCUMENT_CHARS)
+                .collect(),
+        );
         if end == words.len() {
             break;
         }
         start = end.saturating_sub(V2_CHUNK_OVERLAP_WORDS);
     }
     chunks
+}
+
+fn balanced_indices(length: usize, maximum: usize) -> Vec<usize> {
+    if length <= maximum {
+        return (0..length).collect();
+    }
+    if maximum == 0 {
+        return Vec::new();
+    }
+    if maximum == 1 {
+        return vec![length - 1];
+    }
+    (0..maximum)
+        .map(|slot| slot * (length - 1) / (maximum - 1))
+        .collect()
 }
 
 fn classify_columns(conn: &Connection, columns: &[ColumnMeta]) -> Result<Vec<ColumnPlan>> {
@@ -406,7 +490,12 @@ fn classify_columns(conn: &Connection, columns: &[ColumnMeta]) -> Result<Vec<Col
     }
     let identifiers = columns
         .iter()
-        .map(|column| db::quote_ident(&column.sql_name))
+        .map(|column| {
+            format!(
+                "substr({}, 1, {V2_MAX_CELL_INPUT_CHARS})",
+                db::quote_ident(&column.sql_name)
+            )
+        })
         .collect::<Vec<_>>()
         .join(", ");
     let sql =
@@ -488,10 +577,19 @@ fn normalized_label(plan: &ColumnPlan) -> String {
     }
 }
 
-fn row_documents_v2(
-    plans: &[ColumnPlan],
-    values: &[Option<String>],
-) -> Vec<(&'static str, String, String)> {
+fn bounded_labelled_document(label: &str, chunk: &str) -> String {
+    format!("{label}: {chunk}")
+        .chars()
+        .take(V2_MAX_DOCUMENT_CHARS)
+        .collect()
+}
+
+struct RowDocumentsV2 {
+    documents: Vec<(&'static str, String, String)>,
+    eligible_columns_omitted: i64,
+}
+
+fn row_documents_with_stats_v2(plans: &[ColumnPlan], values: &[Option<String>]) -> RowDocumentsV2 {
     let mut cell_chunks: Vec<(ColumnMode, String, String, Vec<String>)> = Vec::new();
     let mut context_parts = Vec::new();
     for (plan, value) in plans.iter().zip(values) {
@@ -505,7 +603,11 @@ fn row_documents_v2(
         else {
             continue;
         };
-        let normalized = normalize_text(value);
+        let bounded_value = value
+            .chars()
+            .take(V2_MAX_CELL_INPUT_CHARS)
+            .collect::<String>();
+        let normalized = normalize_text(&bounded_value);
         if !is_informative_text(&normalized) {
             continue;
         }
@@ -514,42 +616,68 @@ fn row_documents_v2(
         if chunks.is_empty() {
             continue;
         }
-        if plan.mode == ColumnMode::Categorical {
-            context_parts.push(format!("{label}: {}", chunks[0]));
-        }
         cell_chunks.push((plan.mode, plan.sql_name.clone(), label, chunks));
     }
 
     // Fairness: every eligible column contributes its first chunk before any early column may
-    // contribute a second. Further rounds are bounded without starving later columns.
+    // contribute a second. Wide tables are sampled evenly across their full width, always keeping
+    // the last eligible column; the lexical/structured query remains complete for omitted columns.
+    let selected = balanced_indices(cell_chunks.len(), V2_MAX_PRIMARY_DOCUMENTS_PER_ROW);
+    let eligible_columns_omitted = cell_chunks.len().saturating_sub(selected.len()) as i64;
     let mut documents = Vec::new();
-    for (_, column_key, label, chunks) in &cell_chunks {
+    for index in &selected {
+        let (mode, column_key, label, chunks) = &cell_chunks[*index];
         documents.push((
             "cell",
             column_key.clone(),
-            format!("{label}: {}", chunks[0]),
+            bounded_labelled_document(label, &chunks[0]),
         ));
+        if *mode == ColumnMode::Categorical {
+            context_parts.push(bounded_labelled_document(label, &chunks[0]));
+        }
     }
     let mut additional = 0usize;
     for round in 1..V2_MAX_CHUNKS_PER_CELL {
-        for (_, column_key, label, chunks) in &cell_chunks {
-            if additional == V2_MAX_ADDITIONAL_CHUNKS_PER_ROW {
+        for index in &selected {
+            if additional == V2_MAX_ADDITIONAL_CHUNKS_PER_ROW
+                || documents.len() == V2_MAX_DOCUMENTS_PER_ROW
+            {
                 break;
             }
+            let (_, column_key, label, chunks) = &cell_chunks[*index];
             if let Some(chunk) = chunks.get(round) {
                 documents.push((
                     "cell_chunk",
                     column_key.clone(),
-                    format!("{label}: {chunk}"),
+                    bounded_labelled_document(label, chunk),
                 ));
                 additional += 1;
             }
         }
     }
-    if context_parts.len() >= 2 {
-        documents.push(("row_context", String::new(), context_parts.join("; ")));
+    if context_parts.len() >= 2 && documents.len() < V2_MAX_DOCUMENTS_PER_ROW {
+        documents.push((
+            "row_context",
+            String::new(),
+            context_parts
+                .join("; ")
+                .chars()
+                .take(V2_MAX_DOCUMENT_CHARS)
+                .collect(),
+        ));
     }
-    documents
+    debug_assert!(documents.len() <= V2_MAX_DOCUMENTS_PER_ROW);
+    RowDocumentsV2 {
+        documents,
+        eligible_columns_omitted,
+    }
+}
+
+fn row_documents_v2(
+    plans: &[ColumnPlan],
+    values: &[Option<String>],
+) -> Vec<(&'static str, String, String)> {
+    row_documents_with_stats_v2(plans, values).documents
 }
 
 fn text_sha256(kind: &str, column_key: &str, text_value: &str) -> String {
@@ -581,12 +709,139 @@ fn collect_normalized_documents(
     documents
 }
 
+#[derive(Debug)]
+struct BudgetedDocuments {
+    documents: BTreeMap<String, NormalizedDocument>,
+    documents_seen: i64,
+    documents_mapped: i64,
+    documents_skipped: i64,
+    mappings_skipped: i64,
+    columns_omitted: i64,
+}
+
+fn cumulative_balanced_budget(rows_processed: i64, rows_total: i64, limit: i64) -> i64 {
+    if rows_processed <= 0 || rows_total <= 0 || limit <= 0 {
+        return 0;
+    }
+    let processed = rows_processed.min(rows_total) as i128;
+    ((processed * limit as i128) / rows_total as i128) as i64
+}
+
+/// Applies build-wide limits as cumulative targets instead of consuming them from the first rows.
+/// The targets advance uniformly across the full source-row count and reach their final increment
+/// on the final row. Within a row, balanced selection likewise keeps the final eligible document.
+fn budget_documents_v2(
+    plans: &[ColumnPlan],
+    source_rows: &[(i64, Vec<Option<String>>)],
+    known_build_documents: &HashMap<String, i64>,
+    rows_before: i64,
+    mapped_documents_before: i64,
+    mappings_before: i64,
+    rows_total: i64,
+    limits: SemanticResourceLimits,
+) -> BudgetedDocuments {
+    let mut retained = BTreeMap::<String, NormalizedDocument>::new();
+    let mut newly_known = HashSet::<String>::new();
+    let mut documents_seen = 0i64;
+    let mut documents_mapped = 0i64;
+    let mut documents_skipped = 0i64;
+    let mut mappings_retained = 0i64;
+    let mut mappings_skipped = 0i64;
+    let mut columns_omitted = 0i64;
+
+    for (offset, (row_num, values)) in source_rows.iter().enumerate() {
+        let mut row_hashes = HashSet::<String>::new();
+        let mut candidates = Vec::new();
+        let row_documents = row_documents_with_stats_v2(plans, values);
+        columns_omitted += row_documents.eligible_columns_omitted;
+        for (kind, column_key, text) in row_documents.documents {
+            let hash = text_sha256(kind, &column_key, &text);
+            if row_hashes.insert(hash.clone()) {
+                candidates.push((hash, kind, column_key, text));
+            }
+        }
+        documents_seen += candidates.len() as i64;
+
+        let row_position = rows_before + offset as i64 + 1;
+        let mapping_target =
+            cumulative_balanced_budget(row_position, rows_total, limits.mappings.max(0));
+        let mapping_allowance = mapping_target
+            .saturating_sub(mappings_before + mappings_retained)
+            .min(candidates.len() as i64)
+            .max(0) as usize;
+        let mapping_indices = balanced_indices(candidates.len(), mapping_allowance);
+        mappings_skipped += candidates.len().saturating_sub(mapping_indices.len()) as i64;
+
+        let unknown_indices = mapping_indices
+            .iter()
+            .copied()
+            .filter(|index| {
+                !known_build_documents.contains_key(&candidates[*index].0)
+                    && !newly_known.contains(&candidates[*index].0)
+            })
+            .collect::<Vec<_>>();
+        let document_target =
+            cumulative_balanced_budget(row_position, rows_total, limits.mapped_documents.max(0));
+        let document_allowance = document_target
+            .saturating_sub(mapped_documents_before + documents_mapped)
+            .min(unknown_indices.len() as i64)
+            .max(0) as usize;
+        let admitted_unknown = balanced_indices(unknown_indices.len(), document_allowance)
+            .into_iter()
+            .map(|index| unknown_indices[index])
+            .collect::<HashSet<_>>();
+
+        for index in mapping_indices {
+            let (hash, kind, column_key, text) = &candidates[index];
+            let already_known =
+                known_build_documents.contains_key(hash) || newly_known.contains(hash);
+            if !already_known && !admitted_unknown.contains(&index) {
+                documents_skipped += 1;
+                mappings_skipped += 1;
+                continue;
+            }
+            if !already_known && newly_known.insert(hash.clone()) {
+                documents_mapped += 1;
+            }
+            mappings_retained += 1;
+            retained
+                .entry(hash.clone())
+                .or_insert_with(|| NormalizedDocument {
+                    kind,
+                    column_key: column_key.clone(),
+                    text: text.clone(),
+                    rows: BTreeSet::new(),
+                })
+                .rows
+                .insert(*row_num);
+        }
+    }
+
+    debug_assert!(mapped_documents_before + documents_mapped <= limits.mapped_documents.max(0));
+    debug_assert!(mappings_before + mappings_retained <= limits.mappings.max(0));
+    BudgetedDocuments {
+        documents: retained,
+        documents_seen,
+        documents_mapped,
+        documents_skipped,
+        mappings_skipped,
+        columns_omitted,
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SemanticIndexSummary {
     pub rows_indexed: i64,
     pub documents_indexed: i64,
+    pub documents_mapped: i64,
+    pub documents_skipped: i64,
     pub mappings_written: i64,
+    pub mappings_skipped: i64,
+    pub cells_truncated: i64,
+    pub columns_omitted: i64,
+    pub truncated: bool,
+    pub warnings: Vec<String>,
     pub elapsed_ms: u128,
     pub from_cache: bool,
     pub resumed: bool,
@@ -611,6 +866,10 @@ pub struct SemanticBuildProgress {
     pub rows_total: i64,
     pub documents_embedded: i64,
     pub mappings_written: i64,
+    pub documents_skipped: i64,
+    pub mappings_skipped: i64,
+    pub cells_truncated: i64,
+    pub columns_omitted: i64,
     pub resumed_from_row: i64,
 }
 
@@ -622,6 +881,10 @@ pub struct SemanticSelectionSummary {
     pub documents_retained: usize,
     pub rows_matched: i64,
     pub documents_truncated: bool,
+    pub index_documents_skipped: i64,
+    pub index_mappings_skipped: i64,
+    pub index_cells_truncated: i64,
+    pub index_columns_omitted: i64,
     pub broad_row_warning: bool,
     pub warnings: Vec<String>,
 }
@@ -678,12 +941,18 @@ pub fn create_semantic_v2_schema(conn: &Connection) -> rusqlite::Result<()> {
             model_sha256 TEXT NOT NULL,
             normalizer_version TEXT NOT NULL,
             status TEXT NOT NULL CHECK(status IN ('building','paused','ready','cancelled','failed')),
+            worker_token TEXT,
             source_rows INTEGER NOT NULL,
             cursor_row_num INTEGER NOT NULL DEFAULT 0,
             rows_scanned INTEGER NOT NULL DEFAULT 0,
             documents_seen INTEGER NOT NULL DEFAULT 0,
             documents_embedded INTEGER NOT NULL DEFAULT 0,
+            documents_mapped INTEGER NOT NULL DEFAULT 0,
+            documents_skipped INTEGER NOT NULL DEFAULT 0,
             mappings_written INTEGER NOT NULL DEFAULT 0,
+            mappings_skipped INTEGER NOT NULL DEFAULT 0,
+            cells_truncated INTEGER NOT NULL DEFAULT 0,
+            columns_omitted INTEGER NOT NULL DEFAULT 0,
             started_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             completed_at TEXT,
@@ -729,6 +998,7 @@ pub fn create_semantic_v2_schema(conn: &Connection) -> rusqlite::Result<()> {
             query_sha256 TEXT NOT NULL,
             policy_version TEXT NOT NULL,
             minimum_score REAL NOT NULL,
+            maximum_documents INTEGER NOT NULL,
             documents_above_threshold INTEGER NOT NULL,
             documents_retained INTEGER NOT NULL,
             rows_matched INTEGER NOT NULL,
@@ -744,7 +1014,69 @@ pub fn create_semantic_v2_schema(conn: &Connection) -> rusqlite::Result<()> {
             rank_score REAL NOT NULL,
             PRIMARY KEY(selection_id, doc_id)
          ) WITHOUT ROWID;",
-    )
+    )?;
+    ensure_semantic_v2_build_columns(conn)
+}
+
+fn semantic_v2_build_has_column(conn: &Connection, expected: &str) -> rusqlite::Result<bool> {
+    let mut statement = conn.prepare("PRAGMA table_info(_semantic_v2_build)")?;
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        if row.get::<_, String>(1)? == expected {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn ensure_semantic_v2_build_columns(conn: &Connection) -> rusqlite::Result<()> {
+    for (name, definition) in [
+        ("worker_token", "TEXT"),
+        ("documents_mapped", "INTEGER NOT NULL DEFAULT 0"),
+        ("documents_skipped", "INTEGER NOT NULL DEFAULT 0"),
+        ("mappings_skipped", "INTEGER NOT NULL DEFAULT 0"),
+        ("cells_truncated", "INTEGER NOT NULL DEFAULT 0"),
+        ("columns_omitted", "INTEGER NOT NULL DEFAULT 0"),
+    ] {
+        if semantic_v2_build_has_column(conn, name)? {
+            continue;
+        }
+        let sql = format!(
+            "ALTER TABLE _semantic_v2_build ADD COLUMN {} {definition}",
+            db::quote_ident(name)
+        );
+        match conn.execute(&sql, []) {
+            Ok(_) => {}
+            Err(_) if semantic_v2_build_has_column(conn, name)? => {}
+            Err(error) => return Err(error),
+        }
+    }
+    ensure_semantic_v2_selection_columns(conn)
+}
+
+fn semantic_v2_selection_has_column(conn: &Connection, expected: &str) -> rusqlite::Result<bool> {
+    let mut statement = conn.prepare("PRAGMA table_info(_semantic_v2_selection)")?;
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        if row.get::<_, String>(1)? == expected {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn ensure_semantic_v2_selection_columns(conn: &Connection) -> rusqlite::Result<()> {
+    if semantic_v2_selection_has_column(conn, "maximum_documents")? {
+        return Ok(());
+    }
+    match conn.execute(
+        "ALTER TABLE _semantic_v2_selection ADD COLUMN maximum_documents INTEGER NOT NULL DEFAULT 256",
+        [],
+    ) {
+        Ok(_) => Ok(()),
+        Err(_) if semantic_v2_selection_has_column(conn, "maximum_documents")? => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 fn active_v2_build(
@@ -799,18 +1131,42 @@ fn load_column_plans(conn: &Connection, build_id: i64) -> Result<Vec<ColumnPlan>
     plans
 }
 
+fn new_worker_token(dataset_hash: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(dataset_hash.as_bytes());
+    hasher.update(chrono::Utc::now().to_rfc3339().as_bytes());
+    hasher.update(std::process::id().to_le_bytes());
+    hasher.update(
+        V2_WORKER_SEQUENCE
+            .fetch_add(1, AtomicOrdering::Relaxed)
+            .to_le_bytes(),
+    );
+    bytes_to_hex(&hasher.finalize())
+}
+
+enum PreparedV2Build {
+    Ready(i64),
+    Work {
+        build_id: i64,
+        cursor: i64,
+        plans: Vec<ColumnPlan>,
+        resumed: bool,
+    },
+}
+
 fn prepare_v2_build(
     conn: &mut Connection,
     columns: &[ColumnMeta],
     dataset_hash: &str,
     schema_hash: &str,
     rows_total: i64,
-) -> Result<(i64, i64, Vec<ColumnPlan>, bool)> {
-    if let Some((build_id, cursor)) = conn
+    worker_token: &str,
+) -> Result<PreparedV2Build> {
+    if let Some((build_id, cursor, status, previous_worker)) = conn
         .query_row(
-            "SELECT build_id, cursor_row_num FROM _semantic_v2_build
+            "SELECT build_id, cursor_row_num, status, worker_token FROM _semantic_v2_build
              WHERE dataset_hash = ?1 AND schema_hash = ?2 AND model_sha256 = ?3
-               AND normalizer_version = ?4 AND status IN ('building','paused','failed','ready')
+               AND normalizer_version = ?4
              ORDER BY build_id DESC LIMIT 1",
             params![
                 dataset_hash,
@@ -818,21 +1174,48 @@ fn prepare_v2_build(
                 MODEL_SHA256,
                 V2_NORMALIZER_VERSION
             ],
-            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            },
         )
         .optional()?
     {
-        conn.execute(
-            "UPDATE _semantic_v2_build SET status = 'building', updated_at = ?2, error = NULL
-             WHERE build_id = ?1 AND status IN ('building','paused','failed')",
-            params![build_id, chrono::Utc::now().to_rfc3339()],
+        if status == "ready" {
+            return Ok(PreparedV2Build::Ready(build_id));
+        }
+        let claimed = conn.execute(
+            "UPDATE _semantic_v2_build SET status = 'building', updated_at = ?2, error = NULL,
+                worker_token = ?3
+             WHERE build_id = ?1 AND status = ?4 AND worker_token IS ?5",
+            params![
+                build_id,
+                chrono::Utc::now().to_rfc3339(),
+                worker_token,
+                status,
+                previous_worker,
+            ],
         )?;
-        return Ok((
+        if claimed == 0 {
+            return prepare_v2_build(
+                conn,
+                columns,
+                dataset_hash,
+                schema_hash,
+                rows_total,
+                worker_token,
+            );
+        }
+        return Ok(PreparedV2Build::Work {
             build_id,
             cursor,
-            load_column_plans(conn, build_id)?,
-            cursor > 0,
-        ));
+            plans: load_column_plans(conn, build_id)?,
+            resumed: cursor > 0,
+        });
     }
 
     let plans = classify_columns(conn, columns)?;
@@ -841,13 +1224,14 @@ fn prepare_v2_build(
     let inserted = tx.execute(
         "INSERT OR IGNORE INTO _semantic_v2_build (
             dataset_hash, schema_hash, model_sha256, normalizer_version, status,
-            source_rows, started_at, updated_at
-         ) VALUES (?1, ?2, ?3, ?4, 'building', ?5, ?6, ?6)",
+            worker_token, source_rows, started_at, updated_at
+         ) VALUES (?1, ?2, ?3, ?4, 'building', ?5, ?6, ?7, ?7)",
         params![
             dataset_hash,
             schema_hash,
             MODEL_SHA256,
             V2_NORMALIZER_VERSION,
+            worker_token,
             rows_total,
             now,
         ],
@@ -856,7 +1240,14 @@ fn prepare_v2_build(
         // Another connection won the identity race while this connection classified columns.
         // Its build and column plan are now committed because SQLite serializes these writers.
         tx.commit()?;
-        return prepare_v2_build(conn, columns, dataset_hash, schema_hash, rows_total);
+        return prepare_v2_build(
+            conn,
+            columns,
+            dataset_hash,
+            schema_hash,
+            rows_total,
+            worker_token,
+        );
     }
     let build_id = tx.last_insert_rowid();
     {
@@ -876,7 +1267,12 @@ fn prepare_v2_build(
         }
     }
     tx.commit()?;
-    Ok((build_id, 0, plans, false))
+    Ok(PreparedV2Build::Work {
+        build_id,
+        cursor: 0,
+        plans,
+        resumed: false,
+    })
 }
 
 fn build_summary(
@@ -887,16 +1283,53 @@ fn build_summary(
     resumed: bool,
     cancelled: bool,
 ) -> Result<SemanticIndexSummary> {
-    let (rows, documents, mappings) = conn.query_row(
-        "SELECT rows_scanned, documents_embedded, mappings_written
+    let (
+        rows,
+        documents,
+        documents_mapped,
+        documents_skipped,
+        mappings,
+        mappings_skipped,
+        cells_truncated,
+        columns_omitted,
+    ) = conn.query_row(
+        "SELECT rows_scanned, documents_embedded, documents_mapped, documents_skipped,
+                mappings_written, mappings_skipped, cells_truncated, columns_omitted
          FROM _semantic_v2_build WHERE build_id = ?1",
         [build_id],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+                row.get(7)?,
+            ))
+        },
     )?;
+    let truncated =
+        documents_skipped > 0 || mappings_skipped > 0 || cells_truncated > 0 || columns_omitted > 0;
+    let warnings = if truncated {
+        vec![format!(
+            "Semantic indexing was bounded: {cells_truncated} oversized cell(s) were truncated, {columns_omitted} eligible wide-row column value(s) were omitted, {documents_skipped} new-document candidate(s) were skipped, and {mappings_skipped} document-to-row mapping candidate(s) were skipped. Exact lexical and structured matching remains complete across all {rows} scanned row(s)."
+        )]
+    } else {
+        Vec::new()
+    };
     Ok(SemanticIndexSummary {
         rows_indexed: rows,
         documents_indexed: documents,
+        documents_mapped,
+        documents_skipped,
         mappings_written: mappings,
+        mappings_skipped,
+        cells_truncated,
+        columns_omitted,
+        truncated,
+        warnings,
         elapsed_ms: started.elapsed().as_millis(),
         from_cache,
         resumed,
@@ -904,6 +1337,24 @@ fn build_summary(
         model_name: MODEL_NAME,
         model_version: MODEL_VERSION,
     })
+}
+
+fn pause_owned_build(conn: &Connection, build_id: i64, worker_token: &str) -> Result<bool> {
+    Ok(conn.execute(
+        "UPDATE _semantic_v2_build SET status = 'paused', updated_at = ?3
+         WHERE build_id = ?1 AND status = 'building' AND worker_token = ?2",
+        params![build_id, worker_token, chrono::Utc::now().to_rfc3339()],
+    )? > 0)
+}
+
+fn build_is_owned(conn: &Connection, build_id: i64, worker_token: &str) -> Result<bool> {
+    conn.query_row(
+        "SELECT status = 'building' AND worker_token = ?2
+         FROM _semantic_v2_build WHERE build_id = ?1",
+        params![build_id, worker_token],
+        |row| row.get::<_, bool>(0),
+    )
+    .map_err(Into::into)
 }
 
 /// Resumable semantic-document builder. All model inference occurs outside a transaction; each
@@ -915,7 +1366,30 @@ pub fn ensure_semantic_index_v2<E, C, P>(
     columns: &[ColumnMeta],
     embedder: &E,
     is_cancelled: C,
+    on_progress: P,
+) -> Result<SemanticIndexSummary>
+where
+    E: SemanticEmbedder + ?Sized,
+    C: Fn() -> bool,
+    P: FnMut(SemanticBuildProgress),
+{
+    ensure_semantic_index_v2_with_limits(
+        conn,
+        columns,
+        embedder,
+        is_cancelled,
+        on_progress,
+        SemanticResourceLimits::PRODUCTION,
+    )
+}
+
+fn ensure_semantic_index_v2_with_limits<E, C, P>(
+    conn: &mut Connection,
+    columns: &[ColumnMeta],
+    embedder: &E,
+    is_cancelled: C,
     mut on_progress: P,
+    limits: SemanticResourceLimits,
 ) -> Result<SemanticIndexSummary>
 where
     E: SemanticEmbedder + ?Sized,
@@ -937,47 +1411,132 @@ where
             rows_total,
             documents_embedded: summary.documents_indexed,
             mappings_written: summary.mappings_written,
+            documents_skipped: summary.documents_skipped,
+            mappings_skipped: summary.mappings_skipped,
+            cells_truncated: summary.cells_truncated,
+            columns_omitted: summary.columns_omitted,
             resumed_from_row: summary.rows_indexed,
         });
         return Ok(summary);
     }
 
-    let (build_id, mut cursor, plans, resumed) =
-        prepare_v2_build(conn, columns, &dataset_hash, &schema_hash, rows_total)?;
+    let worker_token = new_worker_token(&dataset_hash);
+    let prepared = prepare_v2_build(
+        conn,
+        columns,
+        &dataset_hash,
+        &schema_hash,
+        rows_total,
+        &worker_token,
+    )?;
+    let (build_id, mut cursor, plans, resumed) = match prepared {
+        PreparedV2Build::Ready(build_id) => {
+            conn.execute(
+                "INSERT INTO _semantic_v2_active(singleton, build_id) VALUES (1, ?1)
+                 ON CONFLICT(singleton) DO UPDATE SET build_id = excluded.build_id",
+                [build_id],
+            )?;
+            let summary = build_summary(conn, build_id, started, true, false, false)?;
+            on_progress(SemanticBuildProgress {
+                build_id,
+                phase: "ready".to_string(),
+                rows_scanned: summary.rows_indexed,
+                rows_total,
+                documents_embedded: summary.documents_indexed,
+                mappings_written: summary.mappings_written,
+                documents_skipped: summary.documents_skipped,
+                mappings_skipped: summary.mappings_skipped,
+                cells_truncated: summary.cells_truncated,
+                columns_omitted: summary.columns_omitted,
+                resumed_from_row: summary.rows_indexed,
+            });
+            return Ok(summary);
+        }
+        PreparedV2Build::Work {
+            build_id,
+            cursor,
+            plans,
+            resumed,
+        } => (build_id, cursor, plans, resumed),
+    };
     let resumed_from_row = cursor;
-    let identifiers = columns
+    let source_expressions = columns
         .iter()
-        .map(|column| db::quote_ident(&column.sql_name))
+        .map(|column| {
+            let identifier = db::quote_ident(&column.sql_name);
+            format!("substr({identifier}, 1, {})", V2_MAX_CELL_INPUT_CHARS + 1)
+        })
         .collect::<Vec<_>>()
         .join(", ");
+    let mut build_doc_ids = HashMap::<String, i64>::new();
+    {
+        let mut statement = conn.prepare(
+            "SELECT DISTINCT d.text_sha256, d.doc_id
+             FROM _semantic_v2_mapping m
+             JOIN _semantic_v2_document d ON d.doc_id = m.doc_id
+             WHERE m.build_id = ?1
+             ORDER BY d.doc_id",
+        )?;
+        let rows = statement.query_map([build_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        for row in rows {
+            let (hash, doc_id) = row?;
+            if build_doc_ids.len() as i64 >= limits.mapped_documents.max(0) {
+                bail!("semantic build exceeds its mapped-document resource limit");
+            }
+            build_doc_ids.insert(hash, doc_id);
+        }
+    }
+    let persisted_documents_mapped: i64 = conn.query_row(
+        "SELECT documents_mapped FROM _semantic_v2_build WHERE build_id = ?1",
+        [build_id],
+        |row| row.get(0),
+    )?;
+    if persisted_documents_mapped != build_doc_ids.len() as i64 {
+        bail!(
+            "semantic build document counter mismatch: stored {persisted_documents_mapped}, resolved {}",
+            build_doc_ids.len()
+        );
+    }
 
     let result = (|| -> Result<SemanticIndexSummary> {
         loop {
             if is_cancelled() {
-                conn.execute(
-                    "UPDATE _semantic_v2_build SET status = 'paused', updated_at = ?2
-                 WHERE build_id = ?1 AND status = 'building'",
-                    params![build_id, chrono::Utc::now().to_rfc3339()],
-                )?;
+                pause_owned_build(conn, build_id, &worker_token)?;
                 return build_summary(conn, build_id, started, false, resumed, true);
             }
 
-            let source_rows = {
+            let (source_rows, cells_truncated) = {
                 let sql = format!(
-                    "SELECT row_num, {identifiers} FROM rows
+                    "SELECT row_num, {source_expressions} FROM rows
                  WHERE row_num > ?1 ORDER BY row_num LIMIT {V2_SOURCE_BATCH_ROWS}"
                 );
                 let mut stmt = conn.prepare(&sql)?;
                 let mut rows = stmt.query([cursor])?;
                 let mut batch = Vec::with_capacity(V2_SOURCE_BATCH_ROWS);
+                let mut cells_truncated = 0i64;
                 while let Some(row) = rows.next()? {
                     let row_num: i64 = row.get(0)?;
                     let values = (0..columns.len())
-                        .map(|index| row.get::<_, Option<String>>(index + 1))
+                        .map(|index| {
+                            let value = row.get::<_, Option<String>>(index + 1)?;
+                            Ok(value.map(|value| {
+                                let mut characters = value.chars();
+                                let bounded = characters
+                                    .by_ref()
+                                    .take(V2_MAX_CELL_INPUT_CHARS)
+                                    .collect::<String>();
+                                if characters.next().is_some() {
+                                    cells_truncated += 1;
+                                }
+                                bounded
+                            }))
+                        })
                         .collect::<rusqlite::Result<Vec<_>>>()?;
                     batch.push((row_num, values));
                 }
-                batch
+                (batch, cells_truncated)
             };
 
             if source_rows.is_empty() {
@@ -986,12 +1545,16 @@ where
                 }
                 let now = chrono::Utc::now().to_rfc3339();
                 let tx = conn.transaction()?;
-                tx.execute(
+                let published = tx.execute(
                     "UPDATE _semantic_v2_build
-                 SET status = 'ready', updated_at = ?2, completed_at = ?2
-                 WHERE build_id = ?1 AND status = 'building'",
-                    params![build_id, now],
+                 SET status = 'ready', updated_at = ?3, completed_at = ?3, worker_token = NULL
+                 WHERE build_id = ?1 AND status = 'building' AND worker_token = ?2",
+                    params![build_id, worker_token, now],
                 )?;
+                if published == 0 {
+                    tx.rollback()?;
+                    return build_summary(conn, build_id, started, false, resumed, true);
+                }
                 tx.execute(
                     "INSERT INTO _semantic_v2_active(singleton, build_id) VALUES (1, ?1)
                  ON CONFLICT(singleton) DO UPDATE SET build_id = excluded.build_id",
@@ -1006,26 +1569,59 @@ where
                     rows_total,
                     documents_embedded: summary.documents_indexed,
                     mappings_written: summary.mappings_written,
+                    documents_skipped: summary.documents_skipped,
+                    mappings_skipped: summary.mappings_skipped,
+                    cells_truncated: summary.cells_truncated,
+                    columns_omitted: summary.columns_omitted,
                     resumed_from_row,
                 });
                 return Ok(summary);
             }
 
-            let documents = collect_normalized_documents(&plans, &source_rows);
-            let mut existing = HashMap::<String, i64>::new();
+            let (rows_before, mapped_documents_before, mappings_before): (i64, i64, i64) = conn
+                .query_row(
+                    "SELECT rows_scanned, documents_mapped, mappings_written
+                     FROM _semantic_v2_build WHERE build_id = ?1",
+                    [build_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )?;
+            let budgeted = budget_documents_v2(
+                &plans,
+                &source_rows,
+                &build_doc_ids,
+                rows_before,
+                mapped_documents_before,
+                mappings_before,
+                rows_total,
+                limits,
+            );
+            let documents = budgeted.documents;
+            let mut existing = documents
+                .keys()
+                .filter_map(|hash| {
+                    build_doc_ids
+                        .get(hash)
+                        .map(|doc_id| (hash.clone(), *doc_id))
+                })
+                .collect::<HashMap<_, _>>();
             {
                 let mut lookup = conn.prepare(
                     "SELECT doc_id FROM _semantic_v2_document
-                 WHERE model_sha256 = ?1 AND normalizer_version = ?2 AND text_sha256 = ?3",
+                     WHERE model_sha256 = ?1 AND normalizer_version = ?2 AND text_sha256 = ?3",
                 )?;
-                for hash in documents.keys() {
+                let unresolved = documents
+                    .keys()
+                    .filter(|hash| !existing.contains_key(*hash))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                for hash in unresolved {
                     if let Some(doc_id) = lookup
-                        .query_row(params![MODEL_SHA256, V2_NORMALIZER_VERSION, hash], |row| {
+                        .query_row(params![MODEL_SHA256, V2_NORMALIZER_VERSION, &hash], |row| {
                             row.get(0)
                         })
                         .optional()?
                     {
-                        existing.insert(hash.clone(), doc_id);
+                        existing.insert(hash, doc_id);
                     }
                 }
             }
@@ -1046,11 +1642,7 @@ where
                     .collect::<Vec<_>>();
                 let vectors = embedder.embed_batch(&texts)?;
                 if is_cancelled() {
-                    conn.execute(
-                        "UPDATE _semantic_v2_build SET status = 'paused', updated_at = ?2
-                     WHERE build_id = ?1 AND status = 'building'",
-                        params![build_id, chrono::Utc::now().to_rfc3339()],
-                    )?;
+                    pause_owned_build(conn, build_id, &worker_token)?;
                     return build_summary(conn, build_id, started, false, resumed, true);
                 }
                 if vectors.len() != chunk.len() {
@@ -1067,11 +1659,7 @@ where
                 }
             }
             if is_cancelled() {
-                conn.execute(
-                    "UPDATE _semantic_v2_build SET status = 'paused', updated_at = ?2
-                 WHERE build_id = ?1 AND status = 'building'",
-                    params![build_id, chrono::Utc::now().to_rfc3339()],
-                )?;
+                pause_owned_build(conn, build_id, &worker_token)?;
                 return build_summary(conn, build_id, started, false, resumed, true);
             }
 
@@ -1083,18 +1671,23 @@ where
                 rows_scanned = rows_scanned + ?3,
                 documents_seen = documents_seen + ?4,
                 updated_at = ?5
-             WHERE build_id = ?1 AND status = 'building' AND cursor_row_num = ?6",
+             WHERE build_id = ?1 AND status = 'building' AND cursor_row_num = ?6
+               AND worker_token = ?7",
                 params![
                     build_id,
                     last_row,
                     source_rows.len() as i64,
-                    documents.len() as i64,
+                    budgeted.documents_seen,
                     chrono::Utc::now().to_rfc3339(),
                     cursor,
+                    worker_token,
                 ],
             )?;
             if claimed == 0 {
                 tx.rollback()?;
+                if !build_is_owned(conn, build_id, &worker_token)? {
+                    return build_summary(conn, build_id, started, false, resumed, true);
+                }
                 cursor = conn.query_row(
                     "SELECT cursor_row_num FROM _semantic_v2_build WHERE build_id = ?1",
                     [build_id],
@@ -1152,20 +1745,44 @@ where
                     }
                 }
             }
-            tx.execute(
+            let expected_mappings = documents
+                .values()
+                .map(|document| document.rows.len() as i64)
+                .sum::<i64>();
+            if mappings_added != expected_mappings {
+                bail!(
+                    "semantic mapping publication wrote {mappings_added} rows, expected {expected_mappings}"
+                );
+            }
+            let updated = tx.execute(
                 "UPDATE _semantic_v2_build SET
-                documents_embedded = documents_embedded + ?2,
-                mappings_written = mappings_written + ?3,
-                updated_at = ?4
-             WHERE build_id = ?1",
+                 documents_embedded = documents_embedded + ?2,
+                 documents_mapped = documents_mapped + ?3,
+                 documents_skipped = documents_skipped + ?4,
+                 mappings_written = mappings_written + ?5,
+                 mappings_skipped = mappings_skipped + ?6,
+                 cells_truncated = cells_truncated + ?7,
+                 columns_omitted = columns_omitted + ?8,
+                 updated_at = ?9
+              WHERE build_id = ?1 AND status = 'building' AND worker_token = ?10",
                 params![
                     build_id,
                     embeddings.len() as i64,
+                    budgeted.documents_mapped,
+                    budgeted.documents_skipped,
                     mappings_added,
+                    budgeted.mappings_skipped,
+                    cells_truncated,
+                    budgeted.columns_omitted,
                     chrono::Utc::now().to_rfc3339(),
+                    worker_token,
                 ],
             )?;
+            if updated != 1 {
+                bail!("semantic build ownership changed during batch publication");
+            }
             tx.commit()?;
+            build_doc_ids.extend(doc_ids);
             cursor = last_row;
             let summary = build_summary(conn, build_id, started, false, resumed, false)?;
             on_progress(SemanticBuildProgress {
@@ -1175,6 +1792,10 @@ where
                 rows_total,
                 documents_embedded: summary.documents_indexed,
                 mappings_written: summary.mappings_written,
+                documents_skipped: summary.documents_skipped,
+                mappings_skipped: summary.mappings_skipped,
+                cells_truncated: summary.cells_truncated,
+                columns_omitted: summary.columns_omitted,
                 resumed_from_row,
             });
         }
@@ -1186,9 +1807,14 @@ where
         let mut message = format!("{error:#}");
         message.truncate(2_048);
         let _ = conn.execute(
-            "UPDATE _semantic_v2_build SET status = 'paused', error = ?2, updated_at = ?3
-             WHERE build_id = ?1 AND status = 'building'",
-            params![build_id, message, chrono::Utc::now().to_rfc3339()],
+            "UPDATE _semantic_v2_build SET status = 'paused', error = ?3, updated_at = ?4
+             WHERE build_id = ?1 AND status = 'building' AND worker_token = ?2",
+            params![
+                build_id,
+                worker_token,
+                message,
+                chrono::Utc::now().to_rfc3339()
+            ],
         );
     }
     result
@@ -1212,6 +1838,51 @@ pub fn semantic_indexed_rows(conn: &Connection, columns: &[ColumnMeta]) -> Resul
             .map(|(_, rows, _, _)| rows)
             .unwrap_or(0),
     )
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SemanticIndexCoverage {
+    pub documents_skipped: i64,
+    pub mappings_skipped: i64,
+    pub cells_truncated: i64,
+    pub columns_omitted: i64,
+}
+
+pub fn semantic_index_coverage(
+    conn: &Connection,
+    columns: &[ColumnMeta],
+) -> Result<Option<SemanticIndexCoverage>> {
+    if !table_exists(conn, "_semantic_v2_active")? || !table_exists(conn, "_semantic_v2_build")? {
+        return Ok(None);
+    }
+    let dataset_hash = semantic_dataset_hash(conn, columns)?;
+    let schema_hash = semantic_schema_hash(columns);
+    conn.query_row(
+        "SELECT b.documents_skipped, b.mappings_skipped, b.cells_truncated,
+                b.columns_omitted
+         FROM _semantic_v2_active a
+         JOIN _semantic_v2_build b ON b.build_id = a.build_id
+         WHERE a.singleton = 1 AND b.status = 'ready'
+           AND b.dataset_hash = ?1 AND b.schema_hash = ?2
+           AND b.model_sha256 = ?3 AND b.normalizer_version = ?4",
+        params![
+            dataset_hash,
+            schema_hash,
+            MODEL_SHA256,
+            V2_NORMALIZER_VERSION
+        ],
+        |row| {
+            Ok(SemanticIndexCoverage {
+                documents_skipped: row.get(0)?,
+                mappings_skipped: row.get(1)?,
+                cells_truncated: row.get(2)?,
+                columns_omitted: row.get(3)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(Into::into)
 }
 
 pub fn ensure_semantic_index(
@@ -1291,6 +1962,9 @@ fn rank_semantic_documents<E: SemanticEmbedder + ?Sized>(
     if query.chars().count() > MAX_QUERY_CHARS {
         bail!("semantic search query exceeds {MAX_QUERY_CHARS} characters");
     }
+    if !policy.minimum_score.is_finite() {
+        bail!("semantic search minimum score must be finite");
+    }
     if !table_exists(conn, "_semantic_v2_active")? {
         bail!("semantic index is not ready");
     }
@@ -1300,12 +1974,8 @@ fn rank_semantic_documents<E: SemanticEmbedder + ?Sized>(
     // Cell documents replace volatile literals with stable placeholders. Applying the same
     // normalization to the semantic query aligns dynamic-ID templates; exact literals remain
     // available to the independent FTS/structured branches.
-    let normalized_query = normalize_text(query);
-    let query_embedding = embedder.embed(if normalized_query.is_empty() {
-        query
-    } else {
-        &normalized_query
-    })?;
+    let normalized_query = semantic_query_input(query);
+    let query_embedding = embedder.embed(&normalized_query)?;
     let mut heap: BinaryHeap<Reverse<ScoredDocument>> =
         BinaryHeap::with_capacity(maximum_documents + 1);
     let mut above_threshold = 0usize;
@@ -1347,13 +2017,173 @@ fn rank_semantic_documents<E: SemanticEmbedder + ?Sized>(
     Ok((documents, above_threshold))
 }
 
-fn new_selection_id(dataset_hash: &str, query: &str) -> String {
+fn query_sha256(query: &str) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(dataset_hash.as_bytes());
     hasher.update(query.as_bytes());
-    hasher.update(chrono::Utc::now().to_rfc3339().as_bytes());
-    hasher.update(std::process::id().to_le_bytes());
     bytes_to_hex(&hasher.finalize())
+}
+
+fn semantic_query_input(query: &str) -> String {
+    let trimmed = query.trim();
+    let normalized = normalize_text(trimmed);
+    if normalized.is_empty() {
+        trimmed.to_string()
+    } else {
+        normalized
+    }
+}
+
+fn new_selection_id(
+    build_id: i64,
+    dataset_hash: &str,
+    query_hash: &str,
+    policy: SemanticSearchPolicy,
+) -> String {
+    let mut hasher = Sha256::new();
+    for value in [
+        V2_SELECTION_POLICY_VERSION.as_bytes(),
+        dataset_hash.as_bytes(),
+        query_hash.as_bytes(),
+    ] {
+        hasher.update((value.len() as u64).to_le_bytes());
+        hasher.update(value);
+    }
+    hasher.update(build_id.to_le_bytes());
+    hasher.update((policy.maximum_documents as u64).to_le_bytes());
+    hasher.update(policy.minimum_score.to_bits().to_le_bytes());
+    bytes_to_hex(&hasher.finalize())
+}
+
+fn load_semantic_selection(
+    conn: &Connection,
+    selection_id: &str,
+) -> Result<Option<SemanticSelectionSummary>> {
+    let stored = conn
+        .query_row(
+            "SELECT s.documents_above_threshold, s.documents_retained, s.rows_matched,
+                    s.documents_truncated, s.broad_row_warning, s.warnings_json,
+                    b.documents_skipped, b.mappings_skipped, b.cells_truncated,
+                    b.columns_omitted
+             FROM _semantic_v2_selection s
+             JOIN _semantic_v2_build b ON b.build_id = s.build_id
+             WHERE s.selection_id = ?1",
+            [selection_id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, bool>(3)?,
+                    row.get::<_, bool>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, i64>(7)?,
+                    row.get::<_, i64>(8)?,
+                    row.get::<_, i64>(9)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        documents_above_threshold,
+        documents_retained,
+        rows_matched,
+        documents_truncated,
+        broad_row_warning,
+        warnings_json,
+        index_documents_skipped,
+        index_mappings_skipped,
+        index_cells_truncated,
+        index_columns_omitted,
+    )) = stored
+    else {
+        return Ok(None);
+    };
+    Ok(Some(SemanticSelectionSummary {
+        selection_id: selection_id.to_string(),
+        documents_above_threshold: documents_above_threshold.max(0) as usize,
+        documents_retained: documents_retained.max(0) as usize,
+        rows_matched,
+        documents_truncated,
+        index_documents_skipped,
+        index_mappings_skipped,
+        index_cells_truncated,
+        index_columns_omitted,
+        broad_row_warning,
+        warnings: serde_json::from_str(&warnings_json)
+            .context("reading semantic selection warnings")?,
+    }))
+}
+
+fn cleanup_semantic_selections(
+    conn: &Connection,
+    build_id: i64,
+    protected_selection_id: &str,
+    maximum_unreferenced: i64,
+) -> Result<usize> {
+    let keep_other = maximum_unreferenced.saturating_sub(1).max(0);
+    let retrieval_audit_exists = table_exists(conn, "_semantic_retrieval_audit")?;
+    let llm_audit_exists = table_exists(conn, "_llm_parse_audit")?;
+    let mut protected_clauses = Vec::new();
+    if retrieval_audit_exists {
+        protected_clauses.push(
+            "EXISTS (
+                SELECT 1 FROM _semantic_retrieval_audit a
+                WHERE a.selection_id = s.selection_id
+             )",
+        );
+    }
+    if llm_audit_exists {
+        protected_clauses.push(
+            "EXISTS (
+                SELECT 1
+                FROM _llm_parse_audit l,
+                     json_tree(CASE WHEN json_valid(l.trusted_intent_json)
+                                    THEN l.trusted_intent_json ELSE '{}' END) j
+                WHERE l.examiner_decision IN ('unreviewed', 'accepted')
+                  AND j.key = 'semanticSelectionId'
+                  AND j.value = s.selection_id
+             )",
+        );
+    }
+    let audit_guard = if protected_clauses.is_empty() {
+        String::new()
+    } else {
+        format!("AND NOT ({})", protected_clauses.join(" OR "))
+    };
+    let sql = format!(
+        "SELECT s.selection_id FROM _semantic_v2_selection s
+         WHERE s.build_id = ?1 AND s.selection_id <> ?2 {audit_guard}
+         ORDER BY s.created_at DESC, s.selection_id DESC
+         LIMIT ?4 OFFSET ?3"
+    );
+    let victims = {
+        let mut statement = conn.prepare(&sql)?;
+        let victims = statement
+            .query_map(
+                params![
+                    build_id,
+                    protected_selection_id,
+                    keep_other,
+                    V2_MAX_SELECTION_CLEANUP_PER_REQUEST,
+                ],
+                |row| row.get::<_, String>(0),
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        victims
+    };
+    let mut removed = 0usize;
+    for selection_id in victims {
+        conn.execute(
+            "DELETE FROM _semantic_v2_selection_doc WHERE selection_id = ?1",
+            [&selection_id],
+        )?;
+        removed += conn.execute(
+            "DELETE FROM _semantic_v2_selection WHERE selection_id = ?1",
+            [&selection_id],
+        )?;
+    }
+    Ok(removed)
 }
 
 pub fn create_semantic_selection<E: SemanticEmbedder + ?Sized>(
@@ -1370,34 +2200,58 @@ pub fn create_semantic_selection<E: SemanticEmbedder + ?Sized>(
     if semantic_dataset_hash(conn, columns)? != dataset_hash {
         bail!("semantic index belongs to a different dataset");
     }
+    let query = query.trim();
+    if query.is_empty() {
+        bail!("semantic search query is empty");
+    }
+    if query.chars().count() > MAX_QUERY_CHARS {
+        bail!("semantic search query exceeds {MAX_QUERY_CHARS} characters");
+    }
+    if !policy.minimum_score.is_finite() {
+        bail!("semantic search minimum score must be finite");
+    }
+    let policy = SemanticSearchPolicy {
+        maximum_documents: policy
+            .maximum_documents
+            .clamp(1, V2_MAX_DOCUMENT_CANDIDATES),
+        minimum_score: policy.minimum_score,
+    };
+    let query_hash = query_sha256(&semantic_query_input(query));
+    let selection_id = new_selection_id(build_id, &dataset_hash, &query_hash, policy);
+    if let Some(selection) = load_semantic_selection(conn, &selection_id)? {
+        return Ok(selection);
+    }
     let (documents, above_threshold) =
         rank_semantic_documents(conn, embedder, build_id, query, policy)?;
     let truncated = above_threshold > documents.len();
-    let selection_id = new_selection_id(&dataset_hash, query);
-    let query_hash = {
-        let mut hasher = Sha256::new();
-        hasher.update(query.as_bytes());
-        bytes_to_hex(&hasher.finalize())
-    };
     let tx = conn.transaction()?;
-    tx.execute(
+    let inserted = tx.execute(
         "INSERT INTO _semantic_v2_selection (
             selection_id, build_id, dataset_hash, query_sha256, policy_version,
-            minimum_score, documents_above_threshold, documents_retained, rows_matched,
-            documents_truncated, broad_row_warning, warnings_json, created_at
-         ) VALUES (?1, ?2, ?3, ?4, 'semantic-doc-search-v1', ?5, ?6, ?7, 0, ?8, 0, '[]', ?9)",
+            minimum_score, maximum_documents, documents_above_threshold, documents_retained,
+            rows_matched, documents_truncated, broad_row_warning, warnings_json, created_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, ?10, 0, '[]', ?11)
+         ON CONFLICT(selection_id) DO NOTHING",
         params![
             selection_id,
             build_id,
             dataset_hash,
             query_hash,
+            V2_SELECTION_POLICY_VERSION,
             policy.minimum_score,
+            policy.maximum_documents as i64,
             above_threshold as i64,
             documents.len() as i64,
             i64::from(truncated),
             chrono::Utc::now().to_rfc3339(),
         ],
     )?;
+    if inserted == 0 {
+        tx.rollback()?;
+        return load_semantic_selection(conn, &selection_id)?.ok_or_else(|| {
+            anyhow::anyhow!("semantic selection identity collision was not readable")
+        });
+    }
     {
         let mut insert = tx.prepare(
             "INSERT INTO _semantic_v2_selection_doc (
@@ -1417,6 +2271,17 @@ pub fn create_semantic_selection<E: SemanticEmbedder + ?Sized>(
         |row| row.get(0),
     )?;
     let broad = rows_matched > 10_000 || rows_matched.saturating_mul(4) > source_rows;
+    let (
+        index_documents_skipped,
+        index_mappings_skipped,
+        index_cells_truncated,
+        index_columns_omitted,
+    ): (i64, i64, i64, i64) = tx.query_row(
+        "SELECT documents_skipped, mappings_skipped, cells_truncated, columns_omitted
+         FROM _semantic_v2_build WHERE build_id = ?1",
+        [build_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    )?;
     let mut warnings = Vec::new();
     warnings.push(
         "Semantic retrieval uses bounded normalized cell/chunk documents; lexical and structured conditions remain complete."
@@ -1426,6 +2291,15 @@ pub fn create_semantic_selection<E: SemanticEmbedder + ?Sized>(
         warnings.push(format!(
             "Semantic document candidates were limited to {}; lexical and structured matches remain complete.",
             documents.len()
+        ));
+    }
+    if index_documents_skipped > 0
+        || index_mappings_skipped > 0
+        || index_cells_truncated > 0
+        || index_columns_omitted > 0
+    {
+        warnings.push(format!(
+            "Semantic indexing was bounded: {index_cells_truncated} oversized cell(s) were truncated, {index_columns_omitted} eligible wide-row column value(s) were omitted, {index_documents_skipped} new-document candidate(s) were skipped, and {index_mappings_skipped} document-to-row mapping candidate(s) were skipped. Exact lexical and structured matching remains complete across every raw row."
         ));
     }
     if broad {
@@ -1443,6 +2317,7 @@ pub fn create_semantic_selection<E: SemanticEmbedder + ?Sized>(
             serde_json::to_string(&warnings)?,
         ],
     )?;
+    cleanup_semantic_selections(&tx, build_id, &selection_id, V2_MAX_SELECTIONS_PER_BUILD)?;
     tx.commit()?;
     Ok(SemanticSelectionSummary {
         selection_id,
@@ -1450,6 +2325,10 @@ pub fn create_semantic_selection<E: SemanticEmbedder + ?Sized>(
         documents_retained: documents.len(),
         rows_matched,
         documents_truncated: truncated,
+        index_documents_skipped,
+        index_mappings_skipped,
+        index_cells_truncated,
+        index_columns_omitted,
         broad_row_warning: broad,
         warnings,
     })
@@ -1791,6 +2670,31 @@ mod tests {
     }
 
     #[test]
+    fn header_classification_uses_exact_tokens_across_snake_camel_and_acronyms() {
+        for (sql_name, original_name) in [
+            ("process_id", "ProcessId"),
+            ("security_sid", "SID"),
+            ("event_guid", "EventGUID"),
+            ("source_ip", "SourceIP"),
+        ] {
+            assert!(
+                exact_only_header_name(&text_column(sql_name, original_name, 0)),
+                "{sql_name}/{original_name} should be exact-only"
+            );
+        }
+        for (sql_name, original_name) in [
+            ("identity_note", "Identity Narrative"),
+            ("candidate_status", "Candidate Status"),
+            ("rapid_detail", "Rapid Detail"),
+        ] {
+            assert!(
+                !exact_only_header_name(&text_column(sql_name, original_name, 0)),
+                "{sql_name}/{original_name} must not match the id token"
+            );
+        }
+    }
+
+    #[test]
     fn semantic_v2_schema_is_additive_and_dataset_bound() {
         let conn = Connection::open_in_memory().unwrap();
         let columns = columns();
@@ -1912,6 +2816,153 @@ mod tests {
     }
 
     #[test]
+    fn v2_wide_rows_report_omissions_and_keep_the_final_eligible_column() {
+        let plans = (0..60)
+            .map(|index| ColumnPlan {
+                col_index: index,
+                sql_name: format!("field_{index}"),
+                original_name: format!("Narrative Field {index}"),
+                mode: ColumnMode::Text,
+            })
+            .collect::<Vec<_>>();
+        let values = (0..60)
+            .map(|index| Some(format!("security evidence value {index}")))
+            .collect::<Vec<_>>();
+        let output = row_documents_with_stats_v2(&plans, &values);
+        assert_eq!(output.eligible_columns_omitted, 12);
+        assert_eq!(output.documents.len(), V2_MAX_PRIMARY_DOCUMENTS_PER_ROW);
+        assert_eq!(output.documents.last().unwrap().1, "field_59");
+    }
+
+    #[test]
+    fn v2_build_caps_are_balanced_to_the_final_row_and_report_exact_skips() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        let columns = message_columns();
+        populate_messages(&mut conn, &columns, 5, true);
+        let embedder = FakeEmbedder::default();
+        let summary = ensure_semantic_index_v2_with_limits(
+            &mut conn,
+            &columns,
+            &embedder,
+            || false,
+            |_| {},
+            SemanticResourceLimits {
+                mapped_documents: 2,
+                mappings: 5,
+            },
+        )
+        .unwrap();
+        assert_eq!(summary.rows_indexed, 5);
+        assert_eq!(summary.documents_mapped, 2);
+        assert_eq!(summary.mappings_written, 2);
+        assert_eq!(summary.documents_skipped, 3);
+        assert_eq!(summary.mappings_skipped, 3);
+        assert!(summary.truncated);
+        let mapped_rows = conn
+            .prepare("SELECT DISTINCT row_num FROM _semantic_v2_mapping ORDER BY row_num")
+            .unwrap()
+            .query_map([], |row| row.get::<_, i64>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(mapped_rows, vec![3, 5]);
+
+        let selection = create_semantic_selection(
+            &mut conn,
+            &columns,
+            &embedder,
+            "suspicious process",
+            SemanticSearchPolicy {
+                maximum_documents: 2,
+                minimum_score: -1.0,
+            },
+        )
+        .unwrap();
+        assert_eq!(selection.index_documents_skipped, 3);
+        assert_eq!(selection.index_mappings_skipped, 3);
+        assert!(selection
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("3 new-document")
+                && warning.contains("3 document-to-row")));
+    }
+
+    #[test]
+    fn v2_fetch_and_documents_bound_oversized_cells_before_embedding() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        let columns = message_columns();
+        db::create_schema(&conn, &columns).unwrap();
+        let huge = (0..50_000)
+            .map(|index| format!("evidence{index}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        conn.execute(
+            "INSERT INTO rows(row_num, event_id, message) VALUES (1, 'event-one', ?1)",
+            [&huge],
+        )
+        .unwrap();
+        let embedder = FakeEmbedder::default();
+        let summary =
+            ensure_semantic_index_v2(&mut conn, &columns, &embedder, || false, |_| {}).unwrap();
+        assert_eq!(summary.cells_truncated, 1);
+        assert!(summary.truncated);
+        assert!(embedder
+            .seen
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|text| text.chars().count() <= V2_MAX_DOCUMENT_CHARS));
+        let longest: i64 = conn
+            .query_row(
+                "SELECT MAX(length(normalized_text)) FROM _semantic_v2_document",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(longest <= V2_MAX_DOCUMENT_CHARS as i64);
+    }
+
+    #[test]
+    fn stale_normalizer_build_is_not_reused_or_published() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        let columns = message_columns();
+        populate_messages(&mut conn, &columns, 1, false);
+        create_semantic_v2_schema(&conn).unwrap();
+        let dataset_hash = semantic_dataset_hash(&conn, &columns).unwrap();
+        let schema_hash = semantic_schema_hash(&columns);
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO _semantic_v2_build (
+                dataset_hash, schema_hash, model_sha256, normalizer_version, status,
+                source_rows, cursor_row_num, rows_scanned, started_at, updated_at, completed_at
+             ) VALUES (?1, ?2, ?3, 'dfir-cell-normalizer-v2', 'ready', 1, 1, 1, ?4, ?4, ?4)",
+            params![dataset_hash, schema_hash, MODEL_SHA256, now],
+        )
+        .unwrap();
+        let stale_build = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO _semantic_v2_active(singleton, build_id) VALUES (1, ?1)",
+            [stale_build],
+        )
+        .unwrap();
+
+        let embedder = FakeEmbedder::default();
+        let summary =
+            ensure_semantic_index_v2(&mut conn, &columns, &embedder, || false, |_| {}).unwrap();
+        assert!(!summary.from_cache);
+        let (active_build, active_version): (i64, String) = conn
+            .query_row(
+                "SELECT b.build_id, b.normalizer_version
+                 FROM _semantic_v2_active a JOIN _semantic_v2_build b ON b.build_id = a.build_id",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_ne!(active_build, stale_build);
+        assert_eq!(active_version, V2_NORMALIZER_VERSION);
+    }
+
+    #[test]
     fn v2_selection_expands_every_mapping_beyond_legacy_row_caps() {
         let mut conn = Connection::open_in_memory().unwrap();
         let columns = message_columns();
@@ -1946,6 +2997,139 @@ mod tests {
             seen.last().unwrap(),
             "credential dumping from <ip> process <number>"
         );
+    }
+
+    #[test]
+    fn semantic_selection_reuses_normalized_query_and_policy_identity() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        let columns = message_columns();
+        populate_messages(&mut conn, &columns, 2, false);
+        let embedder = FakeEmbedder::default();
+        ensure_semantic_index_v2(&mut conn, &columns, &embedder, || false, |_| {}).unwrap();
+        let policy = SemanticSearchPolicy {
+            maximum_documents: 4,
+            minimum_score: -1.0,
+        };
+        let first = create_semantic_selection(
+            &mut conn,
+            &columns,
+            &embedder,
+            "  CREDENTIAL   Dumping  ",
+            policy,
+        )
+        .unwrap();
+        let calls_after_first = embedder.call_count();
+        let reused =
+            create_semantic_selection(&mut conn, &columns, &embedder, "credential dumping", policy)
+                .unwrap();
+        assert_eq!(reused.selection_id, first.selection_id);
+        assert_eq!(embedder.call_count(), calls_after_first);
+
+        let different_policy = create_semantic_selection(
+            &mut conn,
+            &columns,
+            &embedder,
+            "credential dumping",
+            SemanticSearchPolicy {
+                maximum_documents: 1,
+                minimum_score: -1.0,
+            },
+        )
+        .unwrap();
+        assert_ne!(different_policy.selection_id, first.selection_id);
+    }
+
+    #[test]
+    fn selection_cleanup_is_bounded_and_preserves_accepted_and_unreviewed_audits() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        let columns = message_columns();
+        populate_messages(&mut conn, &columns, 1, false);
+        let embedder = FakeEmbedder::default();
+        ensure_semantic_index_v2(&mut conn, &columns, &embedder, || false, |_| {}).unwrap();
+        let policy = SemanticSearchPolicy {
+            maximum_documents: 1,
+            minimum_score: -1.0,
+        };
+        let accepted = create_semantic_selection(
+            &mut conn,
+            &columns,
+            &embedder,
+            "accepted audit query",
+            policy,
+        )
+        .unwrap();
+        let unreviewed = create_semantic_selection(
+            &mut conn,
+            &columns,
+            &embedder,
+            "unreviewed audit query",
+            policy,
+        )
+        .unwrap();
+        conn.execute_batch(
+            "CREATE TABLE _llm_parse_audit (
+                trusted_intent_json TEXT NOT NULL,
+                examiner_decision TEXT NOT NULL
+             );",
+        )
+        .unwrap();
+        for (selection_id, decision) in [
+            (&accepted.selection_id, "accepted"),
+            (&unreviewed.selection_id, "unreviewed"),
+        ] {
+            let trusted = serde_json::json!({
+                "intent": "rawEvidenceSearch",
+                "semanticSelectionId": selection_id,
+            })
+            .to_string();
+            conn.execute(
+                "INSERT INTO _llm_parse_audit(trusted_intent_json, examiner_decision)
+                 VALUES (?1, ?2)",
+                params![trusted, decision],
+            )
+            .unwrap();
+        }
+        let mut newest = String::new();
+        for index in 0..70 {
+            newest = create_semantic_selection(
+                &mut conn,
+                &columns,
+                &embedder,
+                &format!("cleanup candidate {}", alphabetic_id(index)),
+                policy,
+            )
+            .unwrap()
+            .selection_id;
+        }
+        let build_id = active_build_identity(&conn).unwrap().0;
+        let first_pass = cleanup_semantic_selections(&conn, build_id, &newest, 2).unwrap();
+        assert_eq!(first_pass, V2_MAX_SELECTION_CLEANUP_PER_REQUEST as usize);
+        let second_pass = cleanup_semantic_selections(&conn, build_id, &newest, 2).unwrap();
+        assert!(second_pass <= V2_MAX_SELECTION_CLEANUP_PER_REQUEST as usize);
+        for selection_id in [&accepted.selection_id, &unreviewed.selection_id] {
+            let retained: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM _semantic_v2_selection WHERE selection_id = ?1)",
+                    [selection_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(retained, "audited selection {selection_id} was deleted");
+        }
+        let unaudited: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM _semantic_v2_selection s
+                 WHERE NOT EXISTS (
+                    SELECT 1 FROM _llm_parse_audit l,
+                         json_tree(l.trusted_intent_json) j
+                    WHERE l.examiner_decision IN ('unreviewed', 'accepted')
+                      AND j.key = 'semanticSelectionId' AND j.value = s.selection_id
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(unaudited, 2);
     }
 
     #[test]
@@ -2164,9 +3348,15 @@ mod tests {
                 ensure_semantic_index_v2(&mut conn, &columns, &embedder, || false, |_| {})
             }));
         }
-        for worker in workers {
-            worker.join().unwrap().unwrap();
-        }
+        let results = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            results.iter().filter(|summary| summary.cancelled).count(),
+            1,
+            "the worker that lost ownership must exit without pausing the winner"
+        );
 
         let conn = Connection::open(&path).unwrap();
         let (builds, rows_scanned, mappings): (i64, i64, i64) = conn
@@ -2186,6 +3376,29 @@ mod tests {
             })
             .unwrap();
         assert_eq!(mapped, 520);
+        let (status, worker_token): (String, Option<String>) = conn
+            .query_row(
+                "SELECT status, worker_token FROM _semantic_v2_build",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "ready");
+        assert!(worker_token.is_none());
+
+        // Simulate the narrow observer race where the identity row becomes ready after the
+        // caller's active-pointer check but before build preparation. Preparation must return the
+        // ready identity instead of retrying INSERT OR IGNORE forever.
+        conn.execute("DELETE FROM _semantic_v2_active", []).unwrap();
+        drop(conn);
+        let mut conn = Connection::open(&path).unwrap();
+        let cache_embedder = FakeEmbedder::default();
+        let cached =
+            ensure_semantic_index_v2(&mut conn, &columns, &cache_embedder, || false, |_| {})
+                .unwrap();
+        assert!(cached.from_cache);
+        assert_eq!(cache_embedder.call_count(), 0);
+        assert!(semantic_index_ready(&conn, &columns).unwrap());
         drop(conn);
         std::fs::remove_file(path).unwrap();
     }
