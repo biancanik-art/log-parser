@@ -2,7 +2,7 @@ use crate::db::{self, ColumnMeta};
 use crate::export;
 use crate::semantic;
 use anyhow::{anyhow, bail, Context, Result};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use rust_xlsxwriter::{Workbook, Worksheet};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 const VPN_RANGES_JSON: &str = include_str!("../resources/intel/vpn_ranges.v1.json");
 const PROGRESS_EVERY: i64 = 5000;
 const EXCEL_STRING_LIMIT: usize = 32_767;
+const REPORT_SNAPSHOT_ATTEMPTS: usize = 4;
 static REPORT_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 struct PendingReportExport {
@@ -206,10 +207,6 @@ pub fn export_report_guarded(
     mut on_progress: impl FnMut(i64, &str),
     publish: impl FnOnce(&Path, &Path) -> Result<()>,
 ) -> Result<ReportExportSummary> {
-    on_progress(0, "Semantic evidence archival");
-    semantic::complete_required_semantic_audits(conn)
-        .context("completing required semantic evidence archival before report export")?;
-
     let parent = dest_path
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
@@ -234,7 +231,8 @@ pub fn export_report_guarded(
         published: false,
     };
 
-    let mut summary = write_report_workbook(conn, columns, &pending.path, on_progress)?;
+    let mut summary =
+        write_report_from_consistent_snapshot(conn, columns, &pending.path, &mut on_progress)?;
     std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -247,6 +245,38 @@ pub fn export_report_guarded(
     sync_report_parent_directory(parent)?;
     summary.dest_path = dest_path.display().to_string();
     Ok(summary)
+}
+
+fn write_report_from_consistent_snapshot<F>(
+    conn: &mut Connection,
+    columns: &[ColumnMeta],
+    dest_path: &Path,
+    on_progress: &mut F,
+) -> Result<ReportExportSummary>
+where
+    F: FnMut(i64, &str),
+{
+    for _ in 0..REPORT_SNAPSHOT_ATTEMPTS {
+        on_progress(0, "Semantic evidence archival");
+        semantic::complete_required_semantic_audits(conn)
+            .context("completing required semantic evidence archival before report export")?;
+
+        let transaction = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        // This must remain the first read after BEGIN DEFERRED. It fixes the SQLite snapshot and
+        // detects an accepted selection that committed in the narrow gap after archival.
+        if semantic::required_semantic_audits_pending(&transaction)? {
+            transaction.rollback()?;
+            continue;
+        }
+
+        let summary = write_report_workbook(&transaction, columns, dest_path, &mut *on_progress)?;
+        transaction.commit()?;
+        return Ok(summary);
+    }
+
+    bail!(
+        "report evidence changed repeatedly while the point-in-time snapshot was starting; retry the export"
+    )
 }
 
 fn write_report_workbook(
@@ -303,7 +333,7 @@ fn write_report_workbook(
             used_sheet_names.insert("semantic retrieval".to_string());
         }
 
-        if table_has_rows(conn, "_semantic_v2_audit_snapshot")? {
+        if semantic_reportable_snapshots_have_rows(conn)? {
             sheets_written.push(write_semantic_audit_sheet(conn, &mut write_state)?);
             used_sheet_names.insert("semantic audit".to_string());
         }
@@ -611,16 +641,22 @@ where
         "last_row_num",
         "encoded_rows_hex",
         "chunk_sha256",
+        "mapping_chunk_count",
+        "row_chunk_count",
+        "sealed",
+        "seal_version",
+        "archive_status",
     ];
     write_headers(worksheet, &headers)?;
     for column in 0..headers.len() as u16 {
         worksheet.set_column_width(column, 22)?;
     }
-    for column in [4u16, 5, 10, 11, 12, 13, 22, 40, 42, 48, 51, 57, 58] {
+    for column in [4u16, 5, 10, 11, 12, 13, 22, 40, 42, 48, 51, 57, 58, 63] {
         worksheet.set_column_width(column, 56)?;
     }
 
     let mut excel_row = 1u32;
+    let snapshot_targets = (1u16..=45).chain(59u16..=63).collect::<Vec<_>>();
     write_semantic_audit_query(
         conn,
         worksheet,
@@ -636,9 +672,12 @@ where
                 index_chunks_omitted, candidate_documents, candidate_mappings,
                 candidate_document_limit, candidate_mapping_limit, selected_document_count,
                 mapping_count, mapping_sha256, row_count, row_set_sha256, row_set_encoding,
-                selection_created_at, archived_at
-         FROM _semantic_v2_audit_snapshot ORDER BY selection_id",
-        &(1u16..=45).collect::<Vec<_>>(),
+                selection_created_at, archived_at, mapping_chunk_count, row_chunk_count,
+                sealed, seal_version, 'sealed_exact_mappings'
+         FROM _semantic_v2_audit_snapshot p
+         JOIN _semantic_v2_audit_snapshot_complete complete USING(selection_id)
+         ORDER BY selection_id",
+        &snapshot_targets,
         &mut excel_row,
         state.total_rows_written,
     )?;
@@ -647,9 +686,12 @@ where
         worksheet,
         "document",
         "SELECT selection_id, mapping_count, mapping_sha256, rank, source_doc_id,
-                fingerprint_sha256, kind, column_key, normalized_text, cosine_score, rank_score
-         FROM _semantic_v2_audit_snapshot_document ORDER BY selection_id, rank",
-        &[1, 39, 40, 46, 47, 48, 49, 50, 51, 52, 53],
+                fingerprint_sha256, kind, column_key, normalized_text, cosine_score, rank_score,
+                'sealed_exact_mappings'
+         FROM _semantic_v2_audit_snapshot_document d
+         JOIN _semantic_v2_audit_snapshot_complete complete USING(selection_id)
+         ORDER BY selection_id, rank",
+        &[1, 39, 40, 46, 47, 48, 49, 50, 51, 52, 53, 63],
         &mut excel_row,
         state.total_rows_written,
     )?;
@@ -658,12 +700,82 @@ where
         worksheet,
         "row_chunk",
         "SELECT selection_id, row_count, chunk_index, first_row_num, last_row_num,
-                encoded_rows, chunk_sha256
-         FROM _semantic_v2_audit_snapshot_row_chunk ORDER BY selection_id, chunk_index",
-        &[1, 41, 54, 55, 56, 57, 58],
+                encoded_rows, chunk_sha256, 'sealed_exact_mappings'
+         FROM _semantic_v2_audit_snapshot_row_chunk rc
+         JOIN _semantic_v2_audit_snapshot_complete complete USING(selection_id)
+         ORDER BY selection_id, chunk_index",
+        &[1, 41, 54, 55, 56, 57, 58, 63],
         &mut excel_row,
         state.total_rows_written,
     )?;
+    write_semantic_audit_query(
+        conn,
+        worksheet,
+        "mapping_chunk",
+        "SELECT selection_id, row_count, source_doc_id, chunk_index, first_row_num,
+                last_row_num, encoded_rows, chunk_sha256, 'sealed_exact_mappings'
+         FROM _semantic_v2_audit_snapshot_mapping_chunk mc
+         JOIN _semantic_v2_audit_snapshot_complete complete USING(selection_id)
+         ORDER BY selection_id, chunk_index",
+        &[1, 39, 47, 54, 55, 56, 57, 58, 63],
+        &mut excel_row,
+        state.total_rows_written,
+    )?;
+
+    if semantic_audit_view_exists(conn, "_semantic_v2_audit_snapshot_legacy_union")? {
+        write_semantic_audit_query(
+            conn,
+            worksheet,
+            "legacy_snapshot_union_only",
+            "SELECT selection_id, snapshot_version, build_id, dataset_hash, schema_hash,
+                    index_version, normalizer_version, model_name, model_version, model_sha256,
+                    tokenizer_sha256, config_sha256, query_sha256, policy_version, minimum_score,
+                    maximum_documents, documents_above_threshold, documents_retained, rows_matched,
+                    documents_truncated, broad_row_warning, warnings_json, source_rows,
+                    index_rows_scanned, index_documents_seen, index_documents_embedded,
+                    index_documents_mapped, index_mappings_written, index_documents_skipped,
+                    index_mappings_skipped, index_cells_truncated, index_columns_omitted,
+                    index_chunks_omitted, candidate_documents, candidate_mappings,
+                    candidate_document_limit, candidate_mapping_limit, selected_document_count,
+                    mapping_count, mapping_sha256, row_count, row_set_sha256, row_set_encoding,
+                    selection_created_at, archived_at, NULL, NULL, sealed, seal_version,
+                    'legacy_union_only_mapping_links_unavailable'
+             FROM _semantic_v2_audit_snapshot p
+             JOIN _semantic_v2_audit_snapshot_legacy_union legacy USING(selection_id)
+             ORDER BY selection_id",
+            &snapshot_targets,
+            &mut excel_row,
+            state.total_rows_written,
+        )?;
+        write_semantic_audit_query(
+            conn,
+            worksheet,
+            "legacy_document_union_only",
+            "SELECT selection_id, mapping_count, mapping_sha256, rank, source_doc_id,
+                    fingerprint_sha256, kind, column_key, normalized_text, cosine_score, rank_score,
+                    'legacy_union_only_mapping_links_unavailable'
+             FROM _semantic_v2_audit_snapshot_document d
+             JOIN _semantic_v2_audit_snapshot_legacy_union legacy USING(selection_id)
+             ORDER BY selection_id, rank",
+            &[1, 39, 40, 46, 47, 48, 49, 50, 51, 52, 53, 63],
+            &mut excel_row,
+            state.total_rows_written,
+        )?;
+        write_semantic_audit_query(
+            conn,
+            worksheet,
+            "legacy_row_chunk_union_only",
+            "SELECT selection_id, row_count, chunk_index, first_row_num, last_row_num,
+                    encoded_rows, chunk_sha256,
+                    'legacy_union_only_mapping_links_unavailable'
+             FROM _semantic_v2_audit_snapshot_row_chunk rc
+             JOIN _semantic_v2_audit_snapshot_legacy_union legacy USING(selection_id)
+             ORDER BY selection_id, chunk_index",
+            &[1, 41, 54, 55, 56, 57, 58, 63],
+            &mut excel_row,
+            state.total_rows_written,
+        )?;
+    }
 
     (state.on_progress)(*state.total_rows_written, &sheet_name);
     Ok(sheet_name)
@@ -743,6 +855,37 @@ fn table_has_rows(conn: &Connection, table_name: &str) -> Result<bool> {
     );
     let has_rows: i64 = conn.query_row(&sql, [], |row| row.get(0))?;
     Ok(has_rows != 0)
+}
+
+fn semantic_audit_view_exists(conn: &Connection, view_name: &str) -> Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM sqlite_master
+            WHERE type = 'view' AND name = ?1
+         )",
+        [view_name],
+        |row| row.get(0),
+    )
+    .map_err(Into::into)
+}
+
+fn semantic_reportable_snapshots_have_rows(conn: &Connection) -> Result<bool> {
+    for view_name in [
+        "_semantic_v2_audit_snapshot_complete",
+        "_semantic_v2_audit_snapshot_legacy_union",
+    ] {
+        if !semantic_audit_view_exists(conn, view_name)? {
+            continue;
+        }
+        let sql = format!(
+            "SELECT EXISTS(SELECT 1 FROM {} LIMIT 1)",
+            db::quote_ident(view_name)
+        );
+        if conn.query_row(&sql, [], |row| row.get::<_, bool>(0))? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn intel_match_count(conn: &Connection) -> Result<i64> {
@@ -2456,6 +2599,90 @@ mod tests {
     }
 
     #[test]
+    fn report_uses_one_sqlite_snapshot_across_all_sheets() {
+        let report_path = temp_report_path("point-in-time-snapshot");
+        let db_path = report_path.parent().unwrap().join("evidence.sqlite3");
+        let columns = vec![ColumnMeta {
+            sql_name: "message".into(),
+            original_name: "Message".into(),
+            col_index: 0,
+            inferred_type: "text".into(),
+        }];
+        let mut conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch("PRAGMA journal_mode = WAL;").unwrap();
+        db::create_schema(&conn, &columns).unwrap();
+        conn.execute(
+            "INSERT INTO rows(row_num, message) VALUES (1, 'initial evidence')",
+            [],
+        )
+        .unwrap();
+        create_llm_audit_fixture(&conn, false);
+
+        let (snapshot_ready_tx, snapshot_ready_rx) = std::sync::mpsc::channel();
+        let (writer_done_tx, writer_done_rx) = std::sync::mpsc::channel();
+        let export_path = report_path.clone();
+        let export_columns = columns.clone();
+        let export = std::thread::spawn(move || {
+            let mut signalled = false;
+            export_report(&mut conn, &export_columns, &export_path, |_, sheet| {
+                if sheet == "General" && !signalled {
+                    signalled = true;
+                    snapshot_ready_tx.send(()).unwrap();
+                    writer_done_rx
+                        .recv_timeout(std::time::Duration::from_secs(10))
+                        .unwrap();
+                }
+            })
+            .unwrap()
+        });
+
+        snapshot_ready_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        let writer = Connection::open(&db_path).unwrap();
+        writer
+            .busy_timeout(std::time::Duration::from_secs(3))
+            .unwrap();
+        let write_result = writer.execute_batch(
+            "INSERT INTO _llm_parse_audit
+             SELECT 43, provider, model_name, model_version, model_sha256, tokenizer_sha256,
+                    prompt_template_version, correlation_engine_version, artifact_ids_json,
+                    'concurrent-input', generation_parameters_json,
+                    '2026-07-17T02:00:00Z', load_time_ms, inference_latency_ms,
+                    'concurrent model output', validation_status, validation_detail,
+                    trusted_intent_json, examiner_decision, '2026-07-17T02:00:01Z'
+             FROM _llm_parse_audit WHERE id = 42;",
+        );
+        writer_done_tx.send(()).unwrap();
+        write_result.unwrap();
+        let summary = export.join().unwrap();
+        assert!(summary.sheets_written.contains(&"AI Audit".to_string()));
+
+        let mut workbook = calamine::open_workbook_auto(&report_path).unwrap();
+        let audit = workbook.worksheet_range("AI Audit").unwrap();
+        let rows = audit.rows().collect::<Vec<_>>();
+        assert_eq!(
+            rows.len(),
+            2,
+            "concurrent audit must be outside the report snapshot"
+        );
+        assert_eq!(cell_to_i64(&rows[1][0]), 42);
+
+        let database_audits: i64 = writer
+            .query_row("SELECT COUNT(*) FROM _llm_parse_audit", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            database_audits, 2,
+            "writer must really commit during export"
+        );
+        drop(workbook);
+        drop(writer);
+        let _ = std::fs::remove_dir_all(report_path.parent().unwrap());
+    }
+
+    #[test]
     fn report_export_writes_complete_ai_and_semantic_audit_sheets() {
         let (mut conn, columns) = setup_report_fixture(true);
         create_llm_audit_fixture(&conn, true);
@@ -2504,6 +2731,10 @@ mod tests {
                 row_count INTEGER,
                 row_set_sha256 TEXT,
                 row_set_encoding TEXT,
+                mapping_chunk_count INTEGER,
+                row_chunk_count INTEGER,
+                sealed INTEGER,
+                seal_version TEXT,
                 selection_created_at TEXT,
                 archived_at TEXT
              );
@@ -2531,6 +2762,17 @@ mod tests {
                 chunk_sha256 TEXT,
                 PRIMARY KEY (selection_id, chunk_index)
              );
+             CREATE TABLE IF NOT EXISTS _semantic_v2_audit_snapshot_mapping_chunk (
+                selection_id INTEGER,
+                chunk_index INTEGER,
+                source_doc_id INTEGER,
+                first_row_num INTEGER,
+                last_row_num INTEGER,
+                row_count INTEGER,
+                encoded_rows BLOB,
+                chunk_sha256 TEXT,
+                PRIMARY KEY (selection_id, chunk_index)
+             );
              INSERT INTO _semantic_v2_audit_snapshot (
                 selection_id, snapshot_version, build_id, dataset_hash, schema_hash,
                 index_version, normalizer_version, model_name, model_version, model_sha256,
@@ -2543,15 +2785,17 @@ mod tests {
                 index_chunks_omitted, candidate_documents, candidate_mappings,
                 candidate_document_limit, candidate_mapping_limit, selected_document_count,
                 mapping_count, mapping_sha256, row_count, row_set_sha256, row_set_encoding,
+                mapping_chunk_count, row_chunk_count, sealed, seal_version,
                 selection_created_at, archived_at
              ) VALUES (
-                9001, 'semantic-audit-snapshot-v1', 77, 'dataset-hash', 'schema-hash',
+                9001, 'semantic-audit-snapshot-v2', 77, 'dataset-hash', 'schema-hash',
                 'semantic-document-v3', 'dfir-cell-normalizer-v3', 'all-MiniLM-L6-v2',
                 'onnx@revision', 'model-hash', 'tokenizer-hash', 'config-hash', 'query-hash',
                 'semantic-ranking-v2', 0.42, 250, 10, 4, 7, 0, 1,
                 '[\"bounded evidence\"]', 3, 3, 12, 12, 12, 14, 0, 0, 1, 2, 3, 12, 14,
                 100000, 6000000, 4, 14, 'mapping-hash', 7, 'row-set-hash',
-                'delta-varint-v1', '2026-07-16T00:00:30Z', '2026-07-16T00:02:00Z'
+                'delta-varint-v1', 1, 1, 1, 'semantic-audit-seal-v1',
+                '2026-07-16T00:00:30Z', '2026-07-16T00:02:00Z'
              );
              INSERT INTO _semantic_v2_audit_snapshot_document (
                 selection_id, rank, source_doc_id, fingerprint_sha256, kind, column_key,
@@ -2563,7 +2807,54 @@ mod tests {
              INSERT INTO _semantic_v2_audit_snapshot_row_chunk (
                 selection_id, chunk_index, first_row_num, last_row_num, row_count,
                 encoded_rows, chunk_sha256
-             ) VALUES (9001, 0, 1, 3000, 3, x'00017Fff', 'chunk-hash');",
+             ) VALUES (9001, 0, 1, 3000, 3, x'00017Fff', 'chunk-hash');
+             INSERT INTO _semantic_v2_audit_snapshot_mapping_chunk (
+                selection_id, chunk_index, source_doc_id, first_row_num, last_row_num,
+                row_count, encoded_rows, chunk_sha256
+             ) VALUES (9001, 0, 123, 1, 3000, 3, x'00017Fff', 'mapping-chunk-hash');
+             INSERT INTO _semantic_v2_audit_snapshot(selection_id, sealed)
+                VALUES (9002, 0);
+             INSERT INTO _semantic_v2_audit_snapshot_document
+                SELECT 9002, rank, source_doc_id, fingerprint_sha256, kind, column_key,
+                       normalized_text, cosine_score, rank_score, mapping_count, mapping_sha256
+                FROM _semantic_v2_audit_snapshot_document WHERE selection_id = 9001;
+             INSERT INTO _semantic_v2_audit_snapshot_mapping_chunk
+                SELECT 9002, chunk_index, source_doc_id, first_row_num, last_row_num,
+                       row_count, encoded_rows, chunk_sha256
+                FROM _semantic_v2_audit_snapshot_mapping_chunk WHERE selection_id = 9001;
+             INSERT INTO _semantic_v2_audit_snapshot_row_chunk
+                SELECT 9002, chunk_index, first_row_num, last_row_num, row_count,
+                       encoded_rows, chunk_sha256
+                FROM _semantic_v2_audit_snapshot_row_chunk WHERE selection_id = 9001;
+             INSERT INTO _semantic_v2_audit_snapshot
+                SELECT 9003, 'semantic-audit-snapshot-v1', build_id, dataset_hash, schema_hash,
+                       index_version, normalizer_version, model_name, model_version, model_sha256,
+                       tokenizer_sha256, config_sha256, query_sha256, policy_version,
+                       minimum_score, maximum_documents, documents_above_threshold,
+                       documents_retained, rows_matched, documents_truncated, broad_row_warning,
+                       warnings_json, source_rows, index_rows_scanned, index_documents_seen,
+                       index_documents_embedded, index_documents_mapped, index_mappings_written,
+                       index_documents_skipped, index_mappings_skipped, index_cells_truncated,
+                       index_columns_omitted, index_chunks_omitted, candidate_documents,
+                       candidate_mappings, candidate_document_limit, candidate_mapping_limit,
+                       selected_document_count, mapping_count, mapping_sha256, row_count,
+                       row_set_sha256, row_set_encoding, 0, 0, 0, '', selection_created_at,
+                       archived_at
+                FROM _semantic_v2_audit_snapshot WHERE selection_id = 9001;
+             INSERT INTO _semantic_v2_audit_snapshot_document
+                SELECT 9003, rank, source_doc_id, fingerprint_sha256, kind, column_key,
+                       normalized_text, cosine_score, rank_score, mapping_count, mapping_sha256
+                FROM _semantic_v2_audit_snapshot_document WHERE selection_id = 9001;
+             INSERT INTO _semantic_v2_audit_snapshot_row_chunk
+                SELECT 9003, chunk_index, first_row_num, last_row_num, row_count,
+                       encoded_rows, chunk_sha256
+                FROM _semantic_v2_audit_snapshot_row_chunk WHERE selection_id = 9001;
+             CREATE VIEW _semantic_v2_audit_snapshot_complete AS
+                SELECT selection_id FROM _semantic_v2_audit_snapshot
+                WHERE snapshot_version = 'semantic-audit-snapshot-v2' AND sealed = 1;
+             CREATE VIEW _semantic_v2_audit_snapshot_legacy_union AS
+                SELECT selection_id FROM _semantic_v2_audit_snapshot
+                WHERE snapshot_version = 'semantic-audit-snapshot-v1' AND sealed = 0;",
         )
         .unwrap();
         let path = temp_report_path("with-ai-audit");
@@ -2601,7 +2892,27 @@ mod tests {
 
         let semantic = workbook.worksheet_range("Semantic Audit").unwrap();
         let semantic_rows: Vec<_> = semantic.rows().collect();
-        assert_eq!(semantic_rows.len(), 4);
+        assert_eq!(semantic_rows.len(), 8);
+        assert_eq!(
+            semantic_rows
+                .iter()
+                .skip(1)
+                .filter(|row| cell_to_i64(&row[1]) == 9001)
+                .count(),
+            4
+        );
+        assert_eq!(
+            semantic_rows
+                .iter()
+                .skip(1)
+                .filter(|row| cell_to_i64(&row[1]) == 9003)
+                .count(),
+            3
+        );
+        assert!(!semantic_rows
+            .iter()
+            .skip(1)
+            .any(|row| cell_to_i64(&row[1]) == 9002));
         let column = |name: &str| {
             semantic_rows[0]
                 .iter()
@@ -2622,6 +2933,17 @@ mod tests {
         assert_eq!(
             snapshot[column("normalizer_version")].to_string(),
             "dfir-cell-normalizer-v3"
+        );
+        assert_eq!(cell_to_i64(&snapshot[column("mapping_chunk_count")]), 1);
+        assert_eq!(cell_to_i64(&snapshot[column("row_chunk_count")]), 1);
+        assert_eq!(cell_to_i64(&snapshot[column("sealed")]), 1);
+        assert_eq!(
+            snapshot[column("seal_version")].to_string(),
+            "semantic-audit-seal-v1"
+        );
+        assert_eq!(
+            snapshot[column("archive_status")].to_string(),
+            "sealed_exact_mappings"
         );
 
         let document = semantic_rows
@@ -2648,7 +2970,32 @@ mod tests {
             row_chunk[column("encoded_rows_hex")].to_string(),
             "00017fff"
         );
+        let mapping_chunk = semantic_rows
+            .iter()
+            .skip(1)
+            .find(|row| row[column("record_type")].to_string() == "mapping_chunk")
+            .unwrap();
+        assert_eq!(cell_to_i64(&mapping_chunk[column("source_doc_id")]), 123);
+        assert_eq!(cell_to_i64(&mapping_chunk[column("mapping_count")]), 3);
+        assert_eq!(
+            mapping_chunk[column("encoded_rows_hex")].to_string(),
+            "00017fff"
+        );
         assert_eq!(row_chunk[column("chunk_sha256")].to_string(), "chunk-hash");
+
+        let legacy = semantic_rows
+            .iter()
+            .skip(1)
+            .find(|row| row[column("record_type")].to_string() == "legacy_snapshot_union_only")
+            .unwrap();
+        assert_eq!(cell_to_i64(&legacy[column("selection_id")]), 9003);
+        assert_eq!(
+            legacy[column("archive_status")].to_string(),
+            "legacy_union_only_mapping_links_unavailable"
+        );
+        assert!(semantic_rows.iter().skip(1).any(|row| {
+            row[column("record_type")].to_string() == "legacy_row_chunk_union_only"
+        }));
 
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
