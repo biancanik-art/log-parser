@@ -1381,7 +1381,7 @@ fn record_llm_audit(
     context: &LlmContext,
 ) -> Result<i64> {
     create_llm_audit_table(conn)?;
-    let artifacts = context.artifact_ids_json()?;
+    let artifacts = &result.prompt_artifact_ids_json;
     let raw_context = context.is_raw_table_context();
     let correlation_engine = if raw_context {
         RAW_QUERY_ENGINE_VERSION.to_string()
