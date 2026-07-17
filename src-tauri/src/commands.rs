@@ -2,7 +2,7 @@ use crate::db::{self, ColumnMeta, ImportInfo};
 use crate::export;
 use crate::intel::matcher::{self, IntelScanSummary};
 use crate::intel::{llm_parser, parser as guided_parser, query as guided_query, roles, time};
-use crate::query::{self, QueryPage, QuerySpec};
+use crate::query::{self, QueryExpression, QueryPage, QuerySpec};
 use crate::report::{self, ReportExportSummary};
 use crate::semantic;
 use crate::tabular_import;
@@ -86,6 +86,10 @@ struct SemanticIndexProgressPayload {
     rows_total: i64,
     documents_embedded: i64,
     mappings_written: i64,
+    documents_skipped: i64,
+    mappings_skipped: i64,
+    cells_truncated: i64,
+    columns_omitted: i64,
     resumed_from_row: i64,
     phase: String,
 }
@@ -95,6 +99,275 @@ struct SemanticIndexProgressPayload {
 pub struct SemanticIndexStatus {
     pub ready: bool,
     pub rows_indexed: i64,
+    pub documents_skipped: i64,
+    pub mappings_skipped: i64,
+    pub cells_truncated: i64,
+    pub columns_omitted: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SemanticPreviewOutcome {
+    used: bool,
+    code: &'static str,
+    message: String,
+    selection_id: Option<String>,
+}
+
+enum SemanticPreparation {
+    Selection(semantic::SemanticSelectionSummary),
+    Fallback(SemanticPreviewOutcome),
+}
+
+impl SemanticPreviewOutcome {
+    fn fallback(code: &'static str, reason: impl AsRef<str>) -> Self {
+        Self {
+            used: false,
+            code,
+            message: format!(
+                "Semantic matching was not used: {} Exact and structured conditions remain available in this preview.",
+                compact_diagnostic(reason.as_ref())
+            ),
+            selection_id: None,
+        }
+    }
+
+    fn fallback_for_selection(
+        code: &'static str,
+        reason: impl AsRef<str>,
+        selection_id: String,
+    ) -> Self {
+        let mut outcome = Self::fallback(code, reason);
+        outcome.selection_id = Some(selection_id);
+        outcome
+    }
+
+    fn applied(selection: &semantic::SemanticSelectionSummary) -> Self {
+        Self {
+            used: true,
+            code: "applied",
+            message: format!(
+                "Semantic matching was used: the trusted selection retained {} document(s) and expands to {} raw row(s).",
+                selection.documents_retained, selection.rows_matched
+            ),
+            selection_id: Some(selection.selection_id.clone()),
+        }
+    }
+}
+
+fn compact_diagnostic(value: &str) -> String {
+    const MAX_DIAGNOSTIC_CHARS: usize = 1_024;
+    let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut characters = normalized.chars();
+    let mut compact = characters
+        .by_ref()
+        .take(MAX_DIAGNOSTIC_CHARS - 3)
+        .collect::<String>();
+    if characters.next().is_some() {
+        compact.push_str("...");
+    }
+    if !compact
+        .chars()
+        .last()
+        .is_some_and(|character| matches!(character, '.' | '!' | '?'))
+    {
+        compact.push('.');
+    }
+    compact
+}
+
+fn semantic_selection_id_for_preparation(preparation: &SemanticPreparation) -> Option<&str> {
+    match preparation {
+        SemanticPreparation::Selection(selection) if selection.documents_retained > 0 => {
+            Some(selection.selection_id.as_str())
+        }
+        SemanticPreparation::Selection(_) | SemanticPreparation::Fallback(_) => None,
+    }
+}
+
+fn prevalidate_semantic_preparation(
+    preparation: SemanticPreparation,
+    validate: impl FnOnce(&str) -> Result<(), String>,
+) -> SemanticPreparation {
+    match preparation {
+        SemanticPreparation::Selection(selection) if selection.documents_retained > 0 => {
+            match validate(&selection.selection_id) {
+                Ok(()) => SemanticPreparation::Selection(selection),
+                Err(error) => SemanticPreparation::Fallback(
+                    SemanticPreviewOutcome::fallback_for_selection(
+                        "selection_application_failed",
+                        format!(
+                            "the trusted semantic selection could not be attached to the validated preview ({error})"
+                        ),
+                        selection.selection_id,
+                    ),
+                ),
+            }
+        }
+        other => other,
+    }
+}
+
+/// The local model is invoked exactly once. In particular, model, grounding, database, or
+/// validation errors must not be reinterpreted by a second potentially different inference.
+fn plan_with_prevalidated_semantic_selection<T>(
+    selection_id: Option<&str>,
+    build: impl FnOnce(Option<&str>) -> Result<T, String>,
+) -> Result<T, String> {
+    build(selection_id)
+}
+
+fn expression_uses_semantic_selection(expression: &QueryExpression, selection_id: &str) -> bool {
+    match expression {
+        QueryExpression::And { children } | QueryExpression::Or { children } => children
+            .iter()
+            .any(|child| expression_uses_semantic_selection(child, selection_id)),
+        QueryExpression::Not { child } => expression_uses_semantic_selection(child, selection_id),
+        QueryExpression::SemanticSelection {
+            selection_id: candidate,
+        } => candidate == selection_id,
+        QueryExpression::Search { .. }
+        | QueryExpression::Predicate { .. }
+        | QueryExpression::RowIds { .. } => false,
+    }
+}
+
+fn preview_uses_semantic_selection(
+    preview: &guided_parser::GuidedQueryPreview,
+    selection_id: &str,
+) -> bool {
+    preview
+        .query_spec
+        .as_ref()
+        .and_then(|spec| spec.expression.as_ref())
+        .is_some_and(|expression| expression_uses_semantic_selection(expression, selection_id))
+}
+
+fn prepare_semantic_selection(
+    conn: &mut rusqlite::Connection,
+    columns: &[ColumnMeta],
+    query_text: &str,
+    semantic_model: &Arc<Mutex<Option<Arc<semantic::SemanticModel>>>>,
+    semantic_paths: &Result<(PathBuf, PathBuf, PathBuf), String>,
+) -> SemanticPreparation {
+    match semantic::semantic_index_ready(conn, columns) {
+        Ok(false) => {
+            return SemanticPreparation::Fallback(SemanticPreviewOutcome::fallback(
+                "index_not_ready",
+                "the semantic index is not ready yet; preparation may still be running. Preview again after semantic matching reports ready",
+            ));
+        }
+        Err(error) => {
+            return SemanticPreparation::Fallback(SemanticPreviewOutcome::fallback(
+                "index_validation_failed",
+                format!(
+                    "the semantic index could not be validated because of a database or index-integrity error ({error})"
+                ),
+            ));
+        }
+        Ok(true) => {}
+    }
+
+    let (model_path, tokenizer_path, config_path) = match semantic_paths {
+        Ok(paths) => paths,
+        Err(error) => {
+            return SemanticPreparation::Fallback(SemanticPreviewOutcome::fallback(
+                "resource_unavailable",
+                format!("required local semantic resources are unavailable ({error})"),
+            ));
+        }
+    };
+    let model = {
+        let mut guard = match semantic_model.lock() {
+            Ok(guard) => guard,
+            Err(_) => {
+                return SemanticPreparation::Fallback(SemanticPreviewOutcome::fallback(
+                    "model_lock_failed",
+                    "the in-memory semantic model lock is unavailable; restart the application before relying on semantic matching",
+                ));
+            }
+        };
+        if guard.is_none() {
+            match semantic::SemanticModel::load(model_path, tokenizer_path, config_path) {
+                Ok(model) => *guard = Some(Arc::new(model)),
+                Err(error) => {
+                    return SemanticPreparation::Fallback(SemanticPreviewOutcome::fallback(
+                        "model_load_failed",
+                        format!("the local semantic model could not be loaded ({error})"),
+                    ));
+                }
+            }
+        }
+        match guard.as_ref().cloned() {
+            Some(model) => model,
+            None => {
+                return SemanticPreparation::Fallback(SemanticPreviewOutcome::fallback(
+                    "model_initialization_failed",
+                    "the local semantic model did not remain initialized",
+                ));
+            }
+        }
+    };
+
+    match semantic::create_semantic_selection(
+        conn,
+        columns,
+        model.as_ref(),
+        query_text,
+        semantic::SemanticSearchPolicy::default(),
+    ) {
+        Ok(selection) => SemanticPreparation::Selection(selection),
+        Err(error) => SemanticPreparation::Fallback(SemanticPreviewOutcome::fallback(
+            "selection_failed",
+            format!("semantic candidate ranking or the database-backed selection failed ({error})"),
+        )),
+    }
+}
+
+fn record_semantic_preview_outcome(
+    conn: &rusqlite::Connection,
+    columns: &[ColumnMeta],
+    query_text: &str,
+    llm_audit_id: Option<i64>,
+    outcome: &SemanticPreviewOutcome,
+) -> Result<(), String> {
+    let identity = llm_parser::dataset_identity(conn, columns)
+        .map_err(|error| format!("binding semantic retrieval audit to the dataset: {error}"))?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS _semantic_retrieval_audit (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            llm_audit_id INTEGER,
+            input_sha256 TEXT NOT NULL,
+            dataset_schema_sha256 TEXT NOT NULL,
+            dataset_import_sha256 TEXT NOT NULL,
+            semantic_used INTEGER NOT NULL CHECK (semantic_used IN (0, 1)),
+            outcome_code TEXT NOT NULL,
+            detail TEXT NOT NULL,
+            selection_id TEXT,
+            created_at TEXT NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS _semantic_retrieval_audit_llm
+            ON _semantic_retrieval_audit(llm_audit_id);",
+    )
+    .map_err(|error| format!("creating semantic retrieval audit table: {error}"))?;
+    conn.execute(
+        "INSERT INTO _semantic_retrieval_audit (
+            llm_audit_id, input_sha256, dataset_schema_sha256, dataset_import_sha256,
+            semantic_used, outcome_code, detail, selection_id, created_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        rusqlite::params![
+            llm_audit_id,
+            llm_parser::sha256_text(query_text.trim()),
+            identity.schema_sha256,
+            identity.import_sha256,
+            if outcome.used { 1_i64 } else { 0_i64 },
+            outcome.code,
+            outcome.message,
+            outcome.selection_id,
+            chrono::Utc::now().to_rfc3339(),
+        ],
+    )
+    .map_err(|error| format!("recording semantic retrieval outcome: {error}"))?;
+    Ok(())
 }
 
 #[derive(Serialize, Clone)]
@@ -112,6 +385,38 @@ fn cancel_semantic_index_build(state: &AppState) {
     if let Ok(mut current) = state.semantic_cancel.lock() {
         if let Some(cancelled) = current.take() {
             cancelled.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
+fn clear_semantic_cancellation_if_current(
+    current: &Mutex<Option<Arc<AtomicBool>>>,
+    completed: &Arc<AtomicBool>,
+) -> Result<(), String> {
+    let mut current = current
+        .lock()
+        .map_err(|_| "semantic cancellation lock poisoned".to_string())?;
+    if current
+        .as_ref()
+        .is_some_and(|active| Arc::ptr_eq(active, completed))
+    {
+        current.take();
+    }
+    Ok(())
+}
+
+fn finish_semantic_task<T>(
+    task_result: Result<T, String>,
+    cleanup_result: Result<(), String>,
+) -> Result<T, String> {
+    match task_result {
+        Ok(result) => {
+            cleanup_result?;
+            Ok(result)
+        }
+        Err(error) => {
+            let _ = cleanup_result;
+            Err(error)
         }
     }
 }
@@ -340,9 +645,16 @@ pub fn semantic_index_status(state: State<'_, AppState>) -> Result<SemanticIndex
         semantic::semantic_index_ready(&conn, &columns).map_err(|error| error.to_string())?;
     let rows_indexed =
         semantic::semantic_indexed_rows(&conn, &columns).map_err(|error| error.to_string())?;
+    let coverage = semantic::semantic_index_coverage(&conn, &columns)
+        .map_err(|error| error.to_string())?
+        .unwrap_or_default();
     Ok(SemanticIndexStatus {
         ready,
         rows_indexed,
+        documents_skipped: coverage.documents_skipped,
+        mappings_skipped: coverage.mappings_skipped,
+        cells_truncated: coverage.cells_truncated,
+        columns_omitted: coverage.columns_omitted,
     })
 }
 
@@ -369,7 +681,7 @@ pub async fn build_semantic_index(
     }
     let app_for_task = app.clone();
     let task_cancellation = Arc::clone(&cancellation);
-    let result = tauri::async_runtime::spawn_blocking(move || {
+    let task_result = tauri::async_runtime::spawn_blocking(move || {
         let mut conn = db::open(&db_path).map_err(|error| error.to_string())?;
         let rows_total: i64 = conn
             .query_row("SELECT COUNT(*) FROM rows", [], |row| row.get(0))
@@ -382,6 +694,10 @@ pub async fn build_semantic_index(
                 rows_total,
                 documents_embedded: 0,
                 mappings_written: 0,
+                documents_skipped: 0,
+                mappings_skipped: 0,
+                cells_truncated: 0,
+                columns_omitted: 0,
                 resumed_from_row: 0,
                 phase: "loadingModel".to_string(),
             },
@@ -416,6 +732,10 @@ pub async fn build_semantic_index(
                         rows_total: progress.rows_total,
                         documents_embedded: progress.documents_embedded,
                         mappings_written: progress.mappings_written,
+                        documents_skipped: progress.documents_skipped,
+                        mappings_skipped: progress.mappings_skipped,
+                        cells_truncated: progress.cells_truncated,
+                        columns_omitted: progress.columns_omitted,
                         resumed_from_row: progress.resumed_from_row,
                         phase: progress.phase,
                     },
@@ -426,16 +746,15 @@ pub async fn build_semantic_index(
         Ok::<_, String>(summary)
     })
     .await
-    .map_err(|error| format!("semantic index task join error: {error}"))??;
+    .map_err(|error| format!("semantic index task join error: {error}"))
+    .and_then(|result| result);
 
-    if let Ok(mut current) = state.semantic_cancel.lock() {
-        if current
-            .as_ref()
-            .is_some_and(|active| Arc::ptr_eq(active, &cancellation))
-        {
-            current.take();
-        }
-    }
+    // Always retire this request's cancellation handle, including worker errors and panics. If a
+    // newer request replaced it while this one ran, pointer identity keeps the newer handle live.
+    // A cleanup failure is secondary and therefore never hides the worker's primary error.
+    let cleanup_result =
+        clear_semantic_cancellation_if_current(&state.semantic_cancel, &cancellation);
+    let result = finish_semantic_task(task_result, cleanup_result)?;
 
     let still_current = state
         .loaded
@@ -463,49 +782,35 @@ pub async fn parse_guided_query(
     let tokenizer_path = resolve_llm_resource(&app, llm_parser::TOKENIZER_RESOURCE_PATH)?;
     let llm = Arc::clone(&state.llm);
     let semantic_model = Arc::clone(&state.semantic);
-    let semantic_paths = match (
-        resolve_llm_resource(&app, semantic::MODEL_RESOURCE_PATH),
-        resolve_llm_resource(&app, semantic::TOKENIZER_RESOURCE_PATH),
-        resolve_llm_resource(&app, semantic::CONFIG_RESOURCE_PATH),
-    ) {
-        (Ok(model), Ok(tokenizer), Ok(config)) => Some((model, tokenizer, config)),
-        _ => None,
-    };
+    let semantic_paths = (|| {
+        Ok::<_, String>((
+            resolve_llm_resource(&app, semantic::MODEL_RESOURCE_PATH)?,
+            resolve_llm_resource(&app, semantic::TOKENIZER_RESOURCE_PATH)?,
+            resolve_llm_resource(&app, semantic::CONFIG_RESOURCE_PATH)?,
+        ))
+    })();
     let preview = tauri::async_runtime::spawn_blocking(
         move || -> Result<guided_parser::GuidedQueryPreview, String> {
             let mut conn = db::open(&db_path).map_err(|e| e.to_string())?;
-            // Semantic retrieval is optional. A missing/not-yet-built index or model resource
-            // never blocks the validated lexical raw-table plan.
-            let semantic_selection =
-                if semantic::semantic_index_ready(&conn, &columns).unwrap_or(false) {
-                    semantic_paths
-                        .as_ref()
-                        .and_then(|(semantic_path, semantic_tokenizer, semantic_config)| {
-                            let mut guard = semantic_model.lock().ok()?;
-                            if guard.is_none() {
-                                *guard = semantic::SemanticModel::load(
-                                    semantic_path,
-                                    semantic_tokenizer,
-                                    semantic_config,
-                                )
-                                .ok()
-                                .map(Arc::new);
-                            }
-                            guard.as_ref().cloned()
-                        })
-                        .and_then(|model| {
-                            semantic::create_semantic_selection(
-                                &mut conn,
-                                &columns,
-                                model.as_ref(),
-                                &query_text,
-                                semantic::SemanticSearchPolicy::default(),
-                            )
-                            .ok()
-                        })
-                } else {
-                    None
-                };
+            // Semantic retrieval supplements the validated lexical plan. Every non-use path is
+            // retained as a concrete preview note and a dataset-bound audit row below.
+            let semantic_preparation = prepare_semantic_selection(
+                &mut conn,
+                &columns,
+                &query_text,
+                &semantic_model,
+                &semantic_paths,
+            );
+            // Validate immediately before the one permitted model invocation. A stale or
+            // otherwise unusable trusted selection degrades to the literal plan up front;
+            // arbitrary planner/model/grounding errors are never retried.
+            let semantic_preparation =
+                prevalidate_semantic_preparation(semantic_preparation, |selection_id| {
+                    semantic::validate_semantic_selection(&conn, &columns, selection_id)
+                        .map_err(|error| error.to_string())
+                });
+            let semantic_selection_id =
+                semantic_selection_id_for_preparation(&semantic_preparation);
             let mut guard = llm
                 .lock()
                 .map_err(|_| "local AI model lock poisoned".to_string())?;
@@ -518,27 +823,55 @@ pub async fn parse_guided_query(
             let model = guard
                 .as_mut()
                 .ok_or_else(|| "local AI model failed to initialize".to_string())?;
-            let mut preview = guided_parser::parse_guided_query_with_llm_and_semantic_selection(
+            let mut preview = plan_with_prevalidated_semantic_selection(
+                semantic_selection_id,
+                |selection_id| {
+                    guided_parser::parse_guided_query_with_llm_and_semantic_selection(
+                        &conn,
+                        &columns,
+                        &query_text,
+                        model,
+                        &[],
+                        selection_id,
+                    )
+                    .map_err(|error| error.to_string())
+                },
+            )?;
+            let outcome = match semantic_preparation {
+                SemanticPreparation::Fallback(outcome) => outcome,
+                SemanticPreparation::Selection(selection)
+                    if selection.documents_retained == 0 =>
+                {
+                    SemanticPreviewOutcome::fallback_for_selection(
+                        "no_candidates",
+                        "no semantic document candidates met the bounded ranking policy",
+                        selection.selection_id,
+                    )
+                }
+                SemanticPreparation::Selection(selection)
+                    if preview_uses_semantic_selection(&preview, &selection.selection_id) =>
+                {
+                    preview
+                        .match_explanation
+                        .extend(selection.warnings.iter().cloned());
+                    SemanticPreviewOutcome::applied(&selection)
+                }
+                SemanticPreparation::Selection(selection) => {
+                    SemanticPreviewOutcome::fallback_for_selection(
+                        "selection_not_applied",
+                        "semantic candidates were ranked, but the validated preview contains no trusted semantic selection",
+                        selection.selection_id,
+                    )
+                }
+            };
+            preview.match_explanation.push(outcome.message.clone());
+            record_semantic_preview_outcome(
                 &conn,
                 &columns,
                 &query_text,
-                model,
-                &[],
-                semantic_selection
-                    .as_ref()
-                    .filter(|selection| selection.documents_retained > 0)
-                    .map(|selection| selection.selection_id.as_str()),
-            )
-            .map_err(|error| error.to_string())?;
-            if preview.query_spec.is_some() {
-                if let Some(selection) = semantic_selection {
-                    preview.match_explanation.extend(selection.warnings);
-                    preview.match_explanation.push(format!(
-                        "Semantic selection retained {} document(s) and expands to {} raw row(s).",
-                        selection.documents_retained, selection.rows_matched
-                    ));
-                }
-            }
+                preview.audit_id,
+                &outcome,
+            )?;
             Ok(preview)
         },
     )
@@ -938,4 +1271,238 @@ pub async fn export_report(
     })
     .await
     .map_err(|e| format!("report export task join error: {e}"))?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::Connection;
+
+    const SELECTION_ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    fn test_columns() -> Vec<ColumnMeta> {
+        vec![ColumnMeta {
+            sql_name: "description".to_string(),
+            original_name: "Description".to_string(),
+            col_index: 0,
+            inferred_type: "text".to_string(),
+        }]
+    }
+
+    fn selection(documents_retained: usize) -> semantic::SemanticSelectionSummary {
+        semantic::SemanticSelectionSummary {
+            selection_id: SELECTION_ID.to_string(),
+            documents_above_threshold: documents_retained,
+            documents_retained,
+            rows_matched: documents_retained as i64,
+            documents_truncated: false,
+            index_documents_skipped: 0,
+            index_mappings_skipped: 0,
+            index_cells_truncated: 0,
+            index_columns_omitted: 0,
+            broad_row_warning: false,
+            warnings: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn stale_semantic_selection_degrades_before_the_single_planner_attempt() {
+        let mut validations = 0;
+        let preparation =
+            prevalidate_semantic_preparation(SemanticPreparation::Selection(selection(2)), |_| {
+                validations += 1;
+                Err("selection belongs to a superseded build".to_string())
+            });
+        assert_eq!(validations, 1);
+        assert_eq!(semantic_selection_id_for_preparation(&preparation), None);
+        let SemanticPreparation::Fallback(fallback) = &preparation else {
+            panic!("a rejected semantic selection must become an explicit fallback");
+        };
+        assert!(!fallback.used);
+        assert_eq!(fallback.code, "selection_application_failed");
+        assert_eq!(fallback.selection_id.as_deref(), Some(SELECTION_ID));
+        assert!(fallback
+            .message
+            .contains("selection belongs to a superseded build"));
+        assert!(fallback
+            .message
+            .contains("Exact and structured conditions remain available"));
+
+        let mut attempts = 0;
+        let preview = plan_with_prevalidated_semantic_selection(
+            semantic_selection_id_for_preparation(&preparation),
+            |candidate| {
+                attempts += 1;
+                assert_eq!(candidate, None);
+                Ok("literal plan")
+            },
+        )
+        .unwrap();
+        assert_eq!(preview, "literal plan");
+        assert_eq!(attempts, 1);
+    }
+
+    #[test]
+    fn non_selection_planner_error_is_attempted_once_and_not_relabelled() {
+        let preparation =
+            prevalidate_semantic_preparation(SemanticPreparation::Selection(selection(2)), |_| {
+                Ok(())
+            });
+        let mut attempts = 0;
+        let error = plan_with_prevalidated_semantic_selection::<()>(
+            semantic_selection_id_for_preparation(&preparation),
+            |candidate| {
+                attempts += 1;
+                assert_eq!(candidate, Some(SELECTION_ID));
+                Err("grounding rejected the model plan".to_string())
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(attempts, 1);
+        assert_eq!(error, "grounding rejected the model plan");
+    }
+
+    #[test]
+    fn only_a_retained_and_exact_selection_id_is_treated_as_applied() {
+        let preparation = SemanticPreparation::Selection(selection(2));
+        assert_eq!(
+            semantic_selection_id_for_preparation(&preparation),
+            Some(SELECTION_ID)
+        );
+
+        let expression = QueryExpression::And {
+            children: vec![
+                QueryExpression::Search {
+                    value: "lsass".to_string(),
+                },
+                QueryExpression::Or {
+                    children: vec![QueryExpression::SemanticSelection {
+                        selection_id: SELECTION_ID.to_string(),
+                    }],
+                },
+            ],
+        };
+        assert!(expression_uses_semantic_selection(
+            &expression,
+            SELECTION_ID
+        ));
+        assert!(!expression_uses_semantic_selection(
+            &expression,
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        ));
+
+        let empty = SemanticPreparation::Selection(selection(0));
+        assert_eq!(semantic_selection_id_for_preparation(&empty), None);
+        let fallback = SemanticPreparation::Fallback(SemanticPreviewOutcome::fallback(
+            "index_not_ready",
+            "the semantic index is still building",
+        ));
+        assert_eq!(semantic_selection_id_for_preparation(&fallback), None);
+    }
+
+    #[test]
+    fn semantic_non_use_audit_preserves_specific_reason_and_dataset_binding() {
+        let conn = Connection::open_in_memory().unwrap();
+        let columns = test_columns();
+        db::create_schema(&conn, &columns).unwrap();
+        conn.execute(
+            "INSERT INTO rows (row_num, description) VALUES (1, 'exact evidence')",
+            [],
+        )
+        .unwrap();
+        db::record_import_info(
+            &conn,
+            &ImportInfo {
+                source_path: "audit-test.xlsx".to_string(),
+                sheet_name: "Evidence".to_string(),
+                row_count: 1,
+                imported_at: "2026-07-17T00:00:00Z".to_string(),
+            },
+        )
+        .unwrap();
+        let identity = llm_parser::dataset_identity(&conn, &columns).unwrap();
+        let query = "  find credential access  ";
+        let outcome = SemanticPreviewOutcome::fallback_for_selection(
+            "selection_failed",
+            "ranking failed because the active build changed",
+            SELECTION_ID.to_string(),
+        );
+
+        record_semantic_preview_outcome(&conn, &columns, query, Some(42), &outcome).unwrap();
+
+        let stored: (
+            i64,
+            String,
+            String,
+            String,
+            i64,
+            String,
+            String,
+            Option<String>,
+        ) = conn
+            .query_row(
+                "SELECT llm_audit_id, input_sha256, dataset_schema_sha256,
+                        dataset_import_sha256, semantic_used, outcome_code, detail, selection_id
+                 FROM _semantic_retrieval_audit",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(stored.0, 42);
+        assert_eq!(stored.1, llm_parser::sha256_text(query.trim()));
+        assert_eq!(stored.2, identity.schema_sha256);
+        assert_eq!(stored.3, identity.import_sha256);
+        assert_eq!(stored.4, 0);
+        assert_eq!(stored.5, "selection_failed");
+        assert_eq!(stored.6, outcome.message);
+        assert_eq!(stored.7.as_deref(), Some(SELECTION_ID));
+    }
+
+    #[test]
+    fn diagnostics_are_whitespace_compacted_and_unicode_safe() {
+        let reason = format!("model   error\n{}", "é".repeat(2_000));
+        let compact = compact_diagnostic(&reason);
+        assert!(compact.starts_with("model error é"));
+        assert!(compact.ends_with("..."));
+        assert!(compact.chars().count() <= 1_024);
+    }
+
+    #[test]
+    fn cancellation_cleanup_keeps_newer_request_and_primary_error() {
+        let completed = Arc::new(AtomicBool::new(false));
+        let newer = Arc::new(AtomicBool::new(false));
+        let current = Mutex::new(Some(Arc::clone(&newer)));
+
+        clear_semantic_cancellation_if_current(&current, &completed).unwrap();
+        assert!(current
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|active| Arc::ptr_eq(active, &newer)));
+
+        *current.lock().unwrap() = Some(Arc::clone(&completed));
+        clear_semantic_cancellation_if_current(&current, &completed).unwrap();
+        assert!(current.lock().unwrap().is_none());
+
+        let result = finish_semantic_task::<()>(
+            Err("semantic worker failed".to_string()),
+            Err("cleanup failed".to_string()),
+        );
+        assert_eq!(result.unwrap_err(), "semantic worker failed");
+        let cleanup_error =
+            finish_semantic_task(Ok(()), Err("cleanup failed".to_string())).unwrap_err();
+        assert_eq!(cleanup_error, "cleanup failed");
+    }
 }

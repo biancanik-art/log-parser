@@ -131,6 +131,10 @@
     rowsIndexed: 0,
     documentsEmbedded: 0,
     mappingsWritten: 0,
+    documentsSkipped: 0,
+    mappingsSkipped: 0,
+    cellsTruncated: 0,
+    columnsOmitted: 0,
     resumedFromRow: 0,
     summary: null,
     error: null,
@@ -306,6 +310,10 @@
       rowsIndexed: 0,
       documentsEmbedded: 0,
       mappingsWritten: 0,
+      documentsSkipped: 0,
+      mappingsSkipped: 0,
+      cellsTruncated: 0,
+      columnsOmitted: 0,
       resumedFromRow: 0,
       summary: null,
       error: null,
@@ -783,6 +791,31 @@
     return normalized;
   }
 
+  function expressionUsesSemanticSelection(expression) {
+    if (!expression || typeof expression !== "object") return false;
+    if (expression.type === "semanticSelection") return true;
+    if (expression.type === "not") return expressionUsesSemanticSelection(expression.child);
+    if (["and", "or"].includes(expression.type) && Array.isArray(expression.children)) {
+      return expression.children.some(expressionUsesSemanticSelection);
+    }
+    return false;
+  }
+
+  function querySpecUsesSemanticSelection(spec) {
+    return Boolean(spec && expressionUsesSemanticSelection(spec.expression));
+  }
+
+  function isPositiveSemanticClaim(message) {
+    return [
+      "Semantic matching was used:",
+      "Semantic recall:",
+      "Semantic retrieval uses",
+      "Semantic document candidates",
+      "Semantic expansion matched",
+      "Semantic selection retained",
+    ].some((prefix) => message.startsWith(prefix));
+  }
+
   function renderGuidedPreview(result, queryText) {
     guidedParseResult = result;
     guidedIntentToken = typeof result.intentToken === "string" && result.intentToken ? result.intentToken : null;
@@ -804,14 +837,25 @@
       guidedParseResult = result;
     }
 
+    const semanticApplied = querySpecUsesSemanticSelection(guidedQuerySpec);
+    const semanticFallbackReported = guidedMatchExplanation.some((item) =>
+      item.startsWith("Semantic matching was not used:")
+    );
+    if (!semanticApplied && guidedMatchExplanation.some(isPositiveSemanticClaim)) {
+      // A semantic status sentence alone is never proof that retrieval affects this plan. Only
+      // the normalized, backend-issued semanticSelection expression can establish that.
+      guidedMatchExplanation = guidedMatchExplanation.filter((item) => !isPositiveSemanticClaim(item));
+      if (!semanticFallbackReported) {
+        guidedMatchExplanation.push(
+          "Semantic matching was not used: the frontend could not verify a trusted semantic selection in this preview. Exact and structured conditions remain available."
+        );
+      }
+    }
+
     guidedRunBtn.textContent = "Search evidence";
     guidedQueryPanel.classList.remove("hidden");
     const previewLines = [result.previewText || "No search plan was returned."];
-    const searchNotes = guidedMatchExplanation.filter((item) =>
-      ["Semantic document candidates", "Semantic expansion matched", "Semantic selection retained"].some(
-        (prefix) => item.startsWith(prefix)
-      )
-    );
+    const searchNotes = guidedMatchExplanation.filter((item) => item.startsWith("Semantic "));
     const matchRules = guidedMatchExplanation.filter((item) => !searchNotes.includes(item));
     if (matchRules.length > 0) {
       previewLines.push("", "Why rows will match:", ...matchRules.map((item) => `\u2022 ${item}`));
@@ -823,7 +867,12 @@
 
     if (result.aiAssisted) {
       const validation = result.validationStatus ? ` \u2022 ${result.validationStatus.replace(/_/g, " ")}` : "";
-      guidedAiStatus.textContent = `Offline AI interpretation \u2022 ${guidedReviewStatus || "unreviewed"}${validation}`;
+      const semanticStatus = semanticApplied
+        ? " \u2022 semantic matching used"
+        : guidedMatchExplanation.some((item) => item.startsWith("Semantic matching was not used:"))
+          ? " \u2022 semantic matching not used"
+          : "";
+      guidedAiStatus.textContent = `Offline AI interpretation \u2022 ${guidedReviewStatus || "unreviewed"}${validation}${semanticStatus}`;
       guidedAiStatus.classList.remove("hidden");
       guidedRejectBtn.classList.toggle("hidden", guidedReviewStatus !== "unreviewed");
     } else {
@@ -1150,14 +1199,27 @@
     return activeSemanticIndexRequest === request && loadedContextIsCurrent(request);
   }
 
+  function semanticBoundedIndexNote(state) {
+    const limitations = [
+      [state.cellsTruncated, "oversized cells truncated"],
+      [state.columnsOmitted, "eligible wide-row values omitted"],
+      [state.documentsSkipped, "new document candidates skipped"],
+      [state.mappingsSkipped, "document-to-row mappings skipped"],
+    ]
+      .filter(([count]) => Number.isSafeInteger(count) && count > 0)
+      .map(([count, label]) => `${count.toLocaleString()} ${label}`);
+    return limitations.length ? ` Bounded-index notes: ${limitations.join("; ")}.` : "";
+  }
+
   function renderSemanticIndexState() {
     semanticIndexStatus.className = `semantic-index-status ${semanticIndexState.status}`;
+    const boundedNote = semanticBoundedIndexNote(semanticIndexState);
     if (semanticIndexState.status === "ready") {
-      const documentCount = semanticIndexState.summary?.documentsIndexed;
+      const documentCount = semanticIndexState.summary?.documentsMapped;
       const documentDetail = Number.isFinite(documentCount)
         ? ` from ${documentCount.toLocaleString()} deduplicated document${documentCount === 1 ? "" : "s"}`
         : "";
-      semanticIndexStatus.textContent = `Semantic matching ready (${semanticIndexState.rowsIndexed.toLocaleString()} raw rows mapped${documentDetail}).`;
+      semanticIndexStatus.textContent = `Semantic matching ready (${semanticIndexState.rowsIndexed.toLocaleString()} raw rows processed${documentDetail}).${boundedNote}${boundedNote ? " Exact and structured matching still covers every raw row." : ""}`;
     } else if (semanticIndexState.status === "building") {
       if (semanticIndexState.phase === "loadingModel") {
         semanticIndexStatus.textContent = "Loading the local semantic model. Exact and structured AI search are ready now.";
@@ -1176,7 +1238,7 @@
         const resumed = semanticIndexState.resumedFromRow
           ? ` Resumed after row ${semanticIndexState.resumedFromRow.toLocaleString()}.`
           : "";
-        semanticIndexStatus.textContent = `Semantic matching is preparing in resumable batches.${progress}${resumed} Exact and structured AI search are ready now.`;
+        semanticIndexStatus.textContent = `Semantic matching is preparing in resumable batches.${progress}${resumed}${boundedNote} Exact and structured AI search are ready now.`;
       }
     } else if (semanticIndexState.status === "error") {
       semanticIndexStatus.textContent = "Semantic matching is unavailable; exact and structured AI search remain ready.";
@@ -1219,6 +1281,10 @@
       rowsIndexed: 0,
       documentsEmbedded: 0,
       mappingsWritten: 0,
+      documentsSkipped: 0,
+      mappingsSkipped: 0,
+      cellsTruncated: 0,
+      columnsOmitted: 0,
       resumedFromRow: 0,
       summary: null,
       error: null,
@@ -1235,6 +1301,10 @@
           rowsIndexed: status.rowsIndexed || 0,
           documentsEmbedded: 0,
           mappingsWritten: 0,
+          documentsSkipped: status.documentsSkipped || 0,
+          mappingsSkipped: status.mappingsSkipped || 0,
+          cellsTruncated: status.cellsTruncated || 0,
+          columnsOmitted: status.columnsOmitted || 0,
           resumedFromRow: 0,
           summary: null,
           error: null,
@@ -1256,6 +1326,10 @@
         rowsIndexed: summary.rowsIndexed || 0,
         documentsEmbedded: summary.documentsIndexed || 0,
         mappingsWritten: summary.mappingsWritten || 0,
+        documentsSkipped: summary.documentsSkipped || 0,
+        mappingsSkipped: summary.mappingsSkipped || 0,
+        cellsTruncated: summary.cellsTruncated || 0,
+        columnsOmitted: summary.columnsOmitted || 0,
         resumedFromRow: summary.resumed ? semanticIndexState.resumedFromRow : 0,
         summary,
         error: null,
@@ -1273,6 +1347,10 @@
         rowsIndexed: 0,
         documentsEmbedded: 0,
         mappingsWritten: 0,
+        documentsSkipped: 0,
+        mappingsSkipped: 0,
+        cellsTruncated: 0,
+        columnsOmitted: 0,
         resumedFromRow: 0,
         summary: null,
         error: String(err),
@@ -2166,6 +2244,10 @@
       rowsDone,
       documentsEmbedded,
       mappingsWritten,
+      documentsSkipped,
+      mappingsSkipped,
+      cellsTruncated,
+      columnsOmitted,
       resumedFromRow,
       phase,
     } = event.payload;
@@ -2180,6 +2262,10 @@
       rowsIndexed: rowsDone || 0,
       documentsEmbedded: documentsEmbedded || 0,
       mappingsWritten: mappingsWritten || 0,
+      documentsSkipped: documentsSkipped || 0,
+      mappingsSkipped: mappingsSkipped || 0,
+      cellsTruncated: cellsTruncated || 0,
+      columnsOmitted: columnsOmitted || 0,
       resumedFromRow: resumedFromRow || 0,
     };
     renderSemanticIndexState();
