@@ -511,6 +511,27 @@ fn record_semantic_preview_outcome(
     Ok(())
 }
 
+fn keep_primary_result_after_best_effort<T>(
+    primary: Result<T, String>,
+    best_effort: impl FnOnce() -> anyhow::Result<()>,
+) -> Result<T, String> {
+    let value = primary?;
+    let _ = best_effort();
+    Ok(value)
+}
+
+fn accept_and_advance_semantic_archive(
+    conn: &mut rusqlite::Connection,
+    audit_id: i64,
+    intent_token: &str,
+) -> Result<(), String> {
+    let accepted = guided_parser::accept_llm_audit(conn, audit_id, intent_token)
+        .map_err(|error| error.to_string());
+    keep_primary_result_after_best_effort(accepted, || {
+        semantic::archive_required_semantic_audits_slice(conn).map(|_| ())
+    })
+}
+
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct ReportExportProgressPayload {
@@ -1089,9 +1110,8 @@ pub fn accept_guided_query(
     audit_id: i64,
 ) -> Result<(), String> {
     let (db_path, _, _) = state_snapshot(&state)?;
-    let conn = db::open(&db_path).map_err(|error| error.to_string())?;
-    guided_parser::accept_llm_audit(&conn, audit_id, &intent_token)
-        .map_err(|error| error.to_string())
+    let mut conn = db::open(&db_path).map_err(|error| error.to_string())?;
+    accept_and_advance_semantic_archive(&mut conn, audit_id, &intent_token)
 }
 
 #[tauri::command]
@@ -1103,9 +1123,8 @@ pub fn run_guided_query(
     limit: Option<u32>,
 ) -> Result<QueryPage, String> {
     let (db_path, columns, _) = state_snapshot(&state)?;
-    let conn = db::open(&db_path).map_err(|e| e.to_string())?;
-    guided_parser::accept_llm_audit(&conn, audit_id, &intent_token)
-        .map_err(|error| error.to_string())?;
+    let mut conn = db::open(&db_path).map_err(|e| e.to_string())?;
+    accept_and_advance_semantic_archive(&mut conn, audit_id, &intent_token)?;
     guided_query::run_guided_query(&conn, &columns, &intent_token, cursor, limit)
         .map_err(|error| error.to_string())
 }
@@ -1457,7 +1476,7 @@ pub async fn export_report(
 
     tauri::async_runtime::spawn_blocking(move || -> Result<ReportExportSummary, String> {
         let _report_guard = report_guard;
-        let conn = db::open(&db_path).map_err(|e| e.to_string())?;
+        let mut conn = db::open(&db_path).map_err(|e| e.to_string())?;
         let publish = |temporary_path: &Path, destination_path: &Path| {
             publish_export_if_current(
                 &app_for_publish,
@@ -1468,7 +1487,7 @@ pub async fn export_report(
             )
         };
         report::export_report_guarded(
-            &conn,
+            &mut conn,
             &columns,
             &dest_for_task,
             |rows_done, sheet| {
@@ -1933,6 +1952,27 @@ mod tests {
         assert!(panicked.is_err());
         assert!(!busy.load(Ordering::SeqCst));
         drop(ReportExportGuard::acquire(&busy).unwrap());
+    }
+
+    #[test]
+    fn best_effort_semantic_archival_never_relabels_acceptance() {
+        let accepted = keep_primary_result_after_best_effort(Ok::<_, String>("accepted"), || {
+            anyhow::bail!("simulated snapshot progress failure")
+        })
+        .unwrap();
+        assert_eq!(accepted, "accepted");
+
+        let archive_called = std::cell::Cell::new(false);
+        let rejection = keep_primary_result_after_best_effort::<()>(
+            Err("audit token mismatch".to_string()),
+            || {
+                archive_called.set(true);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(rejection, "audit token mismatch");
+        assert!(!archive_called.get());
     }
 
     #[test]

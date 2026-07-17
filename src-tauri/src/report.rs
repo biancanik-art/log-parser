@@ -1,5 +1,6 @@
 use crate::db::{self, ColumnMeta};
 use crate::export;
+use crate::semantic;
 use anyhow::{anyhow, bail, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use rust_xlsxwriter::{Workbook, Worksheet};
@@ -180,7 +181,7 @@ where
 }
 
 pub fn export_report(
-    conn: &Connection,
+    conn: &mut Connection,
     columns: &[ColumnMeta],
     dest_path: &Path,
     on_progress: impl FnMut(i64, &str),
@@ -199,12 +200,16 @@ pub fn export_report(
 /// replacement in one critical section. Any write, validation, or publication error removes the
 /// temporary file and leaves an existing examiner report untouched.
 pub fn export_report_guarded(
-    conn: &Connection,
+    conn: &mut Connection,
     columns: &[ColumnMeta],
     dest_path: &Path,
-    on_progress: impl FnMut(i64, &str),
+    mut on_progress: impl FnMut(i64, &str),
     publish: impl FnOnce(&Path, &Path) -> Result<()>,
 ) -> Result<ReportExportSummary> {
+    on_progress(0, "Semantic evidence archival");
+    semantic::complete_required_semantic_audits(conn)
+        .context("completing required semantic evidence archival before report export")?;
+
     let parent = dest_path
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
@@ -288,6 +293,14 @@ fn write_report_workbook(
         if table_has_rows(conn, "_llm_parse_audit")? {
             sheets_written.push(write_llm_audit_sheet(conn, &mut write_state)?);
             used_sheet_names.insert("ai audit".to_string());
+        }
+
+        if table_has_rows(conn, "_semantic_retrieval_audit")? {
+            sheets_written.push(write_semantic_retrieval_audit_sheet(
+                conn,
+                &mut write_state,
+            )?);
+            used_sheet_names.insert("semantic retrieval".to_string());
         }
 
         if table_has_rows(conn, "_semantic_v2_audit_snapshot")? {
@@ -424,6 +437,105 @@ fn optional_text_column_expression(columns: &HashSet<String>, column_name: &str)
     } else {
         "''".to_string()
     }
+}
+
+fn optional_integer_column_expression(columns: &HashSet<String>, column_name: &str) -> String {
+    if columns.contains(column_name) {
+        db::quote_ident(column_name)
+    } else {
+        "NULL".to_string()
+    }
+}
+
+fn write_semantic_retrieval_audit_sheet<F>(
+    conn: &Connection,
+    state: &mut ReportWriteState<'_, F>,
+) -> Result<String>
+where
+    F: FnMut(i64, &str),
+{
+    let sheet_name = "Semantic Retrieval".to_string();
+    let worksheet = state.workbook.add_worksheet_with_constant_memory();
+    worksheet.set_name(&sheet_name)?;
+    let headers = [
+        "retrieval_id",
+        "llm_audit_id",
+        "input_sha256",
+        "dataset_schema_sha256",
+        "dataset_import_sha256",
+        "semantic_used",
+        "outcome_code",
+        "detail",
+        "selection_id",
+        "created_at",
+    ];
+    write_headers(worksheet, &headers)?;
+    for column in 0..headers.len() as u16 {
+        worksheet.set_column_width(column, 24)?;
+    }
+    for column in [2u16, 3, 4, 7, 8] {
+        worksheet.set_column_width(column, 56)?;
+    }
+
+    let columns = table_column_names(conn, "_semantic_retrieval_audit")?;
+    let retrieval_id = optional_integer_column_expression(&columns, "id");
+    let llm_audit_id = optional_integer_column_expression(&columns, "llm_audit_id");
+    let input_sha256 = optional_text_column_expression(&columns, "input_sha256");
+    let dataset_schema = optional_text_column_expression(&columns, "dataset_schema_sha256");
+    let dataset_import = optional_text_column_expression(&columns, "dataset_import_sha256");
+    let semantic_used = optional_integer_column_expression(&columns, "semantic_used");
+    let outcome_code = optional_text_column_expression(&columns, "outcome_code");
+    let detail = optional_text_column_expression(&columns, "detail");
+    let selection_id = optional_text_column_expression(&columns, "selection_id");
+    let created_at = optional_text_column_expression(&columns, "created_at");
+    let sql = format!(
+        "SELECT {retrieval_id}, {llm_audit_id}, {input_sha256}, {dataset_schema},
+                {dataset_import}, {semantic_used}, {outcome_code}, {detail},
+                {selection_id}, {created_at}
+         FROM _semantic_retrieval_audit
+         ORDER BY 1"
+    );
+    let mut statement = conn.prepare(&sql)?;
+    let mut rows = statement.query([])?;
+    let mut excel_row = 1u32;
+    while let Some(row) = rows.next()? {
+        for column in 0..headers.len() {
+            write_audit_value(worksheet, excel_row, column as u16, row.get_ref(column)?)?;
+        }
+        excel_row += 1;
+        *state.total_rows_written += 1;
+    }
+    (state.on_progress)(*state.total_rows_written, &sheet_name);
+    Ok(sheet_name)
+}
+
+fn write_audit_value(
+    worksheet: &mut Worksheet,
+    row: u32,
+    column: u16,
+    value: rusqlite::types::ValueRef<'_>,
+) -> Result<()> {
+    match value {
+        rusqlite::types::ValueRef::Null => {}
+        rusqlite::types::ValueRef::Integer(value) => {
+            if (-9_007_199_254_740_992..=9_007_199_254_740_992).contains(&value) {
+                worksheet.write_number(row, column, value as f64)?;
+            } else {
+                worksheet.write_string(row, column, value.to_string())?;
+            }
+        }
+        rusqlite::types::ValueRef::Real(value) => {
+            worksheet.write_number(row, column, value)?;
+        }
+        rusqlite::types::ValueRef::Text(value) => {
+            let value = std::str::from_utf8(value).context("decoding semantic retrieval audit")?;
+            worksheet.write_string(row, column, value)?;
+        }
+        rusqlite::types::ValueRef::Blob(value) => {
+            worksheet.write_string(row, column, lowercase_hex(value))?;
+        }
+    }
+    Ok(())
 }
 
 fn write_semantic_audit_sheet<F>(
@@ -2008,6 +2120,33 @@ mod tests {
         }
     }
 
+    fn create_semantic_retrieval_audit_fixture(conn: &Connection) {
+        conn.execute_batch(
+            "CREATE TABLE _semantic_retrieval_audit (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                llm_audit_id INTEGER,
+                input_sha256 TEXT NOT NULL,
+                dataset_schema_sha256 TEXT NOT NULL,
+                dataset_import_sha256 TEXT NOT NULL,
+                semantic_used INTEGER NOT NULL,
+                outcome_code TEXT NOT NULL,
+                detail TEXT NOT NULL,
+                selection_id TEXT,
+                created_at TEXT NOT NULL
+             );
+             INSERT INTO _semantic_retrieval_audit (
+                llm_audit_id, input_sha256, dataset_schema_sha256, dataset_import_sha256,
+                semantic_used, outcome_code, detail, selection_id, created_at
+             ) VALUES
+                (42, 'input-one', 'schema-one', 'import-one', 1, 'applied',
+                 '=literal semantic match detail', 'selection-one', '2026-07-17T01:00:00Z'),
+                (43, 'input-two', 'schema-two', 'import-two', 0, 'no_candidates',
+                 'No semantic candidates met the bounded policy', NULL,
+                 '2026-07-17T01:01:00Z');",
+        )
+        .unwrap();
+    }
+
     fn temp_report_path(name: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "log-parser-report-test-{}-{name}",
@@ -2254,10 +2393,10 @@ mod tests {
 
     #[test]
     fn report_export_writes_dynamic_sheets_and_source_row_numbers() {
-        let (conn, columns) = setup_report_fixture(true);
+        let (mut conn, columns) = setup_report_fixture(true);
         let path = temp_report_path("with-matches");
 
-        let summary = export_report(&conn, &columns, &path, |_, _| {}).unwrap();
+        let summary = export_report(&mut conn, &columns, &path, |_, _| {}).unwrap();
 
         assert_eq!(
             summary.sheets_written,
@@ -2318,7 +2457,7 @@ mod tests {
 
     #[test]
     fn report_export_writes_complete_ai_and_semantic_audit_sheets() {
-        let (conn, columns) = setup_report_fixture(true);
+        let (mut conn, columns) = setup_report_fixture(true);
         create_llm_audit_fixture(&conn, true);
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS _semantic_v2_audit_snapshot (
@@ -2429,7 +2568,7 @@ mod tests {
         .unwrap();
         let path = temp_report_path("with-ai-audit");
 
-        let summary = export_report(&conn, &columns, &path, |_, _| {}).unwrap();
+        let summary = export_report(&mut conn, &columns, &path, |_, _| {}).unwrap();
         assert_eq!(
             summary.sheets_written,
             vec![
@@ -2515,12 +2654,97 @@ mod tests {
     }
 
     #[test]
+    fn report_exports_semantic_retrieval_success_and_fallback_outcomes() {
+        let (mut conn, columns) = setup_report_fixture(false);
+        create_semantic_retrieval_audit_fixture(&conn);
+        let path = temp_report_path("semantic-retrieval");
+
+        let summary = export_report(&mut conn, &columns, &path, |_, _| {}).unwrap();
+        assert_eq!(
+            summary.sheets_written,
+            vec!["General", "Semantic Retrieval"]
+        );
+
+        let mut workbook = calamine::open_workbook_auto(&path).unwrap();
+        let retrieval = workbook.worksheet_range("Semantic Retrieval").unwrap();
+        let rows = retrieval.rows().collect::<Vec<_>>();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0][0].to_string(), "retrieval_id");
+        assert_eq!(rows[0][9].to_string(), "created_at");
+        assert_eq!(cell_to_i64(&rows[1][1]), 42);
+        assert_eq!(rows[1][2].to_string(), "input-one");
+        assert_eq!(rows[1][3].to_string(), "schema-one");
+        assert_eq!(rows[1][4].to_string(), "import-one");
+        assert_eq!(cell_to_i64(&rows[1][5]), 1);
+        assert_eq!(rows[1][6].to_string(), "applied");
+        assert_eq!(rows[1][7].to_string(), "=literal semantic match detail");
+        assert_eq!(rows[1][8].to_string(), "selection-one");
+        assert_eq!(cell_to_i64(&rows[2][5]), 0);
+        assert_eq!(rows[2][6].to_string(), "no_candidates");
+        assert_eq!(rows[2][8].to_string(), "");
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn semantic_retrieval_sheet_is_migration_safe_for_legacy_columns() {
+        let (mut conn, columns) = setup_report_fixture(false);
+        conn.execute_batch(
+            "CREATE TABLE _semantic_retrieval_audit (selection_id TEXT);
+             INSERT INTO _semantic_retrieval_audit(selection_id) VALUES ('legacy-selection');",
+        )
+        .unwrap();
+        let path = temp_report_path("legacy-semantic-retrieval");
+
+        let summary = export_report(&mut conn, &columns, &path, |_, _| {}).unwrap();
+        assert_eq!(
+            summary.sheets_written,
+            vec!["General", "Semantic Retrieval"]
+        );
+        let mut workbook = calamine::open_workbook_auto(&path).unwrap();
+        let retrieval = workbook.worksheet_range("Semantic Retrieval").unwrap();
+        let rows = retrieval.rows().collect::<Vec<_>>();
+        assert_eq!(rows.len(), 2);
+        for column in 0..8 {
+            assert_eq!(rows[1][column].to_string(), "");
+        }
+        assert_eq!(rows[1][8].to_string(), "legacy-selection");
+        assert_eq!(rows[1][9].to_string(), "");
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn oversized_semantic_retrieval_evidence_fails_without_replacing_existing_report() {
+        let (mut conn, columns) = setup_report_fixture(false);
+        create_semantic_retrieval_audit_fixture(&conn);
+        conn.execute(
+            "UPDATE _semantic_retrieval_audit SET detail = ?1 WHERE id = 1",
+            ["x".repeat(EXCEL_STRING_LIMIT + 1)],
+        )
+        .unwrap();
+        let path = temp_report_path("oversized-semantic-retrieval");
+        std::fs::write(&path, b"existing examiner report").unwrap();
+
+        let error = export_report(&mut conn, &columns, &path, |_, _| {}).unwrap_err();
+        assert!(error.to_string().contains("Excel"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"existing examiner report");
+        let siblings = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(siblings, vec!["report.xlsx"]);
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
     fn ai_audit_dataset_identity_columns_are_blank_for_legacy_tables() {
-        let (conn, columns) = setup_report_fixture(false);
+        let (mut conn, columns) = setup_report_fixture(false);
         create_llm_audit_fixture(&conn, false);
         let path = temp_report_path("legacy-ai-audit");
 
-        let summary = export_report(&conn, &columns, &path, |_, _| {}).unwrap();
+        let summary = export_report(&mut conn, &columns, &path, |_, _| {}).unwrap();
         assert_eq!(summary.sheets_written, vec!["General", "AI Audit"]);
 
         let mut workbook = calamine::open_workbook_auto(&path).unwrap();
@@ -2540,10 +2764,10 @@ mod tests {
 
     #[test]
     fn report_export_with_zero_matches_writes_no_timeline_or_category_sheets() {
-        let (conn, columns) = setup_report_fixture(false);
+        let (mut conn, columns) = setup_report_fixture(false);
         let path = temp_report_path("zero-matches");
 
-        let summary = export_report(&conn, &columns, &path, |_, _| {}).unwrap();
+        let summary = export_report(&mut conn, &columns, &path, |_, _| {}).unwrap();
 
         assert_eq!(summary.sheets_written, vec!["General"]);
         let sheet_names = workbook_sheet_names(&path);
@@ -2559,7 +2783,7 @@ mod tests {
 
     #[test]
     fn report_export_without_optional_roles_intel_or_time_writes_raw_and_audit_sheets() {
-        let (conn, columns) = setup_report_fixture(false);
+        let (mut conn, columns) = setup_report_fixture(false);
         conn.execute_batch(
             "DROP TABLE _column_roles;
              DROP TABLE _row_time;
@@ -2570,7 +2794,7 @@ mod tests {
         create_llm_audit_fixture(&conn, true);
         let path = temp_report_path("raw-and-audit-only");
 
-        let summary = export_report(&conn, &columns, &path, |_, _| {}).unwrap();
+        let summary = export_report(&mut conn, &columns, &path, |_, _| {}).unwrap();
         assert_eq!(summary.sheets_written, vec!["General", "AI Audit"]);
         assert_eq!(summary.dest_path, path.display().to_string());
 
@@ -2587,11 +2811,11 @@ mod tests {
 
     #[test]
     fn report_export_without_normalized_time_omits_timeline_but_keeps_tactic_evidence() {
-        let (conn, columns) = setup_report_fixture(true);
+        let (mut conn, columns) = setup_report_fixture(true);
         conn.execute("DELETE FROM _row_time", []).unwrap();
         let path = temp_report_path("missing-time");
 
-        let summary = export_report(&conn, &columns, &path, |_, _| {}).unwrap();
+        let summary = export_report(&mut conn, &columns, &path, |_, _| {}).unwrap();
         assert_eq!(
             summary.sheets_written,
             vec!["General", "Credential Access", "Execution"]
@@ -2610,12 +2834,12 @@ mod tests {
 
     #[test]
     fn guarded_report_publish_failure_preserves_destination_and_cleans_temporary_file() {
-        let (conn, columns) = setup_report_fixture(false);
+        let (mut conn, columns) = setup_report_fixture(false);
         let path = temp_report_path("publish-rejected");
         std::fs::write(&path, b"existing examiner report").unwrap();
 
         let error = export_report_guarded(
-            &conn,
+            &mut conn,
             &columns,
             &path,
             |_, _| {},
@@ -2639,7 +2863,7 @@ mod tests {
         // Windows hostnames are case-insensitive - "WKSTN-01.corp.local" and
         // "wkstn-01.corp.local" are the same machine, and must roll up into one General-sheet
         // entry, not two "distinct" hosts.
-        let conn = Connection::open_in_memory().unwrap();
+        let mut conn = Connection::open_in_memory().unwrap();
         let columns = vec![
             ColumnMeta {
                 sql_name: "timegenerated".into(),
@@ -2697,7 +2921,7 @@ mod tests {
         .unwrap();
 
         let path = temp_report_path("case-fold-hosts");
-        export_report(&conn, &columns, &path, |_, _| {}).unwrap();
+        export_report(&mut conn, &columns, &path, |_, _| {}).unwrap();
 
         let mut workbook: calamine::Sheets<std::io::BufReader<std::fs::File>> =
             calamine::open_workbook_auto(&path).unwrap();
