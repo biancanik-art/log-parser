@@ -1,4 +1,5 @@
 use crate::db::{self, ColumnMeta};
+use crate::export;
 use anyhow::{anyhow, bail, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use rust_xlsxwriter::{Workbook, Worksheet};
@@ -6,11 +7,26 @@ use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::net::{IpAddr, Ipv4Addr};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 const VPN_RANGES_JSON: &str = include_str!("../resources/intel/vpn_ranges.v1.json");
 const PROGRESS_EVERY: i64 = 5000;
 const EXCEL_STRING_LIMIT: usize = 32_767;
+static REPORT_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+struct PendingReportExport {
+    path: PathBuf,
+    published: bool,
+}
+
+impl Drop for PendingReportExport {
+    fn drop(&mut self) {
+        if !self.published {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -167,13 +183,84 @@ pub fn export_report(
     conn: &Connection,
     columns: &[ColumnMeta],
     dest_path: &Path,
+    on_progress: impl FnMut(i64, &str),
+) -> Result<ReportExportSummary> {
+    export_report_guarded(
+        conn,
+        columns,
+        dest_path,
+        on_progress,
+        export::publish_completed_export,
+    )
+}
+
+/// Builds a complete workbook in a unique sibling file and publishes it only after the file is
+/// flushed. The caller-supplied publisher can keep dataset-generation validation and the atomic
+/// replacement in one critical section. Any write, validation, or publication error removes the
+/// temporary file and leaves an existing examiner report untouched.
+pub fn export_report_guarded(
+    conn: &Connection,
+    columns: &[ColumnMeta],
+    dest_path: &Path,
+    on_progress: impl FnMut(i64, &str),
+    publish: impl FnOnce(&Path, &Path) -> Result<()>,
+) -> Result<ReportExportSummary> {
+    let parent = dest_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let file_name = dest_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("log-parser-report.xlsx");
+    let sequence = REPORT_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let temporary_path = parent.join(format!(
+        ".{file_name}.log-parser-report-{}-{sequence}.tmp.xlsx",
+        std::process::id()
+    ));
+
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary_path)
+        .with_context(|| format!("creating temporary report {}", temporary_path.display()))?;
+    let mut pending = PendingReportExport {
+        path: temporary_path,
+        published: false,
+    };
+
+    let mut summary = write_report_workbook(conn, columns, &pending.path, on_progress)?;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&pending.path)
+        .with_context(|| format!("opening completed report {}", pending.path.display()))?
+        .sync_all()
+        .with_context(|| format!("flushing completed report {}", pending.path.display()))?;
+    publish(&pending.path, dest_path)?;
+    pending.published = true;
+    sync_report_parent_directory(parent)?;
+    summary.dest_path = dest_path.display().to_string();
+    Ok(summary)
+}
+
+fn write_report_workbook(
+    conn: &Connection,
+    columns: &[ColumnMeta],
+    dest_path: &Path,
     mut on_progress: impl FnMut(i64, &str),
 ) -> Result<ReportExportSummary> {
-    validate_report_prerequisites(conn)?;
-
     let ranges = load_vpn_ranges()?;
     let roles = load_confirmed_roles(conn, columns)?;
-    let tactics = load_tactic_sheets(conn)?;
+    let has_intel_matches = intel_match_count(conn)? > 0;
+    let has_normalized_time = table_has_rows(conn, "_row_time")?;
+    let has_timeline_data =
+        has_intel_matches && has_normalized_time && intel_matches_have_normalized_time(conn)?;
+    let tactics = if has_intel_matches {
+        load_tactic_sheets(conn)?
+    } else {
+        Vec::new()
+    };
 
     let mut workbook = Workbook::new();
     let mut sheets_written = Vec::new();
@@ -208,7 +295,7 @@ pub fn export_report(
             used_sheet_names.insert("semantic audit".to_string());
         }
 
-        if intel_match_count(conn)? > 0 {
+        if has_timeline_data {
             sheets_written.push(write_timeline_sheet(
                 conn,
                 columns,
@@ -220,7 +307,14 @@ pub fn export_report(
 
         for tactic in tactics {
             let sheet_name = unique_sheet_name(&tactic.tactic_name, &mut used_sheet_names);
-            write_tactic_sheet(conn, columns, &tactic, &sheet_name, &mut write_state)?;
+            write_tactic_sheet(
+                conn,
+                columns,
+                &tactic,
+                &sheet_name,
+                has_normalized_time,
+                &mut write_state,
+            )?;
             sheets_written.push(sheet_name);
         }
     }
@@ -232,6 +326,17 @@ pub fn export_report(
         row_count: source_rows.len() as i64,
         dest_path: dest_path.display().to_string(),
     })
+}
+
+#[cfg(unix)]
+fn sync_report_parent_directory(parent: &Path) -> Result<()> {
+    std::fs::File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_report_parent_directory(_parent: &Path) -> Result<()> {
+    Ok(())
 }
 
 fn write_llm_audit_sheet<F>(
@@ -507,16 +612,6 @@ fn lowercase_hex(bytes: &[u8]) -> String {
     encoded
 }
 
-fn validate_report_prerequisites(conn: &Connection) -> Result<()> {
-    if !table_has_rows(conn, "_intel_scan_info")? {
-        bail!("intel scan results are not available; run scan_intel_matches before exporting the report");
-    }
-    if !table_has_rows(conn, "_row_time")? {
-        bail!("normalized timestamps are not available; run normalize_timestamp_column before exporting the report");
-    }
-    Ok(())
-}
-
 fn table_has_rows(conn: &Connection, table_name: &str) -> Result<bool> {
     let exists = conn
         .query_row(
@@ -544,6 +639,23 @@ fn intel_match_count(conn: &Connection) -> Result<i64> {
     }
     conn.query_row("SELECT COUNT(*) FROM _intel_match", [], |row| row.get(0))
         .map_err(Into::into)
+}
+
+fn intel_matches_have_normalized_time(conn: &Connection) -> Result<bool> {
+    if !table_exists(conn, "_intel_match")? || !table_exists(conn, "_row_time")? {
+        return Ok(false);
+    }
+    let has_rows: i64 = conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1
+            FROM _intel_match m
+            JOIN _row_time rt ON rt.row_num = m.row_num
+            LIMIT 1
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(has_rows != 0)
 }
 
 fn table_exists(conn: &Connection, table_name: &str) -> Result<bool> {
@@ -688,6 +800,20 @@ fn write_date_range<F>(conn: &Connection, writer: &mut RowWriter<'_, '_, F>) -> 
 where
     F: FnMut(i64, &str),
 {
+    if !table_has_rows(conn, "_row_time")? {
+        writer.write_cells_with_count(
+            first_source_row_num(conn)?,
+            &[
+                "Date range",
+                "normalized_utc",
+                "not available",
+                "No normalized timestamp data is available. The report still includes raw-data summaries and any independent audit evidence.",
+            ],
+            0,
+        )?;
+        return Ok(());
+    }
+
     let min_time: (i64, String, i64) = conn.query_row(
         "SELECT row_num, utc_text, epoch_ms
          FROM _row_time
@@ -1293,6 +1419,7 @@ fn write_tactic_sheet<F>(
     columns: &[ColumnMeta],
     tactic: &TacticSheet,
     sheet_name: &str,
+    has_normalized_time: bool,
     state: &mut ReportWriteState<'_, F>,
 ) -> Result<()>
 where
@@ -1321,19 +1448,28 @@ where
     worksheet.set_column_width(6, 80)?;
 
     let evidence_expr = evidence_case_expression(columns);
+    let (timestamp_expression, timestamp_join, timestamp_order) = if has_normalized_time {
+        (
+            "COALESCE(rt.utc_text, '')",
+            "LEFT JOIN _row_time rt ON rt.row_num = m.row_num",
+            "rt.epoch_ms ASC, ",
+        )
+    } else {
+        ("''", "", "")
+    };
     let sql = format!(
         "SELECT m.row_num,
-                COALESCE(rt.utc_text, ''),
+                {timestamp_expression},
                 m.technique_id,
                 m.technique_name,
                 m.keyword,
                 m.column_name,
                 {evidence_expr}
          FROM _intel_match m
-         LEFT JOIN _row_time rt ON rt.row_num = m.row_num
+         {timestamp_join}
          JOIN rows r ON r.row_num = m.row_num
          WHERE m.tactic_id = ?1
-         ORDER BY rt.epoch_ms ASC, m.row_num ASC, m.technique_id ASC, m.keyword ASC, m.column_name ASC"
+         ORDER BY {timestamp_order}m.row_num ASC, m.technique_id ASC, m.keyword ASC, m.column_name ASC"
     );
 
     let mut writer = RowWriter::new(
@@ -2422,25 +2558,78 @@ mod tests {
     }
 
     #[test]
-    fn report_export_fails_before_intel_scan() {
+    fn report_export_without_optional_roles_intel_or_time_writes_raw_and_audit_sheets() {
         let (conn, columns) = setup_report_fixture(false);
-        conn.execute("DELETE FROM _intel_scan_info", []).unwrap();
-        let path = temp_report_path("missing-scan");
+        conn.execute_batch(
+            "DROP TABLE _column_roles;
+             DROP TABLE _row_time;
+             DROP TABLE _intel_match;
+             DROP TABLE _intel_scan_info;",
+        )
+        .unwrap();
+        create_llm_audit_fixture(&conn, true);
+        let path = temp_report_path("raw-and-audit-only");
 
-        let err = export_report(&conn, &columns, &path, |_, _| {}).unwrap_err();
-        assert!(err.to_string().contains("run scan_intel_matches"));
+        let summary = export_report(&conn, &columns, &path, |_, _| {}).unwrap();
+        assert_eq!(summary.sheets_written, vec!["General", "AI Audit"]);
+        assert_eq!(summary.dest_path, path.display().to_string());
+
+        let mut workbook = calamine::open_workbook_auto(&path).unwrap();
+        let general = workbook.worksheet_range("General").unwrap();
+        assert!(general.rows().any(|row| {
+            row.get(1).is_some_and(|cell| cell == "Date range")
+                && row.get(3).is_some_and(|cell| cell == "not available")
+        }));
+        assert_eq!(workbook.sheet_names(), &["General", "AI Audit"]);
 
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]
-    fn report_export_fails_before_timestamp_normalization() {
-        let (conn, columns) = setup_report_fixture(false);
+    fn report_export_without_normalized_time_omits_timeline_but_keeps_tactic_evidence() {
+        let (conn, columns) = setup_report_fixture(true);
         conn.execute("DELETE FROM _row_time", []).unwrap();
         let path = temp_report_path("missing-time");
 
-        let err = export_report(&conn, &columns, &path, |_, _| {}).unwrap_err();
-        assert!(err.to_string().contains("run normalize_timestamp_column"));
+        let summary = export_report(&conn, &columns, &path, |_, _| {}).unwrap();
+        assert_eq!(
+            summary.sheets_written,
+            vec!["General", "Credential Access", "Execution"]
+        );
+
+        let mut workbook = calamine::open_workbook_auto(&path).unwrap();
+        assert!(!workbook.sheet_names().iter().any(|name| name == "Timeline"));
+        let execution = workbook.worksheet_range("Execution").unwrap();
+        let rows = execution.rows().collect::<Vec<_>>();
+        assert_eq!(rows[0][1].to_string(), "utc_timestamp");
+        assert_eq!(rows[1][1].to_string(), "");
+        assert!(rows[1][6].to_string().contains("powershell"));
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn guarded_report_publish_failure_preserves_destination_and_cleans_temporary_file() {
+        let (conn, columns) = setup_report_fixture(false);
+        let path = temp_report_path("publish-rejected");
+        std::fs::write(&path, b"existing examiner report").unwrap();
+
+        let error = export_report_guarded(
+            &conn,
+            &columns,
+            &path,
+            |_, _| {},
+            |_, _| bail!("dataset generation changed before report publication"),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("dataset generation changed"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"existing examiner report");
+        let siblings = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(siblings, vec!["report.xlsx"]);
 
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }

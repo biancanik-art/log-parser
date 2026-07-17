@@ -114,6 +114,8 @@
   let timestampNormalizationSummary = null;
   let intelScanSummaryResult = null;
   let reportSummaryResult = null;
+  let reportExportSequence = 0;
+  let activeReportExport = null;
   let roleDetectionInFlight = false;
   let roleDetectionError = null;
   let roleDetectionRequestSequence = 0;
@@ -184,7 +186,7 @@
     searchBox.disabled = !enabled;
     guidedSearchBox.disabled = !enabled;
     guidedSearchSubmit.disabled = !enabled;
-    reportExportBtn.disabled = !enabled;
+    reportExportBtn.disabled = !enabled || sheetLoadInFlight || activeReportExport !== null;
     exportCsvBtn.disabled = !enabled;
     exportXlsxBtn.disabled = !enabled;
     addFilterBtn.disabled = !enabled;
@@ -208,7 +210,7 @@
     openFileBtn.disabled = inFlight;
     sheetLoadBtn.disabled = inFlight;
     searchBox.disabled = inFlight || !controlsEnabled;
-    reportExportBtn.disabled = inFlight || !controlsEnabled;
+    reportExportBtn.disabled = inFlight || !controlsEnabled || activeReportExport !== null;
     exportCsvBtn.disabled = inFlight || !controlsEnabled;
     exportXlsxBtn.disabled = inFlight || !controlsEnabled;
     addFilterBtn.disabled = inFlight || !controlsEnabled;
@@ -1213,6 +1215,19 @@
     );
   }
 
+  function reportExportIsCurrent(request) {
+    return (
+      activeReportExport === request &&
+      currentPath === request.path &&
+      currentSheet === request.sheet
+    );
+  }
+
+  function updateReportExportButton() {
+    reportExportBtn.disabled =
+      !controlsEnabled || sheetLoadInFlight || activeReportExport !== null;
+  }
+
   function semanticIndexRequestIsCurrent(request) {
     return activeSemanticIndexRequest === request && loadedContextIsCurrent(request);
   }
@@ -1802,17 +1817,17 @@
     }
   }
 
-  async function generateReport(destPath) {
+  async function generateReport(destPath, request) {
+    if (!reportExportIsCurrent(request)) return null;
     showProgress("Generating report workbook...", 0);
     try {
-      const summary = await invoke("export_report", { destPath });
+      const summary = await invoke("export_report", { destPath, requestId: request.id });
+      if (!reportExportIsCurrent(request)) return null;
       renderReportSummary(summary);
       return summary;
     } catch (err) {
       console.error("export_report failed", err);
       throw err;
-    } finally {
-      hideProgress();
     }
   }
 
@@ -2092,18 +2107,34 @@
   }
 
   async function doReportExport() {
-    const destPath = await invoke("plugin:dialog|save", {
-      options: {
-        filters: [{ name: "Excel Workbook", extensions: ["xlsx"] }],
-        defaultPath: "log-parser-report.xlsx",
-      },
-    });
-    if (!destPath) return;
+    if (sheetLoadInFlight || !controlsEnabled || activeReportExport !== null) return;
+    const request = {
+      id: ++reportExportSequence,
+      path: currentPath,
+      sheet: currentSheet,
+    };
+    activeReportExport = request;
+    updateReportExportButton();
 
     try {
-      await generateReport(destPath);
+      const destPath = await invoke("plugin:dialog|save", {
+        options: {
+          filters: [{ name: "Excel Workbook", extensions: ["xlsx"] }],
+          defaultPath: "log-parser-report.xlsx",
+        },
+      });
+      if (!destPath || !reportExportIsCurrent(request)) return;
+      await generateReport(destPath, request);
     } catch (err) {
+      if (!reportExportIsCurrent(request)) return;
       alert(`Report export failed: ${err}`);
+    } finally {
+      const shouldHideProgress = reportExportIsCurrent(request);
+      if (activeReportExport === request) {
+        activeReportExport = null;
+        if (shouldHideProgress) hideProgress();
+        updateReportExportButton();
+      }
     }
   }
 
@@ -2297,7 +2328,14 @@
   });
 
   listen("report-export-progress", (event) => {
-    const { rowsDone, sheet } = event.payload;
+    const { requestId, rowsDone, sheet } = event.payload;
+    if (
+      !activeReportExport ||
+      activeReportExport.id !== requestId ||
+      !reportExportIsCurrent(activeReportExport)
+    ) {
+      return;
+    }
     const sheetLabel = sheet ? ` (${sheet})` : "";
     showProgress(`Writing report${sheetLabel}... ${rowsDone.toLocaleString()} rows`, 0.5);
   });

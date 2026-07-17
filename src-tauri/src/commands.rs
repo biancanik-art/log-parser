@@ -145,6 +145,30 @@ pub struct AppState {
     /// concurrent imports can race on the same cache file and on which result last wins the
     /// `loaded` slot — see AGENT_NOTES.md 2026-07-08 for the QA pass that found this.
     busy: AtomicBool,
+    /// Reject duplicate report IPC calls instead of allowing long-running workbook exports to
+    /// race at publication.
+    report_busy: Arc<AtomicBool>,
+}
+
+#[derive(Debug)]
+struct ReportExportGuard {
+    busy: Arc<AtomicBool>,
+}
+
+impl ReportExportGuard {
+    fn acquire(busy: &Arc<AtomicBool>) -> Result<Self, String> {
+        busy.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .map_err(|_| "another report export is already running".to_string())?;
+        Ok(Self {
+            busy: Arc::clone(busy),
+        })
+    }
+}
+
+impl Drop for ReportExportGuard {
+    fn drop(&mut self) {
+        self.busy.store(false, Ordering::SeqCst);
+    }
 }
 
 #[derive(Serialize)]
@@ -490,6 +514,7 @@ fn record_semantic_preview_outcome(
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct ReportExportProgressPayload {
+    request_id: u64,
     rows_done: i64,
     sheet: String,
 }
@@ -575,6 +600,22 @@ fn publish_export_if_current(
     destination_path: &Path,
 ) -> anyhow::Result<()> {
     let state = app.state::<AppState>();
+    publish_export_for_state_if_current(
+        &state,
+        expected_db_path,
+        expected_generation,
+        temporary_path,
+        destination_path,
+    )
+}
+
+fn publish_export_for_state_if_current(
+    state: &AppState,
+    expected_db_path: &Path,
+    expected_generation: u64,
+    temporary_path: &Path,
+    destination_path: &Path,
+) -> anyhow::Result<()> {
     let guard = state
         .loaded
         .lock()
@@ -1404,23 +1445,44 @@ pub async fn export_report(
     app: AppHandle,
     state: State<'_, AppState>,
     dest_path: String,
+    request_id: u64,
 ) -> Result<ReportExportSummary, String> {
-    let (db_path, columns, _) = state_snapshot(&state)?;
+    let report_guard = ReportExportGuard::acquire(&state.report_busy)?;
+    let (db_path, columns, generation) = state_snapshot(&state)?;
+    let exported_db_path = db_path.clone();
     let dest = PathBuf::from(&dest_path);
     let dest_for_task = dest.clone();
-    let app_for_task = app.clone();
+    let app_for_progress = app.clone();
+    let app_for_publish = app.clone();
 
     tauri::async_runtime::spawn_blocking(move || -> Result<ReportExportSummary, String> {
+        let _report_guard = report_guard;
         let conn = db::open(&db_path).map_err(|e| e.to_string())?;
-        report::export_report(&conn, &columns, &dest_for_task, |rows_done, sheet| {
-            let _ = app_for_task.emit(
-                "report-export-progress",
-                ReportExportProgressPayload {
-                    rows_done,
-                    sheet: sheet.to_string(),
-                },
-            );
-        })
+        let publish = |temporary_path: &Path, destination_path: &Path| {
+            publish_export_if_current(
+                &app_for_publish,
+                &exported_db_path,
+                generation,
+                temporary_path,
+                destination_path,
+            )
+        };
+        report::export_report_guarded(
+            &conn,
+            &columns,
+            &dest_for_task,
+            |rows_done, sheet| {
+                let _ = app_for_progress.emit(
+                    "report-export-progress",
+                    ReportExportProgressPayload {
+                        request_id,
+                        rows_done,
+                        sheet: sheet.to_string(),
+                    },
+                );
+            },
+            publish,
+        )
         .map_err(|e| e.to_string())
     })
     .await
@@ -1848,5 +1910,55 @@ mod tests {
         );
         *state.loaded.lock().unwrap() = None;
         assert!(!loaded_generation_is_current(&state, &expected_path, 7).unwrap());
+    }
+
+    #[test]
+    fn report_export_guard_rejects_overlap_and_releases_on_drop() {
+        let busy = Arc::new(AtomicBool::new(false));
+        let first = ReportExportGuard::acquire(&busy).unwrap();
+        let error = ReportExportGuard::acquire(&busy).unwrap_err();
+        assert!(error.contains("already running"));
+
+        drop(first);
+        let second = ReportExportGuard::acquire(&busy).unwrap();
+        assert!(busy.load(Ordering::SeqCst));
+        drop(second);
+        assert!(!busy.load(Ordering::SeqCst));
+
+        let busy_during_panic = Arc::clone(&busy);
+        let panicked = std::panic::catch_unwind(move || {
+            let _guard = ReportExportGuard::acquire(&busy_during_panic).unwrap();
+            panic!("simulated report worker panic");
+        });
+        assert!(panicked.is_err());
+        assert!(!busy.load(Ordering::SeqCst));
+        drop(ReportExportGuard::acquire(&busy).unwrap());
+    }
+
+    #[test]
+    fn stale_report_publication_guard_preserves_existing_destination() {
+        let state = AppState::default();
+        let expected_db = PathBuf::from("expected-report.sqlite3");
+        *state.loaded.lock().unwrap() = Some(AppStateInner {
+            db_path: expected_db.clone(),
+            columns: Vec::new(),
+            generation: 12,
+        });
+        let directory = import_cache_test_path("stale-report-publish").with_extension("dir");
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        let temporary = directory.join("pending.xlsx");
+        let destination = directory.join("report.xlsx");
+        std::fs::write(&temporary, b"new report").unwrap();
+        std::fs::write(&destination, b"existing report").unwrap();
+
+        let error =
+            publish_export_for_state_if_current(&state, &expected_db, 11, &temporary, &destination)
+                .unwrap_err();
+        assert!(error.to_string().contains("loaded file or sheet changed"));
+        assert_eq!(std::fs::read(&destination).unwrap(), b"existing report");
+        assert_eq!(std::fs::read(&temporary).unwrap(), b"new report");
+
+        let _ = std::fs::remove_dir_all(directory);
     }
 }
