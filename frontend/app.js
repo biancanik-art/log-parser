@@ -1000,7 +1000,13 @@
   }
 
   async function refreshCount() {
-    if (queryMode === "guided") {
+    const isAcceptedGuidedQuery =
+      queryMode === "guided" &&
+      guidedReviewStatus === "accepted" &&
+      guidedAuditId !== null &&
+      guidedIntentToken !== null &&
+      guidedQuerySpec !== null;
+    if (queryMode === "guided" && !isAcceptedGuidedQuery) {
       activeCountRequest = null;
       countRequestSequence += 1;
       totalCount = null;
@@ -1008,15 +1014,21 @@
       return;
     }
 
+    // The accepted intent is executed through run_guided_query for paging, while its
+    // backend-issued QuerySpec is safe to reuse for COUNT: the predicate compiler revalidates
+    // any semantic selection against the current dataset and active semantic build.
+    const countSpec = isAcceptedGuidedQuery ? guidedQuerySpec : spec;
     const request = {
       id: ++countRequestSequence,
       contextRevision: guidedContextRevision,
       path: currentPath,
       sheet: currentSheet,
       mode: queryMode,
+      auditId: guidedAuditId,
+      intentToken: guidedIntentToken,
       table,
       querySpec: guidedQuerySpec,
-      spec: snapshotQuerySpec(),
+      spec: snapshotQuerySpec(countSpec),
     };
     activeCountRequest = request;
     totalCount = null;
@@ -1026,7 +1038,11 @@
       loadedContextIsCurrent(request) &&
       queryMode === request.mode &&
       table === request.table &&
-      (request.mode === "normal" || guidedQuerySpec === request.querySpec);
+      (request.mode === "normal" || guidedQuerySpec === request.querySpec) &&
+      (request.mode !== "guided" ||
+        (guidedReviewStatus === "accepted" &&
+          guidedAuditId === request.auditId &&
+          guidedIntentToken === request.intentToken));
     try {
       const count = await invoke("count_rows", { spec: request.spec });
       if (!isCurrent()) return;
@@ -1048,7 +1064,7 @@
           ? `${shown} AI evidence rows on this page`
           : `${shown} rows on this page`;
     } else {
-      rowCountLabel.textContent = `${totalCount.toLocaleString()} ${queryMode === "querySpec" ? "evidence" : "matching"} rows`;
+      rowCountLabel.textContent = `${totalCount.toLocaleString()} ${["guided", "querySpec"].includes(queryMode) ? "evidence" : "matching"} rows`;
     }
     pageLabel.textContent = `page ${pageIndex}`;
   }
