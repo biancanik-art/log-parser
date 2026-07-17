@@ -245,10 +245,17 @@ const V1_INDEX_PRUNE_BATCH: usize = 1_024;
 const V2_PRUNE_PASSES_PER_INVOCATION: usize = 16;
 const V2_PRUNE_TIME_BUDGET_MS: u128 = 150;
 const V2_SELECTION_POLICY_VERSION: &str = "semantic-doc-search-v2";
-const V2_AUDIT_SNAPSHOT_VERSION: &str = "semantic-audit-snapshot-v1";
+const V2_AUDIT_SNAPSHOT_VERSION: &str = "semantic-audit-snapshot-v2";
+const V2_AUDIT_SEAL_VERSION: &str = "semantic-audit-seal-v1";
+const V2_AUDIT_SCHEMA_REVISION: &str = "semantic-audit-schema-r3";
 const V2_AUDIT_ROW_SET_ENCODING: &str = "sorted-positive-delta-varint-chunks-v1";
 const V2_AUDIT_MAPPING_BATCH: usize = 8_192;
 const V2_AUDIT_ROW_CHUNK_ROWS: usize = 1_024;
+const V2_AUDIT_ENCODED_CHUNK_MAX_BYTES: usize = 16_000;
+const _: () = assert!(V2_AUDIT_ENCODED_CHUNK_MAX_BYTES * 2 <= 32_767);
+const V2_AUDIT_FINAL_DOCUMENT_BATCH: usize = 16;
+const V2_AUDIT_FINAL_MAPPING_CHUNK_BATCH: usize = 16;
+const V2_AUDIT_FINAL_ROW_CHUNK_BATCH: usize = 128;
 const V2_AUDIT_ARCHIVE_STEPS_PER_SLICE: usize = 4;
 const V2_AUDIT_ARCHIVE_SLICE_TIME_BUDGET_MS: u128 = 150;
 
@@ -1285,6 +1292,10 @@ pub fn create_semantic_v2_schema(conn: &Connection) -> rusqlite::Result<()> {
             row_count INTEGER NOT NULL,
             row_set_sha256 TEXT NOT NULL,
             row_set_encoding TEXT NOT NULL,
+            mapping_chunk_count INTEGER NOT NULL DEFAULT 0,
+            row_chunk_count INTEGER NOT NULL DEFAULT 0,
+            sealed INTEGER NOT NULL DEFAULT 0,
+            seal_version TEXT NOT NULL DEFAULT '',
             selection_created_at TEXT NOT NULL,
             archived_at TEXT NOT NULL
          ) WITHOUT ROWID;
@@ -1306,6 +1317,17 @@ pub fn create_semantic_v2_schema(conn: &Connection) -> rusqlite::Result<()> {
          CREATE TABLE IF NOT EXISTS _semantic_v2_audit_snapshot_row_chunk (
             selection_id TEXT NOT NULL,
             chunk_index INTEGER NOT NULL,
+            first_row_num INTEGER NOT NULL,
+            last_row_num INTEGER NOT NULL,
+            row_count INTEGER NOT NULL,
+            encoded_rows BLOB NOT NULL,
+            chunk_sha256 TEXT NOT NULL,
+            PRIMARY KEY(selection_id, chunk_index)
+         ) WITHOUT ROWID;
+         CREATE TABLE IF NOT EXISTS _semantic_v2_audit_snapshot_mapping_chunk (
+            selection_id TEXT NOT NULL,
+            chunk_index INTEGER NOT NULL,
+            source_doc_id INTEGER NOT NULL,
             first_row_num INTEGER NOT NULL,
             last_row_num INTEGER NOT NULL,
             row_count INTEGER NOT NULL,
@@ -1366,6 +1388,8 @@ pub fn create_semantic_v2_schema(conn: &Connection) -> rusqlite::Result<()> {
             normalized_text TEXT NOT NULL,
             cosine_score REAL NOT NULL,
             rank_score REAL NOT NULL,
+            mapping_count INTEGER NOT NULL DEFAULT 0,
+            mapping_sha256 TEXT NOT NULL DEFAULT '',
             PRIMARY KEY(selection_id, doc_id),
             UNIQUE(selection_id, rank)
          ) WITHOUT ROWID;
@@ -1394,6 +1418,18 @@ pub fn create_semantic_v2_schema(conn: &Connection) -> rusqlite::Result<()> {
             encoded_rows BLOB NOT NULL,
             chunk_sha256 TEXT NOT NULL,
             PRIMARY KEY(selection_id, chunk_index)
+         ) WITHOUT ROWID;
+         CREATE TABLE IF NOT EXISTS _semantic_v2_audit_snapshot_publish (
+            selection_id TEXT PRIMARY KEY,
+            phase TEXT NOT NULL,
+            cursor_rank INTEGER NOT NULL DEFAULT 0,
+            cursor_mapping_chunk INTEGER NOT NULL DEFAULT -1,
+            cursor_row_chunk INTEGER NOT NULL DEFAULT -1,
+            documents_copied INTEGER NOT NULL DEFAULT 0,
+            mapping_chunks_copied INTEGER NOT NULL DEFAULT 0,
+            row_chunks_copied INTEGER NOT NULL DEFAULT 0,
+            started_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
          ) WITHOUT ROWID;
          CREATE TRIGGER IF NOT EXISTS _semantic_v2_audit_snapshot_document_no_insert
          BEFORE INSERT ON _semantic_v2_audit_snapshot_document
@@ -1443,7 +1479,8 @@ pub fn create_semantic_v2_schema(conn: &Connection) -> rusqlite::Result<()> {
          END;",
     )?;
     ensure_semantic_v2_build_columns(conn)?;
-    ensure_semantic_v2_document_identity_schema(conn)
+    ensure_semantic_v2_document_identity_schema(conn)?;
+    ensure_semantic_v2_audit_snapshot_schema(conn)
 }
 
 fn semantic_v2_build_has_column(conn: &Connection, expected: &str) -> rusqlite::Result<bool> {
@@ -1463,6 +1500,521 @@ fn sqlite_table_has_columns(
         .query_map([], |row| row.get::<_, String>(1))?
         .collect::<rusqlite::Result<HashSet<_>>>()?;
     Ok(expected.iter().all(|column| columns.contains(*column)))
+}
+
+fn ensure_table_columns(
+    conn: &Connection,
+    table_name: &str,
+    columns: &[(&str, &str)],
+) -> rusqlite::Result<()> {
+    for (name, definition) in columns {
+        if sqlite_table_has_columns(conn, table_name, &[*name])? {
+            continue;
+        }
+        let sql = format!(
+            "ALTER TABLE {} ADD COLUMN {} {definition}",
+            db::quote_ident(table_name),
+            db::quote_ident(name),
+        );
+        match conn.execute(&sql, []) {
+            Ok(_) => {}
+            Err(_) if sqlite_table_has_columns(conn, table_name, &[*name])? => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+fn ensure_semantic_v2_audit_snapshot_schema(conn: &Connection) -> rusqlite::Result<()> {
+    ensure_table_columns(
+        conn,
+        "_semantic_v2_audit_snapshot",
+        &[
+            ("mapping_chunk_count", "INTEGER NOT NULL DEFAULT 0"),
+            ("row_chunk_count", "INTEGER NOT NULL DEFAULT 0"),
+            ("sealed", "INTEGER NOT NULL DEFAULT 0"),
+            ("seal_version", "TEXT NOT NULL DEFAULT ''"),
+        ],
+    )?;
+    ensure_table_columns(
+        conn,
+        "_semantic_v2_audit_snapshot_stage_document",
+        &[
+            ("mapping_count", "INTEGER NOT NULL DEFAULT 0"),
+            ("mapping_sha256", "TEXT NOT NULL DEFAULT ''"),
+        ],
+    )?;
+    let current: bool = conn.query_row(
+        "SELECT 16 = (
+            SELECT COUNT(*) FROM sqlite_master
+            WHERE sql LIKE '%' || ?1 || '%'
+              AND ((type = 'view' AND name IN (
+                '_semantic_v2_audit_snapshot_sealed_contents',
+                '_semantic_v2_audit_snapshot_complete',
+                '_semantic_v2_audit_snapshot_legacy_union'
+            )) OR (type = 'trigger' AND name IN (
+                 '_semantic_v2_audit_snapshot_no_insert',
+                 '_semantic_v2_audit_snapshot_no_update',
+                 '_semantic_v2_audit_snapshot_immutable_fields',
+                 '_semantic_v2_audit_snapshot_no_delete',
+                '_semantic_v2_audit_snapshot_document_no_insert',
+                '_semantic_v2_audit_snapshot_document_no_update',
+                '_semantic_v2_audit_snapshot_document_no_delete',
+                '_semantic_v2_audit_snapshot_mapping_no_insert',
+                '_semantic_v2_audit_snapshot_mapping_no_update',
+                '_semantic_v2_audit_snapshot_mapping_no_delete',
+                '_semantic_v2_audit_snapshot_row_no_insert',
+                '_semantic_v2_audit_snapshot_row_no_update',
+                '_semantic_v2_audit_snapshot_row_no_delete'
+            )))
+         )",
+        [V2_AUDIT_SCHEMA_REVISION],
+        |row| row.get(0),
+    )?;
+    if current {
+        return Ok(());
+    }
+    conn.execute_batch(
+        "SAVEPOINT semantic_v2_audit_seal_schema;
+         DROP VIEW IF EXISTS _semantic_v2_audit_snapshot_legacy_union;
+         DROP VIEW IF EXISTS _semantic_v2_audit_snapshot_complete;
+         DROP VIEW IF EXISTS _semantic_v2_audit_snapshot_sealed_contents;
+         DROP TRIGGER IF EXISTS _semantic_v2_audit_snapshot_no_insert;
+         DROP TRIGGER IF EXISTS _semantic_v2_audit_snapshot_no_update;
+         DROP TRIGGER IF EXISTS _semantic_v2_audit_snapshot_immutable_fields;
+         DROP TRIGGER IF EXISTS _semantic_v2_audit_snapshot_no_delete;
+         DROP TRIGGER IF EXISTS _semantic_v2_audit_snapshot_document_no_insert;
+         DROP TRIGGER IF EXISTS _semantic_v2_audit_snapshot_document_no_update;
+         DROP TRIGGER IF EXISTS _semantic_v2_audit_snapshot_document_no_delete;
+         DROP TRIGGER IF EXISTS _semantic_v2_audit_snapshot_mapping_no_insert;
+         DROP TRIGGER IF EXISTS _semantic_v2_audit_snapshot_mapping_no_update;
+         DROP TRIGGER IF EXISTS _semantic_v2_audit_snapshot_mapping_no_delete;
+         DROP TRIGGER IF EXISTS _semantic_v2_audit_snapshot_row_no_insert;
+         DROP TRIGGER IF EXISTS _semantic_v2_audit_snapshot_row_no_update;
+         DROP TRIGGER IF EXISTS _semantic_v2_audit_snapshot_row_no_delete;
+
+         DELETE FROM _semantic_v2_audit_snapshot_document
+          WHERE selection_id IN (
+             SELECT selection_id FROM _semantic_v2_audit_snapshot
+             WHERE snapshot_version = 'semantic-audit-snapshot-v2' AND sealed = 0
+          );
+         DELETE FROM _semantic_v2_audit_snapshot_mapping_chunk
+          WHERE selection_id IN (
+             SELECT selection_id FROM _semantic_v2_audit_snapshot
+             WHERE snapshot_version = 'semantic-audit-snapshot-v2' AND sealed = 0
+          );
+         DELETE FROM _semantic_v2_audit_snapshot_row_chunk
+          WHERE selection_id IN (
+             SELECT selection_id FROM _semantic_v2_audit_snapshot
+             WHERE snapshot_version = 'semantic-audit-snapshot-v2' AND sealed = 0
+          );
+         DELETE FROM _semantic_v2_audit_snapshot
+          WHERE snapshot_version = 'semantic-audit-snapshot-v2' AND sealed = 0;
+         DELETE FROM _semantic_v2_audit_snapshot_stage_mapping_chunk;
+         DELETE FROM _semantic_v2_audit_snapshot_stage_row_chunk;
+         DELETE FROM _semantic_v2_audit_snapshot_stage_row;
+         DELETE FROM _semantic_v2_audit_snapshot_stage_document;
+         DELETE FROM _semantic_v2_audit_snapshot_stage;
+         DELETE FROM _semantic_v2_audit_snapshot_publish;
+
+         CREATE TRIGGER _semantic_v2_audit_snapshot_no_insert
+         BEFORE INSERT ON _semantic_v2_audit_snapshot
+         WHEN NEW.snapshot_version <> 'semantic-audit-snapshot-v2'
+           OR NEW.sealed <> 0 OR NEW.seal_version <> ''
+           OR NEW.mapping_sha256 <> '' OR NEW.row_set_sha256 <> ''
+           OR NEW.mapping_chunk_count <> 0 OR NEW.row_chunk_count <> 0
+           OR NOT EXISTS (
+            SELECT 1 FROM _semantic_v2_audit_snapshot_publish pub
+            JOIN _semantic_v2_audit_snapshot_stage st USING(selection_id)
+            WHERE pub.selection_id = NEW.selection_id AND pub.phase = 'header'
+         )
+         BEGIN
+            SELECT RAISE(ABORT, 'semantic-audit-schema-r3 parent insert requires publication');
+         END;
+         CREATE TRIGGER _semantic_v2_audit_snapshot_no_update
+         BEFORE UPDATE ON _semantic_v2_audit_snapshot
+         WHEN NOT EXISTS (
+            SELECT 1 FROM _semantic_v2_audit_snapshot_publish pub
+            WHERE pub.selection_id = OLD.selection_id
+              AND pub.phase = 'seal' AND OLD.sealed = 0 AND NEW.sealed = 1
+              AND OLD.snapshot_version = 'semantic-audit-snapshot-v2'
+              AND NEW.snapshot_version = OLD.snapshot_version
+              AND NEW.seal_version = 'semantic-audit-seal-v1'
+         )
+         BEGIN
+            SELECT RAISE(ABORT, 'semantic-audit-schema-r3 snapshots are immutable');
+         END;
+         CREATE TRIGGER _semantic_v2_audit_snapshot_immutable_fields
+         BEFORE UPDATE OF
+            selection_id, snapshot_version, build_id, dataset_hash, schema_hash,
+            index_version, normalizer_version, model_name, model_version, model_sha256,
+            tokenizer_sha256, config_sha256, query_sha256, policy_version, minimum_score,
+            maximum_documents, documents_above_threshold, documents_retained, rows_matched,
+            documents_truncated, broad_row_warning, warnings_json, source_rows,
+            index_rows_scanned, index_documents_seen, index_documents_embedded,
+            index_documents_mapped, index_mappings_written, index_documents_skipped,
+            index_mappings_skipped, index_cells_truncated, index_columns_omitted,
+            index_chunks_omitted, candidate_documents, candidate_mappings,
+            candidate_document_limit, candidate_mapping_limit, selected_document_count,
+            mapping_count, row_count, row_set_encoding, selection_created_at
+         ON _semantic_v2_audit_snapshot
+         BEGIN
+            SELECT RAISE(ABORT, 'semantic-audit-schema-r3 immutable parent fields cannot change');
+         END;
+         CREATE TRIGGER _semantic_v2_audit_snapshot_no_delete
+         BEFORE DELETE ON _semantic_v2_audit_snapshot
+         WHEN OLD.sealed = 1 OR OLD.snapshot_version <> 'semantic-audit-snapshot-v2' OR NOT EXISTS (
+            SELECT 1 FROM _semantic_v2_audit_snapshot_publish pub
+            WHERE pub.selection_id = OLD.selection_id AND pub.phase = 'header'
+         )
+         BEGIN
+            SELECT RAISE(ABORT, 'semantic-audit-schema-r3 snapshots are immutable');
+         END;
+
+         CREATE TRIGGER _semantic_v2_audit_snapshot_document_no_insert
+         BEFORE INSERT ON _semantic_v2_audit_snapshot_document
+         WHEN NOT EXISTS (
+            SELECT 1
+            FROM _semantic_v2_audit_snapshot p
+            JOIN _semantic_v2_audit_snapshot_publish pub USING(selection_id)
+            JOIN _semantic_v2_audit_snapshot_stage_document sd USING(selection_id)
+            WHERE p.selection_id = NEW.selection_id AND p.sealed = 0
+              AND p.snapshot_version = 'semantic-audit-snapshot-v2'
+              AND pub.phase = 'documents' AND sd.rank = NEW.rank
+              AND sd.doc_id = NEW.source_doc_id
+              AND sd.fingerprint_sha256 = NEW.fingerprint_sha256
+              AND sd.kind = NEW.kind AND sd.column_key = NEW.column_key
+              AND sd.normalized_text = NEW.normalized_text
+              AND sd.cosine_score = NEW.cosine_score AND sd.rank_score = NEW.rank_score
+              AND sd.mapping_count = NEW.mapping_count
+              AND sd.mapping_sha256 = NEW.mapping_sha256
+         )
+         BEGIN
+            SELECT RAISE(ABORT, 'semantic-audit-schema-r3 snapshot children are immutable');
+         END;
+         CREATE TRIGGER _semantic_v2_audit_snapshot_document_no_update
+         BEFORE UPDATE ON _semantic_v2_audit_snapshot_document
+         BEGIN
+            SELECT RAISE(ABORT, 'semantic-audit-schema-r3 snapshot children are immutable');
+         END;
+         CREATE TRIGGER _semantic_v2_audit_snapshot_document_no_delete
+         BEFORE DELETE ON _semantic_v2_audit_snapshot_document
+         WHEN NOT EXISTS (
+            SELECT 1 FROM _semantic_v2_audit_snapshot_publish pub
+            JOIN _semantic_v2_audit_snapshot p USING(selection_id)
+            JOIN _semantic_v2_audit_snapshot_stage st USING(selection_id)
+            WHERE pub.selection_id = OLD.selection_id AND pub.phase = 'reset_documents'
+              AND p.sealed = 0 AND p.snapshot_version = 'semantic-audit-snapshot-v2'
+         )
+         BEGIN
+            SELECT RAISE(ABORT, 'semantic-audit-schema-r3 snapshot children are immutable');
+         END;
+
+         CREATE TRIGGER _semantic_v2_audit_snapshot_mapping_no_insert
+         BEFORE INSERT ON _semantic_v2_audit_snapshot_mapping_chunk
+         WHEN NOT EXISTS (
+            SELECT 1
+            FROM _semantic_v2_audit_snapshot p
+            JOIN _semantic_v2_audit_snapshot_publish pub USING(selection_id)
+            JOIN _semantic_v2_audit_snapshot_stage_mapping_chunk sm USING(selection_id)
+            WHERE p.selection_id = NEW.selection_id AND p.sealed = 0
+              AND p.snapshot_version = 'semantic-audit-snapshot-v2'
+              AND pub.phase = 'mapping_chunks' AND sm.chunk_index = NEW.chunk_index
+              AND sm.doc_id = NEW.source_doc_id
+              AND sm.first_row_num = NEW.first_row_num
+              AND sm.last_row_num = NEW.last_row_num
+              AND sm.row_count = NEW.row_count
+              AND sm.encoded_rows = NEW.encoded_rows
+              AND sm.chunk_sha256 = NEW.chunk_sha256
+         )
+         BEGIN
+            SELECT RAISE(ABORT, 'semantic-audit-schema-r3 snapshot children are immutable');
+         END;
+         CREATE TRIGGER _semantic_v2_audit_snapshot_mapping_no_update
+         BEFORE UPDATE ON _semantic_v2_audit_snapshot_mapping_chunk
+         BEGIN
+            SELECT RAISE(ABORT, 'semantic-audit-schema-r3 snapshot children are immutable');
+         END;
+         CREATE TRIGGER _semantic_v2_audit_snapshot_mapping_no_delete
+         BEFORE DELETE ON _semantic_v2_audit_snapshot_mapping_chunk
+         WHEN NOT EXISTS (
+            SELECT 1 FROM _semantic_v2_audit_snapshot_publish pub
+            JOIN _semantic_v2_audit_snapshot p USING(selection_id)
+            JOIN _semantic_v2_audit_snapshot_stage st USING(selection_id)
+            WHERE pub.selection_id = OLD.selection_id AND pub.phase = 'reset_mapping_chunks'
+              AND p.sealed = 0 AND p.snapshot_version = 'semantic-audit-snapshot-v2'
+         )
+         BEGIN
+            SELECT RAISE(ABORT, 'semantic-audit-schema-r3 snapshot children are immutable');
+         END;
+
+         CREATE TRIGGER _semantic_v2_audit_snapshot_row_no_insert
+         BEFORE INSERT ON _semantic_v2_audit_snapshot_row_chunk
+         WHEN NOT EXISTS (
+            SELECT 1
+            FROM _semantic_v2_audit_snapshot p
+            JOIN _semantic_v2_audit_snapshot_publish pub USING(selection_id)
+            JOIN _semantic_v2_audit_snapshot_stage_row_chunk sr USING(selection_id)
+            WHERE p.selection_id = NEW.selection_id AND p.sealed = 0
+              AND p.snapshot_version = 'semantic-audit-snapshot-v2'
+              AND pub.phase = 'row_chunks' AND sr.chunk_index = NEW.chunk_index
+              AND sr.first_row_num = NEW.first_row_num
+              AND sr.last_row_num = NEW.last_row_num
+              AND sr.row_count = NEW.row_count
+              AND sr.encoded_rows = NEW.encoded_rows
+              AND sr.chunk_sha256 = NEW.chunk_sha256
+         )
+         BEGIN
+            SELECT RAISE(ABORT, 'semantic-audit-schema-r3 snapshot children are immutable');
+         END;
+         CREATE TRIGGER _semantic_v2_audit_snapshot_row_no_update
+         BEFORE UPDATE ON _semantic_v2_audit_snapshot_row_chunk
+         BEGIN
+            SELECT RAISE(ABORT, 'semantic-audit-schema-r3 snapshot children are immutable');
+         END;
+         CREATE TRIGGER _semantic_v2_audit_snapshot_row_no_delete
+         BEFORE DELETE ON _semantic_v2_audit_snapshot_row_chunk
+         WHEN NOT EXISTS (
+            SELECT 1 FROM _semantic_v2_audit_snapshot_publish pub
+            JOIN _semantic_v2_audit_snapshot p USING(selection_id)
+            JOIN _semantic_v2_audit_snapshot_stage st USING(selection_id)
+            WHERE pub.selection_id = OLD.selection_id AND pub.phase = 'reset_row_chunks'
+              AND p.sealed = 0 AND p.snapshot_version = 'semantic-audit-snapshot-v2'
+         )
+         BEGIN
+            SELECT RAISE(ABORT, 'semantic-audit-schema-r3 snapshot children are immutable');
+         END;
+
+         CREATE VIEW _semantic_v2_audit_snapshot_sealed_contents AS
+         SELECT p.selection_id
+         FROM _semantic_v2_audit_snapshot p
+         WHERE 'semantic-audit-schema-r3' = 'semantic-audit-schema-r3'
+           AND p.snapshot_version = 'semantic-audit-snapshot-v2'
+           AND p.sealed = 1 AND p.seal_version = 'semantic-audit-seal-v1'
+           AND length(p.mapping_sha256) = 64
+           AND p.mapping_sha256 NOT GLOB '*[^0-9a-f]*'
+           AND length(p.row_set_sha256) = 64
+           AND p.row_set_sha256 NOT GLOB '*[^0-9a-f]*'
+           AND p.row_set_encoding = 'sorted-positive-delta-varint-chunks-v1'
+           AND p.selected_document_count >= 0 AND p.mapping_count >= 0
+           AND p.mapping_chunk_count >= 0 AND p.row_count >= 0
+           AND p.row_chunk_count >= 0
+           AND p.selected_document_count = p.documents_retained
+           AND p.row_count = p.rows_matched
+           AND p.selected_document_count = (
+                SELECT COUNT(*) FROM _semantic_v2_audit_snapshot_document d
+                WHERE d.selection_id = p.selection_id
+           )
+           AND p.mapping_chunk_count = (
+                SELECT COUNT(*) FROM _semantic_v2_audit_snapshot_mapping_chunk mc
+                WHERE mc.selection_id = p.selection_id
+           )
+           AND p.row_chunk_count = (
+                SELECT COUNT(*) FROM _semantic_v2_audit_snapshot_row_chunk rc
+                WHERE rc.selection_id = p.selection_id
+           )
+           AND p.mapping_count = COALESCE((
+                SELECT SUM(d.mapping_count) FROM _semantic_v2_audit_snapshot_document d
+                WHERE d.selection_id = p.selection_id
+           ), 0)
+           AND p.mapping_count = COALESCE((
+                SELECT SUM(mc.row_count) FROM _semantic_v2_audit_snapshot_mapping_chunk mc
+                WHERE mc.selection_id = p.selection_id
+           ), 0)
+           AND p.row_count = COALESCE((
+                SELECT SUM(rc.row_count) FROM _semantic_v2_audit_snapshot_row_chunk rc
+                WHERE rc.selection_id = p.selection_id
+           ), 0)
+           AND p.selected_document_count = (
+                SELECT COUNT(DISTINCT d.source_doc_id)
+                FROM _semantic_v2_audit_snapshot_document d
+                WHERE d.selection_id = p.selection_id
+           )
+           AND NOT EXISTS (
+                SELECT 1 FROM _semantic_v2_audit_snapshot_document d
+                WHERE d.selection_id = p.selection_id
+                  AND (d.mapping_count <= 0 OR length(d.mapping_sha256) <> 64
+                       OR d.mapping_sha256 GLOB '*[^0-9a-f]*'
+                       OR d.mapping_count <> COALESCE((
+                            SELECT SUM(mc.row_count)
+                            FROM _semantic_v2_audit_snapshot_mapping_chunk mc
+                            WHERE mc.selection_id = d.selection_id
+                              AND mc.source_doc_id = d.source_doc_id
+                       ), 0))
+           )
+           AND NOT EXISTS (
+                SELECT 1 FROM _semantic_v2_audit_snapshot_mapping_chunk mc
+                WHERE mc.selection_id = p.selection_id
+                  AND (mc.row_count <= 0 OR mc.first_row_num <= 0
+                       OR mc.last_row_num < mc.first_row_num
+                       OR length(mc.chunk_sha256) <> 64
+                       OR mc.chunk_sha256 GLOB '*[^0-9a-f]*'
+                       OR typeof(mc.encoded_rows) <> 'blob'
+                       OR length(mc.encoded_rows) = 0
+                       OR length(mc.encoded_rows) > 16000
+                       OR NOT EXISTS (
+                            SELECT 1 FROM _semantic_v2_audit_snapshot_document d
+                            WHERE d.selection_id = mc.selection_id
+                              AND d.source_doc_id = mc.source_doc_id
+                       ))
+           )
+           AND NOT EXISTS (
+                SELECT 1 FROM _semantic_v2_audit_snapshot_row_chunk rc
+                WHERE rc.selection_id = p.selection_id
+                  AND (rc.row_count <= 0 OR rc.first_row_num <= 0
+                       OR rc.last_row_num < rc.first_row_num
+                       OR length(rc.chunk_sha256) <> 64
+                       OR rc.chunk_sha256 GLOB '*[^0-9a-f]*'
+                       OR typeof(rc.encoded_rows) <> 'blob'
+                       OR length(rc.encoded_rows) = 0
+                       OR length(rc.encoded_rows) > 16000)
+           )
+           AND NOT EXISTS (
+                SELECT 1 FROM _semantic_v2_audit_snapshot_mapping_chunk mc
+                WHERE mc.selection_id = p.selection_id
+                  AND EXISTS (
+                    SELECT 1 FROM _semantic_v2_audit_snapshot_mapping_chunk previous
+                    WHERE previous.selection_id = mc.selection_id
+                      AND previous.source_doc_id = mc.source_doc_id
+                      AND previous.chunk_index = (
+                        SELECT MAX(candidate.chunk_index)
+                        FROM _semantic_v2_audit_snapshot_mapping_chunk candidate
+                        WHERE candidate.selection_id = mc.selection_id
+                          AND candidate.source_doc_id = mc.source_doc_id
+                          AND candidate.chunk_index < mc.chunk_index
+                      )
+                      AND mc.first_row_num <= previous.last_row_num
+                  )
+           )
+           AND NOT EXISTS (
+                SELECT 1 FROM _semantic_v2_audit_snapshot_row_chunk rc
+                JOIN _semantic_v2_audit_snapshot_row_chunk previous
+                  ON previous.selection_id = rc.selection_id
+                 AND previous.chunk_index = rc.chunk_index - 1
+                WHERE rc.selection_id = p.selection_id
+                  AND rc.first_row_num <= previous.last_row_num
+           )
+           AND (p.selected_document_count = 0 OR (
+                SELECT MIN(d.rank) = 1 AND MAX(d.rank) = p.selected_document_count
+                FROM _semantic_v2_audit_snapshot_document d
+                WHERE d.selection_id = p.selection_id
+           ))
+           AND (p.mapping_chunk_count = 0 OR (
+                SELECT MIN(mc.chunk_index) = 0
+                       AND MAX(mc.chunk_index) = p.mapping_chunk_count - 1
+                FROM _semantic_v2_audit_snapshot_mapping_chunk mc
+                WHERE mc.selection_id = p.selection_id
+           ))
+           AND (p.row_chunk_count = 0 OR (
+                SELECT MIN(rc.chunk_index) = 0
+                       AND MAX(rc.chunk_index) = p.row_chunk_count - 1
+                FROM _semantic_v2_audit_snapshot_row_chunk rc
+                WHERE rc.selection_id = p.selection_id
+           ));
+         CREATE VIEW _semantic_v2_audit_snapshot_complete AS
+         SELECT sealed.selection_id
+         FROM _semantic_v2_audit_snapshot_sealed_contents sealed
+         WHERE 'semantic-audit-schema-r3' = 'semantic-audit-schema-r3'
+           AND NOT EXISTS (
+                SELECT 1 FROM _semantic_v2_audit_snapshot_stage st
+                WHERE st.selection_id = sealed.selection_id
+         )
+           AND NOT EXISTS (
+                SELECT 1 FROM _semantic_v2_audit_snapshot_publish pub
+                WHERE pub.selection_id = sealed.selection_id
+         );
+         CREATE VIEW _semantic_v2_audit_snapshot_legacy_union AS
+         SELECT p.selection_id
+         FROM _semantic_v2_audit_snapshot p
+         WHERE 'semantic-audit-schema-r3' = 'semantic-audit-schema-r3'
+           AND p.snapshot_version = 'semantic-audit-snapshot-v1'
+           AND p.sealed = 0 AND p.seal_version = ''
+           AND length(p.mapping_sha256) = 64
+           AND p.mapping_sha256 NOT GLOB '*[^0-9a-f]*'
+           AND length(p.row_set_sha256) = 64
+           AND p.row_set_sha256 NOT GLOB '*[^0-9a-f]*'
+           AND p.row_set_encoding = 'sorted-positive-delta-varint-chunks-v1'
+           AND p.selected_document_count >= 0 AND p.mapping_count >= 0 AND p.row_count >= 0
+           AND p.selected_document_count = p.documents_retained
+           AND p.row_count = p.rows_matched
+           AND p.selected_document_count = (
+                SELECT COUNT(*) FROM _semantic_v2_audit_snapshot_document d
+                WHERE d.selection_id = p.selection_id
+           )
+           AND p.selected_document_count = (
+                SELECT COUNT(DISTINCT d.source_doc_id)
+                FROM _semantic_v2_audit_snapshot_document d
+                WHERE d.selection_id = p.selection_id
+           )
+           AND p.mapping_count = COALESCE((
+                SELECT SUM(d.mapping_count) FROM _semantic_v2_audit_snapshot_document d
+                WHERE d.selection_id = p.selection_id
+           ), 0)
+           AND p.row_count = COALESCE((
+                SELECT SUM(rc.row_count) FROM _semantic_v2_audit_snapshot_row_chunk rc
+                WHERE rc.selection_id = p.selection_id
+           ), 0)
+           AND NOT EXISTS (
+                SELECT 1 FROM _semantic_v2_audit_snapshot_document d
+                WHERE d.selection_id = p.selection_id
+                  AND (d.mapping_count <= 0 OR length(d.mapping_sha256) <> 64
+                       OR d.mapping_sha256 GLOB '*[^0-9a-f]*')
+           )
+           AND NOT EXISTS (
+                SELECT 1 FROM _semantic_v2_audit_snapshot_row_chunk rc
+                WHERE rc.selection_id = p.selection_id
+                  AND (rc.row_count <= 0 OR rc.first_row_num <= 0
+                       OR rc.last_row_num < rc.first_row_num
+                       OR length(rc.chunk_sha256) <> 64
+                       OR rc.chunk_sha256 GLOB '*[^0-9a-f]*'
+                       OR typeof(rc.encoded_rows) <> 'blob'
+                       OR length(rc.encoded_rows) = 0
+                       OR length(rc.encoded_rows) > 16000)
+           )
+           AND (p.selected_document_count = 0 OR (
+                SELECT MIN(d.rank) = 1 AND MAX(d.rank) = p.selected_document_count
+                FROM _semantic_v2_audit_snapshot_document d
+                WHERE d.selection_id = p.selection_id
+           ))
+           AND NOT EXISTS (
+                SELECT 1 FROM _semantic_v2_audit_snapshot_row_chunk rc
+                JOIN _semantic_v2_audit_snapshot_row_chunk previous
+                  ON previous.selection_id = rc.selection_id
+                 AND previous.chunk_index = rc.chunk_index - 1
+                WHERE rc.selection_id = p.selection_id
+                  AND rc.first_row_num <= previous.last_row_num
+           )
+           AND NOT EXISTS (
+                SELECT 1 FROM _semantic_v2_audit_snapshot_mapping_chunk mc
+                WHERE mc.selection_id = p.selection_id
+           )
+           AND NOT EXISTS (
+                SELECT 1 FROM _semantic_v2_audit_snapshot_stage st
+                WHERE st.selection_id = p.selection_id
+           )
+           AND NOT EXISTS (
+                SELECT 1 FROM _semantic_v2_audit_snapshot_publish pub
+                WHERE pub.selection_id = p.selection_id
+           )
+           AND NOT EXISTS (
+                SELECT 1 FROM _semantic_v2_audit_snapshot_row_chunk rc
+                WHERE rc.selection_id = p.selection_id
+                  AND rc.chunk_index < 0
+           )
+           AND (
+                NOT EXISTS (
+                    SELECT 1 FROM _semantic_v2_audit_snapshot_row_chunk rc
+                    WHERE rc.selection_id = p.selection_id
+                )
+                OR (
+                    SELECT MIN(rc.chunk_index) = 0
+                           AND MAX(rc.chunk_index) = COUNT(*) - 1
+                    FROM _semantic_v2_audit_snapshot_row_chunk rc
+                    WHERE rc.selection_id = p.selection_id
+                )
+           );
+         RELEASE semantic_v2_audit_seal_schema;",
+    )
 }
 
 fn ensure_semantic_v2_build_columns(conn: &Connection) -> rusqlite::Result<()> {
@@ -1721,6 +2273,18 @@ struct AuditSnapshotStage {
 }
 
 #[derive(Debug, Clone)]
+struct AuditSnapshotPublish {
+    selection_id: String,
+    phase: String,
+    cursor_rank: i64,
+    cursor_mapping_chunk: i64,
+    cursor_row_chunk: i64,
+    documents_copied: i64,
+    mapping_chunks_copied: i64,
+    row_chunks_copied: i64,
+}
+
+#[derive(Debug, Clone)]
 struct AuditSnapshotDocument {
     doc_id: i64,
     rank: i64,
@@ -1777,6 +2341,7 @@ fn update_snapshot_digest(hasher: &mut Sha256, value: &[u8]) {
     hasher.update(value);
 }
 
+#[cfg(test)]
 fn encode_sorted_positive_delta_varints(row_numbers: &[i64]) -> Result<Vec<u8>> {
     let mut output = Vec::with_capacity(row_numbers.len().saturating_mul(2));
     let mut previous = 0u64;
@@ -1803,7 +2368,59 @@ fn encode_sorted_positive_delta_varints(row_numbers: &[i64]) -> Result<Vec<u8>> 
     Ok(output)
 }
 
-#[cfg(test)]
+fn encode_bounded_sorted_row_chunks(row_numbers: &[i64]) -> Result<Vec<(usize, usize, Vec<u8>)>> {
+    let mut chunks = Vec::new();
+    let mut start = 0usize;
+    let mut encoded = Vec::new();
+    let mut previous = 0u64;
+    for (index, row_num) in row_numbers.iter().copied().enumerate() {
+        let current = u64::try_from(row_num)
+            .map_err(|_| anyhow::anyhow!("semantic audit row numbers must be positive"))?;
+        if current == 0 || (index > 0 && current <= u64::try_from(row_numbers[index - 1])?) {
+            bail!("semantic audit row numbers must be strictly increasing and positive");
+        }
+        let mut delta = current - previous;
+        let mut bytes = [0u8; 10];
+        let mut length = 0usize;
+        loop {
+            let mut byte = (delta & 0x7f) as u8;
+            delta >>= 7;
+            if delta != 0 {
+                byte |= 0x80;
+            }
+            bytes[length] = byte;
+            length += 1;
+            if delta == 0 {
+                break;
+            }
+        }
+        if !encoded.is_empty() && encoded.len() + length > V2_AUDIT_ENCODED_CHUNK_MAX_BYTES {
+            chunks.push((start, index, std::mem::take(&mut encoded)));
+            start = index;
+            let mut absolute = current;
+            length = 0;
+            loop {
+                let mut byte = (absolute & 0x7f) as u8;
+                absolute >>= 7;
+                if absolute != 0 {
+                    byte |= 0x80;
+                }
+                bytes[length] = byte;
+                length += 1;
+                if absolute == 0 {
+                    break;
+                }
+            }
+        }
+        encoded.extend_from_slice(&bytes[..length]);
+        previous = current;
+    }
+    if !encoded.is_empty() {
+        chunks.push((start, row_numbers.len(), encoded));
+    }
+    Ok(chunks)
+}
+
 fn decode_sorted_positive_delta_varints(encoded: &[u8]) -> Result<Vec<i64>> {
     let mut output = Vec::new();
     let mut previous = 0u64;
@@ -1874,8 +2491,8 @@ fn pending_audit_snapshot_selection(conn: &Connection) -> Result<Option<String>>
          LEFT JOIN _semantic_v2_audit_snapshot_stage st
            ON st.selection_id = s.selection_id
          WHERE NOT EXISTS (
-                SELECT 1 FROM _semantic_v2_audit_snapshot snap
-                WHERE snap.selection_id = s.selection_id
+                SELECT 1 FROM _semantic_v2_audit_snapshot_complete complete
+                WHERE complete.selection_id = s.selection_id
              )
            AND (
                 st.selection_id IS NOT NULL
@@ -1942,6 +2559,32 @@ fn load_audit_snapshot_stage(
                 next_row_chunk: row.get(6)?,
                 mappings_seen: row.get(7)?,
                 rows_seen: row.get(8)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+fn load_audit_snapshot_publish(
+    conn: &Connection,
+    selection_id: &str,
+) -> Result<Option<AuditSnapshotPublish>> {
+    conn.query_row(
+        "SELECT selection_id, phase, cursor_rank, cursor_mapping_chunk, cursor_row_chunk,
+                documents_copied, mapping_chunks_copied, row_chunks_copied
+         FROM _semantic_v2_audit_snapshot_publish WHERE selection_id = ?1",
+        [selection_id],
+        |row| {
+            Ok(AuditSnapshotPublish {
+                selection_id: row.get(0)?,
+                phase: row.get(1)?,
+                cursor_rank: row.get(2)?,
+                cursor_mapping_chunk: row.get(3)?,
+                cursor_row_chunk: row.get(4)?,
+                documents_copied: row.get(5)?,
+                mapping_chunks_copied: row.get(6)?,
+                row_chunks_copied: row.get(7)?,
             })
         },
     )
@@ -2083,29 +2726,31 @@ fn advance_audit_snapshot_mappings_with_hook(
             .iter()
             .map(|(_, row_num)| *row_num)
             .collect::<Vec<_>>();
-        let encoded = encode_sorted_positive_delta_varints(&row_numbers)?;
-        let first = *row_numbers
-            .first()
-            .ok_or_else(|| anyhow::anyhow!("semantic audit mapping chunk was empty"))?;
-        let last = *row_numbers
-            .last()
-            .ok_or_else(|| anyhow::anyhow!("semantic audit mapping chunk was empty"))?;
-        let count = row_numbers.len() as i64;
-        let digest = audit_snapshot_chunk_sha256("mapping", first, last, count, &encoded);
-        insert_chunk.execute(params![
-            stage.selection_id,
-            next_chunk,
-            doc_id,
-            first,
-            last,
-            count,
-            encoded,
-            digest,
-        ])?;
+        for (chunk_start, chunk_end, encoded) in encode_bounded_sorted_row_chunks(&row_numbers)? {
+            let chunk_rows = &row_numbers[chunk_start..chunk_end];
+            let first = *chunk_rows
+                .first()
+                .ok_or_else(|| anyhow::anyhow!("semantic audit mapping chunk was empty"))?;
+            let last = *chunk_rows
+                .last()
+                .ok_or_else(|| anyhow::anyhow!("semantic audit mapping chunk was empty"))?;
+            let count = chunk_rows.len() as i64;
+            let digest = audit_snapshot_chunk_sha256("mapping", first, last, count, &encoded);
+            insert_chunk.execute(params![
+                stage.selection_id,
+                next_chunk,
+                doc_id,
+                first,
+                last,
+                count,
+                encoded,
+                digest,
+            ])?;
+            next_chunk += 1;
+        }
         for row_num in row_numbers {
             insert_row.execute(params![stage.selection_id, row_num])?;
         }
-        next_chunk += 1;
         at = end;
     }
     drop(insert_row);
@@ -2148,38 +2793,47 @@ fn advance_audit_snapshot_rows(conn: &Connection, stage: &AuditSnapshotStage) ->
     if row_numbers.is_empty() {
         return Ok(false);
     }
-    let encoded = encode_sorted_positive_delta_varints(&row_numbers)?;
-    let first = *row_numbers
-        .first()
-        .ok_or_else(|| anyhow::anyhow!("semantic audit row chunk was empty"))?;
-    let last = *row_numbers
-        .last()
-        .ok_or_else(|| anyhow::anyhow!("semantic audit row chunk was empty"))?;
-    let count = row_numbers.len() as i64;
-    let digest = audit_snapshot_chunk_sha256("row-set", first, last, count, &encoded);
-    conn.execute(
+    let chunks = encode_bounded_sorted_row_chunks(&row_numbers)?;
+    let mut insert_chunk = conn.prepare(
         "INSERT INTO _semantic_v2_audit_snapshot_stage_row_chunk (
             selection_id, chunk_index, first_row_num, last_row_num, row_count,
             encoded_rows, chunk_sha256
          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        params![
+    )?;
+    for (offset, (chunk_start, chunk_end, encoded)) in chunks.iter().enumerate() {
+        let chunk_rows = &row_numbers[*chunk_start..*chunk_end];
+        let first = *chunk_rows
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("semantic audit row chunk was empty"))?;
+        let last = *chunk_rows
+            .last()
+            .ok_or_else(|| anyhow::anyhow!("semantic audit row chunk was empty"))?;
+        let count = chunk_rows.len() as i64;
+        let digest = audit_snapshot_chunk_sha256("row-set", first, last, count, encoded);
+        insert_chunk.execute(params![
             stage.selection_id,
-            stage.next_row_chunk,
+            stage.next_row_chunk + offset as i64,
             first,
             last,
             count,
             encoded,
             digest,
-        ],
-    )?;
+        ])?;
+    }
+    drop(insert_chunk);
+    let last = *row_numbers
+        .last()
+        .ok_or_else(|| anyhow::anyhow!("semantic audit row chunk was empty"))?;
+    let count = row_numbers.len() as i64;
     conn.execute(
         "UPDATE _semantic_v2_audit_snapshot_stage
-         SET cursor_row_num = ?2, next_row_chunk = next_row_chunk + 1,
-             rows_seen = rows_seen + ?3, updated_at = ?4
+         SET cursor_row_num = ?2, next_row_chunk = next_row_chunk + ?3,
+             rows_seen = rows_seen + ?4, updated_at = ?5
          WHERE selection_id = ?1 AND phase = 'rows'",
         params![
             stage.selection_id,
             last,
+            chunks.len() as i64,
             count,
             chrono::Utc::now().to_rfc3339(),
         ],
@@ -2252,176 +2906,108 @@ fn load_audit_snapshot_source(
     .map_err(Into::into)
 }
 
-fn finalize_audit_snapshot(conn: &Connection, stage: &AuditSnapshotStage) -> Result<()> {
+fn clear_audit_snapshot_stage(conn: &Connection, selection_id: &str) -> Result<()> {
+    for table in [
+        "_semantic_v2_audit_snapshot_stage_mapping_chunk",
+        "_semantic_v2_audit_snapshot_stage_row_chunk",
+        "_semantic_v2_audit_snapshot_stage_row",
+        "_semantic_v2_audit_snapshot_stage_document",
+        "_semantic_v2_audit_snapshot_stage",
+    ] {
+        conn.execute(
+            &format!(
+                "DELETE FROM {} WHERE selection_id = ?1",
+                db::quote_ident(table)
+            ),
+            [selection_id],
+        )?;
+    }
+    Ok(())
+}
+
+fn initialize_audit_snapshot_publish(
+    conn: &Connection,
+    stage: &AuditSnapshotStage,
+) -> Result<bool> {
+    let existing_seal: Option<bool> = conn
+        .query_row(
+            "SELECT sealed FROM _semantic_v2_audit_snapshot WHERE selection_id = ?1",
+            [&stage.selection_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if existing_seal == Some(true) {
+        let valid_contents: bool = conn.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM _semantic_v2_audit_snapshot_sealed_contents
+                WHERE selection_id = ?1
+             )",
+            [&stage.selection_id],
+            |row| row.get(0),
+        )?;
+        if !valid_contents {
+            bail!(
+                "sealed semantic audit snapshot is structurally incomplete; preserving live evidence"
+            );
+        }
+        clear_audit_snapshot_stage(conn, &stage.selection_id)?;
+        return Ok(true);
+    }
+    let now = chrono::Utc::now().to_rfc3339();
+    conn.execute(
+        "INSERT INTO _semantic_v2_audit_snapshot_publish (
+            selection_id, phase, started_at, updated_at
+         ) VALUES (?1, 'reset_documents', ?2, ?2)",
+        params![stage.selection_id, now],
+    )?;
+    Ok(false)
+}
+
+fn advance_snapshot_reset_phase(
+    conn: &Connection,
+    publish: &AuditSnapshotPublish,
+    table: &str,
+    key: &str,
+    limit: usize,
+    next_phase: &str,
+) -> Result<()> {
+    let removed = conn.execute(
+        &format!(
+            "DELETE FROM {table}
+             WHERE (selection_id, {key}) IN (
+                SELECT selection_id, {key} FROM {table}
+                WHERE selection_id = ?1 ORDER BY {key} LIMIT {limit}
+             )"
+        ),
+        [&publish.selection_id],
+    )?;
+    if removed == 0 {
+        conn.execute(
+            "UPDATE _semantic_v2_audit_snapshot_publish
+             SET phase = ?2, updated_at = ?3 WHERE selection_id = ?1",
+            params![
+                publish.selection_id,
+                next_phase,
+                chrono::Utc::now().to_rfc3339()
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn write_unsealed_audit_snapshot_header(
+    conn: &Connection,
+    stage: &AuditSnapshotStage,
+) -> Result<()> {
     let source = load_audit_snapshot_source(conn, &stage.selection_id)?;
     if source.build_id != stage.build_id {
-        bail!("semantic audit snapshot build identity changed; preserving stale live artifacts");
+        bail!("semantic audit snapshot build identity changed; preserving live evidence");
     }
-    let mismatched_document_provenance: i64 = conn.query_row(
-        "SELECT COUNT(*)
-         FROM _semantic_v2_audit_snapshot_stage_document sd
-         JOIN _semantic_v2_document d ON d.doc_id = sd.doc_id
-         WHERE sd.selection_id = ?1
-           AND (d.model_sha256 <> ?2 OR d.tokenizer_sha256 <> ?3
-                OR d.config_sha256 <> ?4 OR d.normalizer_version <> ?5)",
-        params![
-            stage.selection_id,
-            source.model_sha256,
-            source.tokenizer_sha256,
-            source.config_sha256,
-            source.normalizer_version,
-        ],
-        |row| row.get(0),
+    conn.execute(
+        "DELETE FROM _semantic_v2_audit_snapshot WHERE selection_id = ?1",
+        [&stage.selection_id],
     )?;
-    if mismatched_document_provenance != 0 {
-        bail!(
-            "semantic audit document provenance differs from its build; preserving stale live artifacts"
-        );
-    }
-    let documents = {
-        let mut statement = conn.prepare(
-            "SELECT doc_id, rank, fingerprint_sha256, kind, column_key, normalized_text,
-                    cosine_score, rank_score
-             FROM _semantic_v2_audit_snapshot_stage_document
-             WHERE selection_id = ?1 ORDER BY rank",
-        )?;
-        let collected = statement
-            .query_map([&stage.selection_id], |row| {
-                Ok(AuditSnapshotDocument {
-                    doc_id: row.get(0)?,
-                    rank: row.get(1)?,
-                    fingerprint_sha256: row.get(2)?,
-                    kind: row.get(3)?,
-                    column_key: row.get(4)?,
-                    normalized_text: row.get(5)?,
-                    cosine_score: row.get(6)?,
-                    rank_score: row.get(7)?,
-                })
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        collected
-    };
-    if documents.len() as i64 != source.documents_retained {
-        bail!(
-            "semantic audit snapshot selected-document count changed; preserving stale live artifacts"
-        );
-    }
-
-    let mut final_documents = Vec::with_capacity(documents.len());
-    let mut aggregate_mapping_hasher = Sha256::new();
-    update_snapshot_digest(
-        &mut aggregate_mapping_hasher,
-        V2_AUDIT_SNAPSHOT_VERSION.as_bytes(),
-    );
-    update_snapshot_digest(&mut aggregate_mapping_hasher, b"selected-document-mappings");
-    let mut mapping_total = 0i64;
-    let mut mapping_statement = conn.prepare(
-        "SELECT first_row_num, last_row_num, row_count, encoded_rows, chunk_sha256
-         FROM _semantic_v2_audit_snapshot_stage_mapping_chunk
-         WHERE selection_id = ?1 AND doc_id = ?2 ORDER BY chunk_index",
-    )?;
-    for document in documents {
-        let chunks = mapping_statement
-            .query_map(params![stage.selection_id, document.doc_id], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, i64>(2)?,
-                    row.get::<_, Vec<u8>>(3)?,
-                    row.get::<_, String>(4)?,
-                ))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        let mut document_hasher = Sha256::new();
-        update_snapshot_digest(&mut document_hasher, V2_AUDIT_SNAPSHOT_VERSION.as_bytes());
-        update_snapshot_digest(&mut document_hasher, b"document-mappings");
-        update_snapshot_digest(&mut document_hasher, document.fingerprint_sha256.as_bytes());
-        let mut document_mapping_count = 0i64;
-        for (first, last, count, encoded, stored_digest) in chunks {
-            let expected = audit_snapshot_chunk_sha256("mapping", first, last, count, &encoded);
-            if expected != stored_digest {
-                bail!(
-                    "semantic audit mapping chunk failed integrity validation; preserving stale live artifacts"
-                );
-            }
-            document_mapping_count = document_mapping_count
-                .checked_add(count)
-                .ok_or_else(|| anyhow::anyhow!("semantic audit mapping count overflow"))?;
-            document_hasher.update(first.to_le_bytes());
-            document_hasher.update(last.to_le_bytes());
-            document_hasher.update(count.to_le_bytes());
-            update_snapshot_digest(&mut document_hasher, stored_digest.as_bytes());
-        }
-        if document_mapping_count == 0 {
-            bail!(
-                "semantic audit selected document has no mappings; preserving stale live artifacts"
-            );
-        }
-        let mapping_sha256 = bytes_to_hex(&document_hasher.finalize());
-        mapping_total = mapping_total
-            .checked_add(document_mapping_count)
-            .ok_or_else(|| anyhow::anyhow!("semantic audit mapping count overflow"))?;
-        aggregate_mapping_hasher.update(document.rank.to_le_bytes());
-        update_snapshot_digest(
-            &mut aggregate_mapping_hasher,
-            document.fingerprint_sha256.as_bytes(),
-        );
-        aggregate_mapping_hasher.update(document_mapping_count.to_le_bytes());
-        update_snapshot_digest(&mut aggregate_mapping_hasher, mapping_sha256.as_bytes());
-        final_documents.push((document, document_mapping_count, mapping_sha256));
-    }
-    drop(mapping_statement);
-    if mapping_total != stage.mappings_seen {
-        bail!("semantic audit mapping total changed; preserving stale live artifacts");
-    }
-    let mapping_sha256 = bytes_to_hex(&aggregate_mapping_hasher.finalize());
-
-    let row_chunks = {
-        let mut statement = conn.prepare(
-            "SELECT chunk_index, first_row_num, last_row_num, row_count, encoded_rows,
-                    chunk_sha256
-             FROM _semantic_v2_audit_snapshot_stage_row_chunk
-             WHERE selection_id = ?1 ORDER BY chunk_index",
-        )?;
-        let collected = statement
-            .query_map([&stage.selection_id], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, i64>(2)?,
-                    row.get::<_, i64>(3)?,
-                    row.get::<_, Vec<u8>>(4)?,
-                    row.get::<_, String>(5)?,
-                ))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        collected
-    };
-    let mut row_set_hasher = Sha256::new();
-    update_snapshot_digest(&mut row_set_hasher, V2_AUDIT_SNAPSHOT_VERSION.as_bytes());
-    update_snapshot_digest(&mut row_set_hasher, V2_AUDIT_ROW_SET_ENCODING.as_bytes());
-    let mut row_total = 0i64;
-    for (chunk_index, first, last, count, encoded, stored_digest) in &row_chunks {
-        let expected = audit_snapshot_chunk_sha256("row-set", *first, *last, *count, encoded);
-        if expected != *stored_digest {
-            bail!(
-                "semantic audit row-set chunk failed integrity validation; preserving stale live artifacts"
-            );
-        }
-        row_total = row_total
-            .checked_add(*count)
-            .ok_or_else(|| anyhow::anyhow!("semantic audit row count overflow"))?;
-        row_set_hasher.update(chunk_index.to_le_bytes());
-        row_set_hasher.update(first.to_le_bytes());
-        row_set_hasher.update(last.to_le_bytes());
-        row_set_hasher.update(count.to_le_bytes());
-        update_snapshot_digest(&mut row_set_hasher, stored_digest.as_bytes());
-    }
-    if row_total != stage.rows_seen || row_total != source.rows_matched {
-        bail!("semantic audit expanded row set changed; preserving stale live artifacts");
-    }
-    let row_set_sha256 = bytes_to_hex(&row_set_hasher.finalize());
-    let archived_at = chrono::Utc::now().to_rfc3339();
+    let now = chrono::Utc::now().to_rfc3339();
     conn.execute(
         "INSERT INTO _semantic_v2_audit_snapshot (
             selection_id, snapshot_version, build_id, dataset_hash, schema_hash,
@@ -2435,13 +3021,14 @@ fn finalize_audit_snapshot(conn: &Connection, stage: &AuditSnapshotStage) -> Res
             index_chunks_omitted, candidate_documents, candidate_mappings,
             candidate_document_limit, candidate_mapping_limit, selected_document_count,
             mapping_count, mapping_sha256, row_count, row_set_sha256, row_set_encoding,
+            mapping_chunk_count, row_chunk_count, sealed, seal_version,
             selection_created_at, archived_at
          ) VALUES (
             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
             ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20,
             ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30,
-            ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40,
-            ?41, ?42, ?43, ?44, ?45
+            ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, '',
+            ?40, '', ?41, 0, 0, 0, '', ?42, ?43
          )",
         params![
             stage.selection_id,
@@ -2481,26 +3068,160 @@ fn finalize_audit_snapshot(conn: &Connection, stage: &AuditSnapshotStage) -> Res
             source.candidate_mappings,
             source.candidate_document_limit,
             source.candidate_mapping_limit,
-            final_documents.len() as i64,
-            mapping_total,
-            mapping_sha256,
-            row_total,
-            row_set_sha256,
+            source.documents_retained,
+            stage.mappings_seen,
+            stage.rows_seen,
             V2_AUDIT_ROW_SET_ENCODING,
             source.selection_created_at,
-            archived_at,
+            now,
         ],
     )?;
+    conn.execute(
+        "UPDATE _semantic_v2_audit_snapshot_publish
+         SET phase = 'documents', updated_at = ?2 WHERE selection_id = ?1",
+        params![stage.selection_id, chrono::Utc::now().to_rfc3339()],
+    )?;
+    Ok(())
+}
 
-    let mut insert_document = conn.prepare(
+fn stage_document_mapping_summary(
+    conn: &Connection,
+    selection_id: &str,
+    doc_id: i64,
+    fingerprint_sha256: &str,
+) -> Result<(i64, String)> {
+    let mut hasher = Sha256::new();
+    update_snapshot_digest(&mut hasher, V2_AUDIT_SNAPSHOT_VERSION.as_bytes());
+    update_snapshot_digest(&mut hasher, b"document-mappings");
+    update_snapshot_digest(&mut hasher, fingerprint_sha256.as_bytes());
+    let mut count = 0i64;
+    let mut statement = conn.prepare(
+        "SELECT first_row_num, last_row_num, row_count, chunk_sha256
+         FROM _semantic_v2_audit_snapshot_stage_mapping_chunk
+         WHERE selection_id = ?1 AND doc_id = ?2 ORDER BY chunk_index",
+    )?;
+    let mut rows = statement.query(params![selection_id, doc_id])?;
+    while let Some(row) = rows.next()? {
+        let first: i64 = row.get(0)?;
+        let last: i64 = row.get(1)?;
+        let chunk_count: i64 = row.get(2)?;
+        let digest: String = row.get(3)?;
+        count = count
+            .checked_add(chunk_count)
+            .ok_or_else(|| anyhow::anyhow!("semantic audit mapping count overflow"))?;
+        hasher.update(first.to_le_bytes());
+        hasher.update(last.to_le_bytes());
+        hasher.update(chunk_count.to_le_bytes());
+        update_snapshot_digest(&mut hasher, digest.as_bytes());
+    }
+    if count <= 0 {
+        bail!("semantic audit selected document has no mappings; preserving live evidence");
+    }
+    Ok((count, bytes_to_hex(&hasher.finalize())))
+}
+
+fn final_document_mapping_summary(
+    conn: &Connection,
+    selection_id: &str,
+    source_doc_id: i64,
+    fingerprint_sha256: &str,
+) -> Result<(i64, String)> {
+    let mut hasher = Sha256::new();
+    update_snapshot_digest(&mut hasher, V2_AUDIT_SNAPSHOT_VERSION.as_bytes());
+    update_snapshot_digest(&mut hasher, b"document-mappings");
+    update_snapshot_digest(&mut hasher, fingerprint_sha256.as_bytes());
+    let mut count = 0i64;
+    let mut previous_last = None;
+    let mut statement = conn.prepare(
+        "SELECT first_row_num, last_row_num, row_count, encoded_rows, chunk_sha256
+         FROM _semantic_v2_audit_snapshot_mapping_chunk
+         WHERE selection_id = ?1 AND source_doc_id = ?2 ORDER BY chunk_index",
+    )?;
+    let mut rows = statement.query(params![selection_id, source_doc_id])?;
+    while let Some(row) = rows.next()? {
+        let first: i64 = row.get(0)?;
+        let last: i64 = row.get(1)?;
+        let chunk_count: i64 = row.get(2)?;
+        let encoded: Vec<u8> = row.get(3)?;
+        let digest: String = row.get(4)?;
+        validated_mapping_chunk(first, last, chunk_count, &encoded, &digest)?;
+        if previous_last.is_some_and(|previous| first <= previous) {
+            bail!("semantic audit mapping chunks overlap or are out of order");
+        }
+        previous_last = Some(last);
+        count = count
+            .checked_add(chunk_count)
+            .ok_or_else(|| anyhow::anyhow!("semantic audit mapping count overflow"))?;
+        hasher.update(first.to_le_bytes());
+        hasher.update(last.to_le_bytes());
+        hasher.update(chunk_count.to_le_bytes());
+        update_snapshot_digest(&mut hasher, digest.as_bytes());
+    }
+    if count <= 0 {
+        bail!("semantic audit selected document has no final mappings");
+    }
+    Ok((count, bytes_to_hex(&hasher.finalize())))
+}
+
+fn advance_snapshot_documents(conn: &Connection, publish: &AuditSnapshotPublish) -> Result<()> {
+    let documents = {
+        let mut statement = conn.prepare(&format!(
+            "SELECT doc_id, rank, fingerprint_sha256, kind, column_key, normalized_text,
+                    cosine_score, rank_score
+             FROM _semantic_v2_audit_snapshot_stage_document
+             WHERE selection_id = ?1 AND rank > ?2 ORDER BY rank
+             LIMIT {V2_AUDIT_FINAL_DOCUMENT_BATCH}"
+        ))?;
+        let collected = statement
+            .query_map(params![publish.selection_id, publish.cursor_rank], |row| {
+                Ok(AuditSnapshotDocument {
+                    doc_id: row.get(0)?,
+                    rank: row.get(1)?,
+                    fingerprint_sha256: row.get(2)?,
+                    kind: row.get(3)?,
+                    column_key: row.get(4)?,
+                    normalized_text: row.get(5)?,
+                    cosine_score: row.get(6)?,
+                    rank_score: row.get(7)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        collected
+    };
+    if documents.is_empty() {
+        conn.execute(
+            "UPDATE _semantic_v2_audit_snapshot_publish
+             SET phase = 'mapping_chunks', updated_at = ?2 WHERE selection_id = ?1",
+            params![publish.selection_id, chrono::Utc::now().to_rfc3339()],
+        )?;
+        return Ok(());
+    }
+    let mut insert = conn.prepare(
         "INSERT INTO _semantic_v2_audit_snapshot_document (
             selection_id, rank, source_doc_id, fingerprint_sha256, kind, column_key,
             normalized_text, cosine_score, rank_score, mapping_count, mapping_sha256
          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
     )?;
-    for (document, mapping_count, document_mapping_sha256) in final_documents {
-        insert_document.execute(params![
-            stage.selection_id,
+    for document in &documents {
+        let (mapping_count, mapping_sha256) = stage_document_mapping_summary(
+            conn,
+            &publish.selection_id,
+            document.doc_id,
+            &document.fingerprint_sha256,
+        )?;
+        conn.execute(
+            "UPDATE _semantic_v2_audit_snapshot_stage_document
+             SET mapping_count = ?3, mapping_sha256 = ?4
+             WHERE selection_id = ?1 AND doc_id = ?2",
+            params![
+                publish.selection_id,
+                document.doc_id,
+                mapping_count,
+                mapping_sha256
+            ],
+        )?;
+        insert.execute(params![
+            publish.selection_id,
             document.rank,
             document.doc_id,
             document.fingerprint_sha256,
@@ -2510,20 +3231,95 @@ fn finalize_audit_snapshot(conn: &Connection, stage: &AuditSnapshotStage) -> Res
             document.cosine_score,
             document.rank_score,
             mapping_count,
-            document_mapping_sha256,
+            mapping_sha256,
         ])?;
     }
-    drop(insert_document);
-    let mut insert_row_chunk = conn.prepare(
-        "INSERT INTO _semantic_v2_audit_snapshot_row_chunk (
-            selection_id, chunk_index, first_row_num, last_row_num, row_count,
-            encoded_rows, chunk_sha256
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+    let cursor = documents.last().map(|document| document.rank).unwrap_or(0);
+    conn.execute(
+        "UPDATE _semantic_v2_audit_snapshot_publish
+         SET cursor_rank = ?2, documents_copied = documents_copied + ?3, updated_at = ?4
+         WHERE selection_id = ?1 AND phase = 'documents'",
+        params![
+            publish.selection_id,
+            cursor,
+            documents.len() as i64,
+            chrono::Utc::now().to_rfc3339()
+        ],
     )?;
-    for (chunk_index, first, last, count, encoded, digest) in row_chunks {
-        insert_row_chunk.execute(params![
-            stage.selection_id,
-            chunk_index,
+    Ok(())
+}
+
+fn validated_mapping_chunk(
+    first: i64,
+    last: i64,
+    count: i64,
+    encoded: &[u8],
+    stored_digest: &str,
+) -> Result<()> {
+    if encoded.is_empty() || encoded.len() > V2_AUDIT_ENCODED_CHUNK_MAX_BYTES {
+        bail!("semantic audit mapping chunk exceeds the export-safe byte limit");
+    }
+    let decoded = decode_sorted_positive_delta_varints(encoded)?;
+    if decoded.len() as i64 != count
+        || decoded.first().copied() != Some(first)
+        || decoded.last().copied() != Some(last)
+        || audit_snapshot_chunk_sha256("mapping", first, last, count, encoded) != stored_digest
+    {
+        bail!("semantic audit mapping chunk failed integrity validation");
+    }
+    Ok(())
+}
+
+fn advance_snapshot_mapping_chunks(
+    conn: &Connection,
+    publish: &AuditSnapshotPublish,
+) -> Result<()> {
+    let chunks = {
+        let mut statement = conn.prepare(&format!(
+            "SELECT chunk_index, doc_id, first_row_num, last_row_num, row_count,
+                    encoded_rows, chunk_sha256
+             FROM _semantic_v2_audit_snapshot_stage_mapping_chunk
+             WHERE selection_id = ?1 AND chunk_index > ?2 ORDER BY chunk_index
+             LIMIT {V2_AUDIT_FINAL_MAPPING_CHUNK_BATCH}"
+        ))?;
+        let collected = statement
+            .query_map(
+                params![publish.selection_id, publish.cursor_mapping_chunk],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, Vec<u8>>(5)?,
+                        row.get::<_, String>(6)?,
+                    ))
+                },
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        collected
+    };
+    if chunks.is_empty() {
+        conn.execute(
+            "UPDATE _semantic_v2_audit_snapshot_publish
+             SET phase = 'row_chunks', updated_at = ?2 WHERE selection_id = ?1",
+            params![publish.selection_id, chrono::Utc::now().to_rfc3339()],
+        )?;
+        return Ok(());
+    }
+    let mut insert = conn.prepare(
+        "INSERT INTO _semantic_v2_audit_snapshot_mapping_chunk (
+            selection_id, chunk_index, source_doc_id, first_row_num, last_row_num,
+            row_count, encoded_rows, chunk_sha256
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+    )?;
+    for (chunk, doc, first, last, count, encoded, digest) in &chunks {
+        validated_mapping_chunk(*first, *last, *count, encoded, digest)?;
+        insert.execute(params![
+            publish.selection_id,
+            chunk,
+            doc,
             first,
             last,
             count,
@@ -2531,24 +3327,270 @@ fn finalize_audit_snapshot(conn: &Connection, stage: &AuditSnapshotStage) -> Res
             digest,
         ])?;
     }
-    drop(insert_row_chunk);
+    let cursor = chunks.last().map(|chunk| chunk.0).unwrap_or(-1);
+    conn.execute(
+        "UPDATE _semantic_v2_audit_snapshot_publish
+         SET cursor_mapping_chunk = ?2,
+             mapping_chunks_copied = mapping_chunks_copied + ?3, updated_at = ?4
+         WHERE selection_id = ?1 AND phase = 'mapping_chunks'",
+        params![
+            publish.selection_id,
+            cursor,
+            chunks.len() as i64,
+            chrono::Utc::now().to_rfc3339()
+        ],
+    )?;
+    Ok(())
+}
 
-    for table in [
-        "_semantic_v2_audit_snapshot_stage_mapping_chunk",
-        "_semantic_v2_audit_snapshot_stage_row_chunk",
-        "_semantic_v2_audit_snapshot_stage_row",
-        "_semantic_v2_audit_snapshot_stage_document",
-        "_semantic_v2_audit_snapshot_stage",
-    ] {
+fn advance_snapshot_row_chunks(conn: &Connection, publish: &AuditSnapshotPublish) -> Result<()> {
+    let chunks = {
+        let mut statement = conn.prepare(&format!(
+            "SELECT chunk_index, first_row_num, last_row_num, row_count, encoded_rows,
+                    chunk_sha256
+             FROM _semantic_v2_audit_snapshot_stage_row_chunk
+             WHERE selection_id = ?1 AND chunk_index > ?2 ORDER BY chunk_index
+             LIMIT {V2_AUDIT_FINAL_ROW_CHUNK_BATCH}"
+        ))?;
+        let collected = statement
+            .query_map(
+                params![publish.selection_id, publish.cursor_row_chunk],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, Vec<u8>>(4)?,
+                        row.get::<_, String>(5)?,
+                    ))
+                },
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        collected
+    };
+    if chunks.is_empty() {
         conn.execute(
-            &format!(
-                "DELETE FROM {} WHERE selection_id = ?1",
-                db::quote_ident(table)
-            ),
-            [&stage.selection_id],
+            "UPDATE _semantic_v2_audit_snapshot_publish
+             SET phase = 'seal', updated_at = ?2 WHERE selection_id = ?1",
+            params![publish.selection_id, chrono::Utc::now().to_rfc3339()],
         )?;
+        return Ok(());
+    }
+    let mut insert = conn.prepare(
+        "INSERT INTO _semantic_v2_audit_snapshot_row_chunk (
+            selection_id, chunk_index, first_row_num, last_row_num, row_count,
+            encoded_rows, chunk_sha256
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+    )?;
+    for (chunk, first, last, count, encoded, digest) in &chunks {
+        if encoded.is_empty() || encoded.len() > V2_AUDIT_ENCODED_CHUNK_MAX_BYTES {
+            bail!("semantic audit row-set chunk exceeds the export-safe byte limit");
+        }
+        let decoded = decode_sorted_positive_delta_varints(encoded)?;
+        if decoded.len() as i64 != *count
+            || decoded.first().copied() != Some(*first)
+            || decoded.last().copied() != Some(*last)
+            || audit_snapshot_chunk_sha256("row-set", *first, *last, *count, encoded) != *digest
+        {
+            bail!("semantic audit row-set chunk failed integrity validation");
+        }
+        insert.execute(params![
+            publish.selection_id,
+            chunk,
+            first,
+            last,
+            count,
+            encoded,
+            digest,
+        ])?;
+    }
+    let cursor = chunks.last().map(|chunk| chunk.0).unwrap_or(-1);
+    conn.execute(
+        "UPDATE _semantic_v2_audit_snapshot_publish
+         SET cursor_row_chunk = ?2, row_chunks_copied = row_chunks_copied + ?3,
+             updated_at = ?4 WHERE selection_id = ?1 AND phase = 'row_chunks'",
+        params![
+            publish.selection_id,
+            cursor,
+            chunks.len() as i64,
+            chrono::Utc::now().to_rfc3339()
+        ],
+    )?;
+    Ok(())
+}
+
+fn seal_audit_snapshot(
+    conn: &Connection,
+    stage: &AuditSnapshotStage,
+    publish: &AuditSnapshotPublish,
+) -> Result<()> {
+    let source = load_audit_snapshot_source(conn, &stage.selection_id)?;
+    if source.build_id != stage.build_id {
+        bail!("semantic audit snapshot build identity changed; preserving live evidence");
+    }
+    let (document_count, mapping_total): (i64, i64) = conn.query_row(
+        "SELECT COUNT(*), COALESCE(SUM(mapping_count), 0)
+         FROM _semantic_v2_audit_snapshot_document WHERE selection_id = ?1",
+        [&stage.selection_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let (mapping_chunk_count, mapping_chunk_rows): (i64, i64) = conn.query_row(
+        "SELECT COUNT(*), COALESCE(SUM(row_count), 0)
+         FROM _semantic_v2_audit_snapshot_mapping_chunk WHERE selection_id = ?1",
+        [&stage.selection_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let (row_chunk_count, row_total): (i64, i64) = conn.query_row(
+        "SELECT COUNT(*), COALESCE(SUM(row_count), 0)
+         FROM _semantic_v2_audit_snapshot_row_chunk WHERE selection_id = ?1",
+        [&stage.selection_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    if document_count != source.documents_retained
+        || document_count != publish.documents_copied
+        || mapping_total != stage.mappings_seen
+        || mapping_chunk_rows != stage.mappings_seen
+        || mapping_chunk_count != publish.mapping_chunks_copied
+        || row_total != stage.rows_seen
+        || row_total != source.rows_matched
+        || row_chunk_count != publish.row_chunks_copied
+    {
+        bail!("semantic audit snapshot final counts failed seal validation");
+    }
+    let mut mapping_hasher = Sha256::new();
+    update_snapshot_digest(&mut mapping_hasher, V2_AUDIT_SNAPSHOT_VERSION.as_bytes());
+    update_snapshot_digest(&mut mapping_hasher, b"selected-document-mappings");
+    let documents = {
+        let mut statement = conn.prepare(
+            "SELECT rank, source_doc_id, fingerprint_sha256, mapping_count, mapping_sha256
+             FROM _semantic_v2_audit_snapshot_document
+             WHERE selection_id = ?1 ORDER BY rank",
+        )?;
+        let collected = statement
+            .query_map([&stage.selection_id], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        collected
+    };
+    for (rank, source_doc_id, fingerprint, stored_count, stored_digest) in documents {
+        let (actual_count, actual_digest) =
+            final_document_mapping_summary(conn, &stage.selection_id, source_doc_id, &fingerprint)?;
+        if actual_count != stored_count || actual_digest != stored_digest {
+            bail!("semantic audit per-document mapping digest failed seal validation");
+        }
+        mapping_hasher.update(rank.to_le_bytes());
+        update_snapshot_digest(&mut mapping_hasher, fingerprint.as_bytes());
+        mapping_hasher.update(actual_count.to_le_bytes());
+        update_snapshot_digest(&mut mapping_hasher, actual_digest.as_bytes());
+    }
+    let mapping_sha256 = bytes_to_hex(&mapping_hasher.finalize());
+    let mut row_hasher = Sha256::new();
+    update_snapshot_digest(&mut row_hasher, V2_AUDIT_SNAPSHOT_VERSION.as_bytes());
+    update_snapshot_digest(&mut row_hasher, V2_AUDIT_ROW_SET_ENCODING.as_bytes());
+    {
+        let mut statement = conn.prepare(
+            "SELECT chunk_index, first_row_num, last_row_num, row_count, chunk_sha256
+             FROM _semantic_v2_audit_snapshot_row_chunk
+             WHERE selection_id = ?1 ORDER BY chunk_index",
+        )?;
+        let mut rows = statement.query([&stage.selection_id])?;
+        while let Some(row) = rows.next()? {
+            let chunk: i64 = row.get(0)?;
+            let first: i64 = row.get(1)?;
+            let last: i64 = row.get(2)?;
+            let count: i64 = row.get(3)?;
+            let digest: String = row.get(4)?;
+            row_hasher.update(chunk.to_le_bytes());
+            row_hasher.update(first.to_le_bytes());
+            row_hasher.update(last.to_le_bytes());
+            row_hasher.update(count.to_le_bytes());
+            update_snapshot_digest(&mut row_hasher, digest.as_bytes());
+        }
+    }
+    let row_set_sha256 = bytes_to_hex(&row_hasher.finalize());
+    conn.execute(
+        "UPDATE _semantic_v2_audit_snapshot
+         SET mapping_sha256 = ?2, row_set_sha256 = ?3,
+             mapping_chunk_count = ?4, row_chunk_count = ?5,
+             sealed = 1, seal_version = ?6, archived_at = ?7
+         WHERE selection_id = ?1 AND sealed = 0",
+        params![
+            stage.selection_id,
+            mapping_sha256,
+            row_set_sha256,
+            mapping_chunk_count,
+            row_chunk_count,
+            V2_AUDIT_SEAL_VERSION,
+            chrono::Utc::now().to_rfc3339(),
+        ],
+    )?;
+    conn.execute(
+        "DELETE FROM _semantic_v2_audit_snapshot_publish WHERE selection_id = ?1",
+        [&stage.selection_id],
+    )?;
+    clear_audit_snapshot_stage(conn, &stage.selection_id)?;
+    let complete: bool = conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM _semantic_v2_audit_snapshot_complete WHERE selection_id = ?1
+         )",
+        [&stage.selection_id],
+        |row| row.get(0),
+    )?;
+    if !complete {
+        bail!("semantic audit snapshot seal did not produce a structurally complete archive");
     }
     Ok(())
+}
+
+fn advance_audit_snapshot_publish(
+    conn: &Connection,
+    stage: &AuditSnapshotStage,
+    publish: &AuditSnapshotPublish,
+) -> Result<bool> {
+    match publish.phase.as_str() {
+        "reset_documents" => advance_snapshot_reset_phase(
+            conn,
+            publish,
+            "_semantic_v2_audit_snapshot_document",
+            "rank",
+            V2_AUDIT_FINAL_DOCUMENT_BATCH,
+            "reset_mapping_chunks",
+        )?,
+        "reset_mapping_chunks" => advance_snapshot_reset_phase(
+            conn,
+            publish,
+            "_semantic_v2_audit_snapshot_mapping_chunk",
+            "chunk_index",
+            V2_AUDIT_FINAL_MAPPING_CHUNK_BATCH,
+            "reset_row_chunks",
+        )?,
+        "reset_row_chunks" => advance_snapshot_reset_phase(
+            conn,
+            publish,
+            "_semantic_v2_audit_snapshot_row_chunk",
+            "chunk_index",
+            V2_AUDIT_FINAL_ROW_CHUNK_BATCH,
+            "header",
+        )?,
+        "header" => write_unsealed_audit_snapshot_header(conn, stage)?,
+        "documents" => advance_snapshot_documents(conn, publish)?,
+        "mapping_chunks" => advance_snapshot_mapping_chunks(conn, publish)?,
+        "row_chunks" => advance_snapshot_row_chunks(conn, publish)?,
+        "seal" => {
+            seal_audit_snapshot(conn, stage, publish)?;
+            return Ok(true);
+        }
+        other => bail!("semantic audit snapshot has invalid publication phase {other}"),
+    }
+    Ok(false)
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
@@ -2577,6 +3619,39 @@ fn advance_required_audit_snapshot(conn: &Connection) -> Result<Option<RequiredA
             snapshot_completed: false,
         }));
     };
+    if let Some(publish) = load_audit_snapshot_publish(conn, &selection_id)? {
+        let sealed: bool = conn
+            .query_row(
+                "SELECT sealed FROM _semantic_v2_audit_snapshot WHERE selection_id = ?1",
+                [&selection_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or(false);
+        if sealed {
+            let valid_contents: bool = conn.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM _semantic_v2_audit_snapshot_sealed_contents
+                    WHERE selection_id = ?1
+                 )",
+                [&selection_id],
+                |row| row.get(0),
+            )?;
+            if !valid_contents {
+                bail!("sealed semantic audit snapshot is structurally incomplete");
+            }
+            conn.execute(
+                "DELETE FROM _semantic_v2_audit_snapshot_publish WHERE selection_id = ?1",
+                [&selection_id],
+            )?;
+            clear_audit_snapshot_stage(conn, &selection_id)?;
+            return Ok(Some(RequiredAuditSnapshotStep {
+                snapshot_completed: true,
+            }));
+        }
+        let snapshot_completed = advance_audit_snapshot_publish(conn, &stage, &publish)?;
+        return Ok(Some(RequiredAuditSnapshotStep { snapshot_completed }));
+    }
     let mut snapshot_completed = false;
     match stage.phase.as_str() {
         "mappings" => {
@@ -2584,8 +3659,7 @@ fn advance_required_audit_snapshot(conn: &Connection) -> Result<Option<RequiredA
         }
         "rows" => {
             if !advance_audit_snapshot_rows(conn, &stage)? {
-                finalize_audit_snapshot(conn, &stage)?;
-                snapshot_completed = true;
+                snapshot_completed = initialize_audit_snapshot_publish(conn, &stage)?;
             }
         }
         other => bail!("semantic audit snapshot has invalid stage phase {other}"),
@@ -2664,6 +3738,40 @@ pub fn complete_required_semantic_audits(
             bail!("semantic audit archival remained pending without making progress");
         }
     }
+}
+
+/// Reports whether the caller's existing SQLite read snapshot contains semantic evidence that
+/// still needs an immutable archive. This helper is deliberately read-only: report export calls
+/// it as the first read in a deferred transaction, so schema migration or archival must happen
+/// before that transaction starts.
+pub(crate) fn required_semantic_audits_pending(conn: &Connection) -> Result<bool> {
+    if !table_exists(conn, "_llm_parse_audit")?
+        || !table_exists(conn, "_semantic_v2_build")?
+        || !table_exists(conn, "_semantic_v2_selection")?
+    {
+        return Ok(false);
+    }
+
+    let archive_schema_ready: bool = conn.query_row(
+        "SELECT 5 = COUNT(*)
+         FROM sqlite_master
+         WHERE (type = 'table' AND name IN (
+                    '_semantic_v2_audit_snapshot_stage',
+                    '_semantic_v2_audit_snapshot_publish'
+                ))
+            OR (type = 'view' AND name IN (
+                    '_semantic_v2_audit_snapshot_complete',
+                    '_semantic_v2_audit_snapshot_legacy_union',
+                    '_semantic_v2_audit_snapshot_sealed_contents'
+                ))",
+        [],
+        |row| row.get(0),
+    )?;
+    if !archive_schema_ready {
+        bail!("semantic audit schema is not prepared for a read-only report snapshot");
+    }
+
+    Ok(pending_audit_snapshot_selection(conn)?.is_some())
 }
 
 /// Removes a bounded slice of superseded semantic artifacts after a current build is active.
@@ -4621,6 +5729,132 @@ mod tests {
         assert!(encode_sorted_positive_delta_varints(&[0]).is_err());
         assert!(decode_sorted_positive_delta_varints(&[0]).is_err());
         assert!(decode_sorted_positive_delta_varints(&[0x80]).is_err());
+
+        let sparse = (0..V2_AUDIT_MAPPING_BATCH)
+            .map(|index| 1 + index as i64 * (1i64 << 40))
+            .collect::<Vec<_>>();
+        let bounded = encode_bounded_sorted_row_chunks(&sparse).unwrap();
+        assert!(
+            bounded.len() > 1,
+            "sparse mappings should split by encoded bytes"
+        );
+        let mut round_trip = Vec::new();
+        for (start, end, encoded) in bounded {
+            assert!(!encoded.is_empty());
+            assert!(encoded.len() <= V2_AUDIT_ENCODED_CHUNK_MAX_BYTES);
+            assert!(encoded.len() * 2 <= 32_767);
+            assert_eq!(
+                decode_sorted_positive_delta_varints(&encoded).unwrap(),
+                sparse[start..end]
+            );
+            round_trip.extend_from_slice(&sparse[start..end]);
+        }
+        assert_eq!(round_trip, sparse);
+    }
+
+    #[test]
+    fn audit_schema_upgrade_repairs_same_name_triggers_and_preserves_legacy_union() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_semantic_v2_schema(&conn).unwrap();
+        conn.execute_batch(
+            "DROP TRIGGER _semantic_v2_audit_snapshot_no_insert;
+             DROP TRIGGER _semantic_v2_audit_snapshot_document_no_insert;
+             DROP TRIGGER _semantic_v2_audit_snapshot_row_no_insert;
+             DROP TRIGGER _semantic_v2_audit_snapshot_document_no_delete;
+             CREATE TRIGGER _semantic_v2_audit_snapshot_document_no_delete
+             BEFORE DELETE ON _semantic_v2_audit_snapshot_document
+             BEGIN
+                SELECT 1;
+             END;
+             INSERT INTO _semantic_v2_audit_snapshot (
+                selection_id, snapshot_version, build_id, dataset_hash, schema_hash,
+                index_version, normalizer_version, model_name, model_version, model_sha256,
+                tokenizer_sha256, config_sha256, query_sha256, policy_version, minimum_score,
+                maximum_documents, documents_above_threshold, documents_retained, rows_matched,
+                documents_truncated, broad_row_warning, warnings_json, source_rows,
+                index_rows_scanned, index_documents_seen, index_documents_embedded,
+                index_documents_mapped, index_mappings_written, index_documents_skipped,
+                index_mappings_skipped, index_cells_truncated, index_columns_omitted,
+                index_chunks_omitted, candidate_documents, candidate_mappings,
+                candidate_document_limit, candidate_mapping_limit, selected_document_count,
+                mapping_count, mapping_sha256, row_count, row_set_sha256, row_set_encoding,
+                mapping_chunk_count, row_chunk_count, sealed, seal_version,
+                selection_created_at, archived_at
+             ) VALUES (
+                'legacy-selection', 'semantic-audit-snapshot-v1', 7,
+                lower(hex(zeroblob(32))), lower(hex(zeroblob(32))),
+                'semantic-document-v3', 'dfir-cell-normalizer-v3', 'legacy-model',
+                'legacy-version', lower(hex(zeroblob(32))), lower(hex(zeroblob(32))),
+                lower(hex(zeroblob(32))), lower(hex(zeroblob(32))), 'legacy-policy', 0.25,
+                10, 1, 1, 1, 0, 0, '[]', 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0,
+                1, 1, 10, 10, 1, 1, lower(hex(zeroblob(32))), 1,
+                lower(hex(zeroblob(32))), 'sorted-positive-delta-varint-chunks-v1',
+                0, 0, 0, '', '2026-07-17T00:00:00Z', '2026-07-17T00:01:00Z'
+             );
+             INSERT INTO _semantic_v2_audit_snapshot_document (
+                selection_id, rank, source_doc_id, fingerprint_sha256, kind, column_key,
+                normalized_text, cosine_score, rank_score, mapping_count, mapping_sha256
+             ) VALUES (
+                'legacy-selection', 1, 99, lower(hex(zeroblob(32))), 'cell', 'message',
+                'legacy retained evidence', 0.8, 0.9, 1, lower(hex(zeroblob(32)))
+             );
+             INSERT INTO _semantic_v2_audit_snapshot_row_chunk (
+                selection_id, chunk_index, first_row_num, last_row_num, row_count,
+                encoded_rows, chunk_sha256
+             ) VALUES (
+                'legacy-selection', 0, 1, 1, 1, X'01', lower(hex(zeroblob(32)))
+             );",
+        )
+        .unwrap();
+
+        create_semantic_v2_schema(&conn).unwrap();
+
+        let legacy_visible: bool = conn
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM _semantic_v2_audit_snapshot_legacy_union
+                    WHERE selection_id = 'legacy-selection'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            legacy_visible,
+            "migration must not hide already-pruned v1 evidence"
+        );
+        let complete_visible: bool = conn
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM _semantic_v2_audit_snapshot_complete
+                    WHERE selection_id = 'legacy-selection'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            !complete_visible,
+            "legacy union evidence must never claim a v2 seal"
+        );
+
+        let repaired_sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master
+                 WHERE type = 'trigger'
+                   AND name = '_semantic_v2_audit_snapshot_document_no_delete'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(repaired_sql.contains(V2_AUDIT_SCHEMA_REVISION));
+        assert!(conn
+            .execute(
+                "DELETE FROM _semantic_v2_audit_snapshot_document
+                 WHERE selection_id = 'legacy-selection'",
+                [],
+            )
+            .is_err());
     }
 
     #[test]
@@ -5768,6 +7002,34 @@ mod tests {
             .flat_map(|chunk| decode_sorted_positive_delta_varints(chunk).unwrap())
             .collect::<Vec<_>>();
         assert_eq!(decoded_rows, vec![1, 2, 3, 5, 8]);
+        let exact_document_mappings = {
+            let mut statement = conn
+                .prepare(
+                    "SELECT source_doc_id, encoded_rows
+                     FROM _semantic_v2_audit_snapshot_mapping_chunk
+                     WHERE selection_id = ?1 ORDER BY source_doc_id, chunk_index",
+                )
+                .unwrap();
+            let mut rows = statement.query([&accepted_selection]).unwrap();
+            let mut mappings = BTreeMap::<i64, Vec<i64>>::new();
+            while let Some(row) = rows.next().unwrap() {
+                let doc_id: i64 = row.get(0).unwrap();
+                let encoded: Vec<u8> = row.get(1).unwrap();
+                mappings
+                    .entry(doc_id)
+                    .or_default()
+                    .extend(decode_sorted_positive_delta_varints(&encoded).unwrap());
+            }
+            mappings
+        };
+        assert_eq!(
+            exact_document_mappings.get(&accepted_doc_one).unwrap(),
+            &vec![1, 3, 5]
+        );
+        assert_eq!(
+            exact_document_mappings.get(&accepted_doc_two).unwrap(),
+            &vec![2, 3, 8]
+        );
 
         for selection_id in [&rejected_selection, &retrieval_selection] {
             let snapshotted: bool = conn
@@ -6057,6 +7319,65 @@ mod tests {
             .flat_map(|chunk| decode_sorted_positive_delta_varints(chunk).unwrap())
             .collect::<Vec<_>>();
         assert_eq!(decoded_rows, (1..=9_000).collect::<Vec<_>>());
+
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO _semantic_v2_audit_snapshot_stage (
+                selection_id, build_id, phase, started_at, updated_at
+             ) VALUES (?1, ?2, 'mappings', ?3, ?3)",
+            params![accepted.selection_id, active_build, now],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO _semantic_v2_audit_snapshot_publish (
+                selection_id, phase, started_at, updated_at
+             ) VALUES (?1, 'reset_documents', ?2, ?2)",
+            params![accepted.selection_id, now],
+        )
+        .unwrap();
+        assert!(conn
+            .execute(
+                "DELETE FROM _semantic_v2_audit_snapshot_document
+                 WHERE selection_id = ?1",
+                [&accepted.selection_id],
+            )
+            .is_err());
+        conn.execute(
+            "UPDATE _semantic_v2_audit_snapshot_publish
+             SET phase = 'reset_mapping_chunks' WHERE selection_id = ?1",
+            [&accepted.selection_id],
+        )
+        .unwrap();
+        assert!(conn
+            .execute(
+                "DELETE FROM _semantic_v2_audit_snapshot_mapping_chunk
+                 WHERE selection_id = ?1",
+                [&accepted.selection_id],
+            )
+            .is_err());
+        conn.execute(
+            "UPDATE _semantic_v2_audit_snapshot_publish
+             SET phase = 'seal' WHERE selection_id = ?1",
+            [&accepted.selection_id],
+        )
+        .unwrap();
+        assert!(conn
+            .execute(
+                "UPDATE _semantic_v2_audit_snapshot SET warnings_json = '[]'
+                 WHERE selection_id = ?1",
+                [&accepted.selection_id],
+            )
+            .is_err());
+        conn.execute(
+            "DELETE FROM _semantic_v2_audit_snapshot_publish WHERE selection_id = ?1",
+            [&accepted.selection_id],
+        )
+        .unwrap();
+        conn.execute(
+            "DELETE FROM _semantic_v2_audit_snapshot_stage WHERE selection_id = ?1",
+            [&accepted.selection_id],
+        )
+        .unwrap();
 
         for selection_id in [
             &unreviewed.selection_id,
