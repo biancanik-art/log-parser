@@ -257,6 +257,8 @@ where
         "prompt_template_version",
         "correlation_engine_version",
         "input_sha256",
+        "dataset_schema_sha256",
+        "dataset_import_sha256",
         "validation_status",
         "validation_detail",
         "generation_parameters_json",
@@ -268,33 +270,55 @@ where
     ];
     write_headers(worksheet, &headers)?;
     for column in 0..headers.len() as u16 {
-        worksheet.set_column_width(column, if column >= 14 { 60 } else { 24 })?;
+        worksheet.set_column_width(column, if column >= 16 { 60 } else { 24 })?;
     }
 
-    let mut stmt = conn.prepare(
+    let audit_columns = table_column_names(conn, "_llm_parse_audit")?;
+    let dataset_schema = optional_text_column_expression(&audit_columns, "dataset_schema_sha256");
+    let dataset_import = optional_text_column_expression(&audit_columns, "dataset_import_sha256");
+    let sql = format!(
         "SELECT id, created_at, examiner_decision, COALESCE(decided_at, ''),
                 provider, model_name, model_version, model_sha256, tokenizer_sha256,
                 prompt_template_version, correlation_engine_version, input_sha256,
+                {dataset_schema}, {dataset_import},
                 validation_status, COALESCE(validation_detail, ''),
                 generation_parameters_json, artifact_ids_json, raw_output,
                 trusted_intent_json, load_time_ms, inference_latency_ms
-         FROM _llm_parse_audit ORDER BY id",
-    )?;
+         FROM _llm_parse_audit ORDER BY id"
+    );
+    let mut stmt = conn.prepare(&sql)?;
     let mut rows = stmt.query([])?;
     let mut excel_row = 1u32;
     while let Some(row) = rows.next()? {
         worksheet.write_number(excel_row, 0, row.get::<_, i64>(0)? as f64)?;
-        for column in 1..18usize {
+        for column in 1..20usize {
             let value: String = row.get(column)?;
             write_cell_string(worksheet, excel_row, column as u16, &value)?;
         }
-        worksheet.write_number(excel_row, 18, row.get::<_, i64>(18)? as f64)?;
-        worksheet.write_number(excel_row, 19, row.get::<_, i64>(19)? as f64)?;
+        worksheet.write_number(excel_row, 20, row.get::<_, i64>(20)? as f64)?;
+        worksheet.write_number(excel_row, 21, row.get::<_, i64>(21)? as f64)?;
         excel_row += 1;
         *state.total_rows_written += 1;
     }
     (state.on_progress)(*state.total_rows_written, &sheet_name);
     Ok(sheet_name)
+}
+
+fn table_column_names(conn: &Connection, table_name: &str) -> Result<HashSet<String>> {
+    let sql = format!("PRAGMA table_info({})", db::quote_ident(table_name));
+    let mut statement = conn.prepare(&sql)?;
+    let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
+    columns
+        .collect::<rusqlite::Result<HashSet<_>>>()
+        .map_err(Into::into)
+}
+
+fn optional_text_column_expression(columns: &HashSet<String>, column_name: &str) -> String {
+    if columns.contains(column_name) {
+        format!("COALESCE({}, '')", db::quote_ident(column_name))
+    } else {
+        "''".to_string()
+    }
 }
 
 fn write_semantic_audit_sheet<F>(
@@ -1800,6 +1824,54 @@ mod tests {
         (conn, columns)
     }
 
+    fn create_llm_audit_fixture(conn: &Connection, with_dataset_identity: bool) {
+        conn.execute_batch(
+            "CREATE TABLE _llm_parse_audit (
+                id INTEGER PRIMARY KEY,
+                provider TEXT NOT NULL,
+                model_name TEXT NOT NULL,
+                model_version TEXT NOT NULL,
+                model_sha256 TEXT NOT NULL,
+                tokenizer_sha256 TEXT NOT NULL,
+                prompt_template_version TEXT NOT NULL,
+                correlation_engine_version TEXT NOT NULL,
+                artifact_ids_json TEXT NOT NULL,
+                input_sha256 TEXT NOT NULL,
+                generation_parameters_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                load_time_ms INTEGER NOT NULL,
+                inference_latency_ms INTEGER NOT NULL,
+                raw_output TEXT NOT NULL,
+                validation_status TEXT NOT NULL,
+                validation_detail TEXT,
+                trusted_intent_json TEXT NOT NULL,
+                examiner_decision TEXT NOT NULL,
+                decided_at TEXT
+             );
+             INSERT INTO _llm_parse_audit VALUES (
+                42, 'local-candle', 'Qwen2.5-1.5B-Instruct', 'Q4_K_M@revision',
+                'model-hash', 'tokenizer-hash', 'guided-intent-v2',
+                'intel-library:test;matcher:v1',
+                '{\"techniqueIds\":[\"T1003.001\"]}', 'input-hash',
+                '{\"strategy\":\"greedy_argmax\"}', '2026-07-16T00:00:00Z',
+                2945, 13182, '=untrusted model text', 'validated', NULL,
+                '{\"intent\":\"techniqueTimeline\"}', 'accepted',
+                '2026-07-16T00:01:00Z'
+             );",
+        )
+        .unwrap();
+        if with_dataset_identity {
+            conn.execute_batch(
+                "ALTER TABLE _llm_parse_audit ADD COLUMN dataset_schema_sha256 TEXT;
+                 ALTER TABLE _llm_parse_audit ADD COLUMN dataset_import_sha256 TEXT;
+                 UPDATE _llm_parse_audit
+                 SET dataset_schema_sha256 = 'dataset-schema-hash',
+                     dataset_import_sha256 = 'dataset-import-hash';",
+            )
+            .unwrap();
+        }
+    }
+
     fn temp_report_path(name: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "log-parser-report-test-{}-{name}",
@@ -2111,41 +2183,7 @@ mod tests {
     #[test]
     fn report_export_writes_complete_ai_and_semantic_audit_sheets() {
         let (conn, columns) = setup_report_fixture(true);
-        conn.execute_batch(
-            "CREATE TABLE _llm_parse_audit (
-                id INTEGER PRIMARY KEY,
-                provider TEXT NOT NULL,
-                model_name TEXT NOT NULL,
-                model_version TEXT NOT NULL,
-                model_sha256 TEXT NOT NULL,
-                tokenizer_sha256 TEXT NOT NULL,
-                prompt_template_version TEXT NOT NULL,
-                correlation_engine_version TEXT NOT NULL,
-                artifact_ids_json TEXT NOT NULL,
-                input_sha256 TEXT NOT NULL,
-                generation_parameters_json TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                load_time_ms INTEGER NOT NULL,
-                inference_latency_ms INTEGER NOT NULL,
-                raw_output TEXT NOT NULL,
-                validation_status TEXT NOT NULL,
-                validation_detail TEXT,
-                trusted_intent_json TEXT NOT NULL,
-                examiner_decision TEXT NOT NULL,
-                decided_at TEXT
-             );
-             INSERT INTO _llm_parse_audit VALUES (
-                42, 'local-candle', 'Qwen2.5-1.5B-Instruct', 'Q4_K_M@revision',
-                'model-hash', 'tokenizer-hash', 'guided-intent-v2',
-                'intel-library:test;matcher:v1',
-                '{\"techniqueIds\":[\"T1003.001\"]}', 'input-hash',
-                '{\"strategy\":\"greedy_argmax\"}', '2026-07-16T00:00:00Z',
-                2945, 13182, '=untrusted model text', 'validated', NULL,
-                '{\"intent\":\"techniqueTimeline\"}', 'accepted',
-                '2026-07-16T00:01:00Z'
-             );",
-        )
-        .unwrap();
+        create_llm_audit_fixture(&conn, true);
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS _semantic_v2_audit_snapshot (
                 selection_id INTEGER PRIMARY KEY,
@@ -2273,14 +2311,18 @@ mod tests {
         let rows: Vec<_> = audit.rows().collect();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0][0].to_string(), "audit_id");
-        assert_eq!(rows[0][19].to_string(), "inference_latency_ms");
+        assert_eq!(rows[0][12].to_string(), "dataset_schema_sha256");
+        assert_eq!(rows[0][13].to_string(), "dataset_import_sha256");
+        assert_eq!(rows[0][21].to_string(), "inference_latency_ms");
         assert_eq!(cell_to_i64(&rows[1][0]), 42);
         assert_eq!(rows[1][2].to_string(), "accepted");
         assert_eq!(rows[1][4].to_string(), "local-candle");
         assert_eq!(rows[1][5].to_string(), "Qwen2.5-1.5B-Instruct");
-        assert_eq!(rows[1][16].to_string(), "=untrusted model text");
-        assert_eq!(cell_to_i64(&rows[1][18]), 2945);
-        assert_eq!(cell_to_i64(&rows[1][19]), 13182);
+        assert_eq!(rows[1][12].to_string(), "dataset-schema-hash");
+        assert_eq!(rows[1][13].to_string(), "dataset-import-hash");
+        assert_eq!(rows[1][18].to_string(), "=untrusted model text");
+        assert_eq!(cell_to_i64(&rows[1][20]), 2945);
+        assert_eq!(cell_to_i64(&rows[1][21]), 13182);
 
         let semantic = workbook.worksheet_range("Semantic Audit").unwrap();
         let semantic_rows: Vec<_> = semantic.rows().collect();
@@ -2332,6 +2374,30 @@ mod tests {
             "00017fff"
         );
         assert_eq!(row_chunk[column("chunk_sha256")].to_string(), "chunk-hash");
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn ai_audit_dataset_identity_columns_are_blank_for_legacy_tables() {
+        let (conn, columns) = setup_report_fixture(false);
+        create_llm_audit_fixture(&conn, false);
+        let path = temp_report_path("legacy-ai-audit");
+
+        let summary = export_report(&conn, &columns, &path, |_, _| {}).unwrap();
+        assert_eq!(summary.sheets_written, vec!["General", "AI Audit"]);
+
+        let mut workbook = calamine::open_workbook_auto(&path).unwrap();
+        let audit = workbook.worksheet_range("AI Audit").unwrap();
+        let rows: Vec<_> = audit.rows().collect();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0][12].to_string(), "dataset_schema_sha256");
+        assert_eq!(rows[0][13].to_string(), "dataset_import_sha256");
+        assert_eq!(rows[1][12].to_string(), "");
+        assert_eq!(rows[1][13].to_string(), "");
+        assert_eq!(rows[1][18].to_string(), "=untrusted model text");
+        assert_eq!(cell_to_i64(&rows[1][20]), 2945);
+        assert_eq!(cell_to_i64(&rows[1][21]), 13182);
 
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
