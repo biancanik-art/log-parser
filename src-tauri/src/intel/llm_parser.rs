@@ -707,11 +707,17 @@ fn timestamp_candidates(
     for column in columns {
         let mut score: u16 = 0;
         let inferred_timestamp = column.inferred_type.eq_ignore_ascii_case("timestamp");
-        if inferred_timestamp {
-            score += 420;
-        }
         let (header_score, strong_header) = timestamp_header_signal(column);
         score = score.saturating_add(header_score);
+        // `ColumnMeta::inferred_type` currently comes from a permissive UI hint that uses
+        // substring matching. On real imports that labels headers such as Runtime and Update as
+        // timestamps. Never let that hint qualify a candidate by itself; it may only
+        // strengthen a boundary-aware temporal header signal. Strong headers already cross the
+        // threshold, while an exact weak header such as Time or Date needs this corroboration.
+        let inferred_header_supported = inferred_timestamp && header_score > 0;
+        if inferred_header_supported && !strong_header {
+            score = score.saturating_add(230);
+        }
         let mut suggested_role = false;
         if let Some((sql_name, confidence, status)) = &suggested {
             if sql_name == &column.sql_name {
@@ -747,7 +753,9 @@ fn timestamp_candidates(
         if !values.is_empty() {
             score = score.saturating_add(((valid * 450) / values.len()) as u16);
         }
-        if score >= 400 && (valid > 0 || inferred_timestamp || strong_header || suggested_role) {
+        if score >= 400
+            && (valid > 0 || inferred_header_supported || strong_header || suggested_role)
+        {
             candidates.push(TimelineCandidate {
                 column: column.sql_name.clone(),
                 original_name: bounded_text(&column.original_name, 128, &column.sql_name),
@@ -2883,6 +2891,48 @@ mod tests {
             rows.last().unwrap()[0].chars().count(),
             MAX_DATABASE_SAMPLE_CHARS
         );
+    }
+
+    #[test]
+    fn production_header_inference_cannot_promote_substring_false_timestamps() {
+        let columns = crate::header_utils::sanitize_headers(&[
+            "Runtime".into(),
+            "Estimate".into(),
+            "Update".into(),
+            "TimeGenerated".into(),
+            "EventDate".into(),
+            "Date".into(),
+        ]);
+        // Exercise the production mismatch explicitly: the UI-oriented import heuristic labels
+        // Runtime and Update as timestamps through substring collisions. Estimate is a nearby
+        // negative that must remain out of the candidate set regardless of its current UI hint.
+        assert_eq!(columns[0].inferred_type, "timestamp");
+        assert_eq!(columns[1].inferred_type, "text");
+        assert_eq!(columns[2].inferred_type, "timestamp");
+        assert!(columns[3..]
+            .iter()
+            .all(|column| column.inferred_type == "timestamp"));
+
+        let conn = Connection::open_in_memory().unwrap();
+        db::create_schema(&conn, &columns).unwrap();
+        let candidates = timestamp_candidates(&conn, &columns).unwrap();
+        let names = candidates
+            .iter()
+            .map(|candidate| candidate.column.as_str())
+            .collect::<HashSet<_>>();
+
+        for false_positive in ["runtime", "estimate", "update"] {
+            assert!(
+                !names.contains(false_positive),
+                "substring-only import hint promoted {false_positive}"
+            );
+        }
+        for real_timestamp in ["timegenerated", "eventdate", "date"] {
+            assert!(
+                names.contains(real_timestamp),
+                "boundary-aware timestamp header omitted {real_timestamp}"
+            );
+        }
     }
 
     #[test]
