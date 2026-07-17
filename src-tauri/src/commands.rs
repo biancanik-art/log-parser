@@ -124,7 +124,7 @@ impl SemanticPreviewOutcome {
             used: false,
             code,
             message: format!(
-                "Semantic matching was not used: {} Exact and structured conditions remain available in this preview.",
+                "Semantic matching was not used: {} Exact and structured search remains available.",
                 compact_diagnostic(reason.as_ref())
             ),
             selection_id: None,
@@ -1326,7 +1326,7 @@ mod tests {
             .contains("selection belongs to a superseded build"));
         assert!(fallback
             .message
-            .contains("Exact and structured conditions remain available"));
+            .contains("Exact and structured search remains available"));
 
         let mut attempts = 0;
         let preview = plan_with_prevalidated_semantic_selection(
