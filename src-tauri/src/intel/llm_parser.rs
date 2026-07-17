@@ -484,6 +484,7 @@ fn select_prompt_columns(
         .iter()
         .map(String::as_str)
         .collect::<HashSet<_>>();
+    let quoted_column_references = unique_quoted_column_references(query_text, columns);
     let mut original_name_counts = HashMap::<Vec<String>, usize>::new();
     for column in columns {
         if let Some(tokens) = column_reference_tokens(&column.original_name) {
@@ -540,7 +541,9 @@ fn select_prompt_columns(
             PromptColumnRank {
                 column,
                 source_position,
-                explicitly_referenced: sql_name_referenced || original_name_referenced,
+                explicitly_referenced: sql_name_referenced
+                    || original_name_referenced
+                    || quoted_column_references.contains(&source_position),
                 recommended_timeline: recommended_timeline_column
                     .is_some_and(|name| name == column.sql_name),
                 relevance_score,
@@ -952,12 +955,30 @@ struct QueryToken {
     segment: usize,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct QuotedSpan {
+    opening_index: usize,
+    content_start: usize,
+    content_end: usize,
+    closing_end: usize,
+    opening: char,
+    closing: char,
+}
+
 /// Returns the byte ranges inside paired quotes. Quoted evidence is treated as an exact literal:
 /// it is deliberately excluded from ordinary token grounding so the model cannot change its
 /// case, punctuation, or leading/trailing whitespace.
 fn quoted_literal_ranges(value: &str) -> Vec<(usize, usize)> {
+    quoted_spans(value)
+        .into_iter()
+        .filter(|span| span.content_start < span.content_end)
+        .map(|span| (span.content_start, span.content_end))
+        .collect()
+}
+
+fn quoted_spans(value: &str) -> Vec<QuotedSpan> {
     let characters = value.char_indices().collect::<Vec<_>>();
-    let mut ranges = Vec::new();
+    let mut spans = Vec::new();
     let mut position = 0usize;
     while position < characters.len() {
         let (opening_index, opening) = characters[position];
@@ -987,6 +1008,16 @@ fn quoted_literal_ranges(value: &str) -> Vec<(usize, usize)> {
         while closing_position < characters.len() {
             let (closing_index, candidate) = characters[closing_position];
             if candidate == closing && !quote_is_escaped(value, closing_index) {
+                // SQL-style doubled delimiters represent one delimiter inside a quoted value.
+                // Skip the complete pair and continue looking for the actual closing delimiter.
+                if opening == closing
+                    && characters
+                        .get(closing_position + 1)
+                        .is_some_and(|(_, next)| *next == closing)
+                {
+                    closing_position += 2;
+                    continue;
+                }
                 let next_is_alphanumeric = characters
                     .get(closing_position + 1)
                     .is_some_and(|(_, character)| character.is_alphanumeric());
@@ -1002,12 +1033,17 @@ fn quoted_literal_ranges(value: &str) -> Vec<(usize, usize)> {
             continue;
         };
         let content_start = opening_index + opening.len_utf8();
-        if content_start < closing_index {
-            ranges.push((content_start, closing_index));
-        }
+        spans.push(QuotedSpan {
+            opening_index,
+            content_start,
+            content_end: closing_index,
+            closing_end: closing_index + closing.len_utf8(),
+            opening,
+            closing,
+        });
         position = closing_position + 1;
     }
-    ranges
+    spans
 }
 
 fn quote_is_escaped(value: &str, quote_index: usize) -> bool {
@@ -1018,6 +1054,122 @@ fn quote_is_escaped(value: &str, quote_index: usize) -> bool {
         .count()
         % 2
         == 1
+}
+
+fn unique_quoted_column_references(query_text: &str, columns: &[ColumnMeta]) -> HashSet<usize> {
+    let spans = quoted_spans(query_text);
+    if spans.is_empty() {
+        return HashSet::new();
+    }
+    let literal_ranges = spans
+        .iter()
+        .filter(|span| span.content_start < span.content_end)
+        .map(|span| (span.content_start, span.content_end))
+        .collect::<Vec<_>>();
+    let unquoted_tokens = lexical_tokens(query_text, &literal_ranges);
+    let mut referenced = HashSet::new();
+
+    for span in spans {
+        if !quoted_span_has_column_syntax(query_text, span, &unquoted_tokens) {
+            continue;
+        }
+        let Some(name) = decode_quoted_identifier(query_text, span) else {
+            continue;
+        };
+        let matches = columns
+            .iter()
+            .enumerate()
+            .filter(|(_, column)| column.sql_name == name || column.original_name == name)
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        if let [index] = matches.as_slice() {
+            referenced.insert(*index);
+        }
+    }
+    referenced
+}
+
+fn quoted_span_has_column_syntax(
+    query_text: &str,
+    span: QuotedSpan,
+    unquoted_tokens: &[QueryToken],
+) -> bool {
+    let previous = unquoted_tokens
+        .iter()
+        .rposition(|token| token.end <= span.opening_index);
+    let preceded_by_identifier_syntax = previous.is_some_and(|index| {
+        let token = unquoted_tokens[index].normalized.as_str();
+        matches!(token, "column" | "field" | "filter")
+            || (matches!(token, "by" | "named")
+                && index.checked_sub(1).is_some_and(|prior| {
+                    matches!(
+                        unquoted_tokens[prior].normalized.as_str(),
+                        "column" | "field" | "filter" | "sort" | "order"
+                    )
+                }))
+    });
+    if preceded_by_identifier_syntax {
+        return true;
+    }
+
+    let following = unquoted_tokens
+        .iter()
+        .position(|token| token.start >= span.closing_end)
+        .map_or(&[][..], |index| &unquoted_tokens[index..]);
+    if token_sequence_starts_comparison(following) {
+        return true;
+    }
+    let suffix = query_text
+        .get(span.closing_end..)
+        .unwrap_or_default()
+        .trim_start();
+    suffix.starts_with('=')
+        || suffix.starts_with('<')
+        || suffix.starts_with('>')
+        || suffix.starts_with("!=")
+}
+
+fn token_sequence_starts_comparison(tokens: &[QueryToken]) -> bool {
+    let token = |index: usize| tokens.get(index).map(|value| value.normalized.as_str());
+    match token(0) {
+        Some(
+            "contains" | "containing" | "endswith" | "equals" | "isempty" | "isnotempty"
+            | "matches" | "matching" | "notcontains" | "notequals" | "startswith",
+        ) => true,
+        Some("equal") => token(1) == Some("to"),
+        Some("starts" | "ends") => token(1) == Some("with"),
+        Some("greater" | "less") => token(1) == Some("than"),
+        Some("not") => matches!(token(1), Some("contains" | "equal" | "equals" | "matching")),
+        // Natural-language equality such as `"Status" is failed` is column comparison syntax.
+        Some("is") => true,
+        _ => false,
+    }
+}
+
+fn decode_quoted_identifier(query_text: &str, span: QuotedSpan) -> Option<String> {
+    let content = query_text.get(span.content_start..span.content_end)?;
+    let mut output = String::with_capacity(content.len());
+    let mut characters = content.chars().peekable();
+    while let Some(character) = characters.next() {
+        if character == '\\' {
+            if characters.peek().is_some_and(|next| {
+                matches!(*next, '\\') || *next == span.opening || *next == span.closing
+            }) {
+                output.push(characters.next()?);
+            } else {
+                output.push(character);
+            }
+        } else if span.opening == span.closing
+            && character == span.closing
+            && characters.peek() == Some(&span.closing)
+        {
+            output.push(character);
+            characters.next();
+        } else {
+            output.push(character);
+        }
+    }
+    Some(output)
 }
 
 fn lexical_tokens(value: &str, quoted_ranges: &[(usize, usize)]) -> Vec<QueryToken> {
@@ -2933,6 +3085,84 @@ mod tests {
                 "boundary-aware timestamp header omitted {real_timestamp}"
             );
         }
+    }
+
+    #[test]
+    fn quoted_column_syntax_pins_only_unique_exact_wide_table_identifiers() {
+        let timeline_candidates = vec![TimelineCandidate {
+            column: "late_timestamp".into(),
+            original_name: "Late Timestamp".into(),
+            score: 900,
+            explicit_or_epoch_samples: 1,
+            naive_samples: 0,
+        }];
+        let columns = wide_columns(220);
+
+        for (query, expected) in [
+            (r#"filter "Opaque Header" contains alpha"#, "late_sql_only"),
+            (r#""Opaque Header" contains alpha"#, "late_sql_only"),
+            ("filter `tail_signal` equals tail", "tail_signal"),
+        ] {
+            let selected = select_prompt_columns(
+                &columns,
+                query,
+                &timeline_candidates,
+                Some("late_timestamp"),
+            )
+            .unwrap();
+            assert!(selected.iter().any(|selected| {
+                selected.column.sql_name == expected && selected.required_for_prompt
+            }));
+        }
+
+        // A quoted evidence literal that happens to equal a column name is not identifier syntax
+        // and therefore cannot consume a required slot in a bounded catalog.
+        let pasted = select_prompt_columns(
+            &columns,
+            r#"find pasted evidence "late_sql_only""#,
+            &timeline_candidates,
+            Some("late_timestamp"),
+        )
+        .unwrap();
+        assert!(!pasted.iter().any(|selected| {
+            selected.column.sql_name == "late_sql_only" && selected.required_for_prompt
+        }));
+
+        let mut escaped_columns = columns.clone();
+        escaped_columns[219].original_name = "Analyst \"Flag\"".into();
+        for query in [
+            r#"filter "Analyst \"Flag\"" equals tail"#,
+            r#"filter "Analyst ""Flag""" equals tail"#,
+        ] {
+            let selected = select_prompt_columns(
+                &escaped_columns,
+                query,
+                &timeline_candidates,
+                Some("late_timestamp"),
+            )
+            .unwrap();
+            assert!(selected.iter().any(|selected| {
+                selected.column.sql_name == "tail_signal" && selected.required_for_prompt
+            }));
+        }
+
+        // Duplicate display names remain ambiguous; the examiner must use either unique SQL name.
+        let mut duplicate_columns = columns.clone();
+        duplicate_columns[217].original_name = "Duplicate Header".into();
+        duplicate_columns[219].original_name = "Duplicate Header".into();
+        let ambiguous = select_prompt_columns(
+            &duplicate_columns,
+            r#"column "Duplicate Header" equals alpha"#,
+            &timeline_candidates,
+            Some("late_timestamp"),
+        )
+        .unwrap();
+        assert!(!ambiguous.iter().any(|selected| {
+            matches!(
+                selected.column.sql_name.as_str(),
+                "late_sql_only" | "tail_signal"
+            ) && selected.required_for_prompt
+        }));
     }
 
     #[test]
