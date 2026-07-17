@@ -400,6 +400,8 @@ fn classify_columns(conn: &Connection, columns: &[ColumnMeta]) -> Result<Vec<Col
     struct Stats {
         nonempty: usize,
         dynamic: usize,
+        total_chars: usize,
+        total_words: usize,
         distinct: HashSet<String>,
     }
     let identifiers = columns
@@ -421,6 +423,8 @@ fn classify_columns(conn: &Connection, columns: &[ColumnMeta]) -> Result<Vec<Col
                 continue;
             };
             stat.nonempty += 1;
+            stat.total_chars += value.chars().count();
+            stat.total_words += value.split_whitespace().count();
             if value_is_dynamic_identifier(value) {
                 stat.dynamic += 1;
             }
@@ -445,6 +449,12 @@ fn classify_columns(conn: &Connection, columns: &[ColumnMeta]) -> Result<Vec<Col
             } else {
                 stat.dynamic as f64 / stat.nonempty as f64
             };
+            let average_chars = stat.total_chars as f64 / stat.nonempty.max(1) as f64;
+            let average_words = stat.total_words as f64 / stat.nonempty.max(1) as f64;
+            let high_cardinality_entity = stat.nonempty >= 16
+                && distinct_ratio >= 0.80
+                && average_chars <= 128.0
+                && average_words <= 3.0;
             // Strong free-text headers correct weak importer type inference (for example, a
             // Description column once misclassified as IP). Explicit identifier/timestamp/hash
             // names still win for ambiguous names such as ProcessId.
@@ -452,7 +462,7 @@ fn classify_columns(conn: &Connection, columns: &[ColumnMeta]) -> Result<Vec<Col
                 ColumnMode::Text
             } else if exact_only_header(column) {
                 ColumnMode::ExactOnly
-            } else if stat.nonempty >= 16 && dynamic_ratio >= 0.80 {
+            } else if stat.nonempty >= 16 && (dynamic_ratio >= 0.80 || high_cardinality_entity) {
                 ColumnMode::ExactOnly
             } else if stat.distinct.len() <= 128 || distinct_ratio <= 0.10 {
                 ColumnMode::Categorical
@@ -919,7 +929,17 @@ where
     let dataset_hash = semantic_dataset_hash(conn, columns)?;
     let schema_hash = semantic_schema_hash(columns);
     if let Some((build_id, _, _, _)) = active_v2_build(conn, &dataset_hash, &schema_hash)? {
-        return build_summary(conn, build_id, started, true, false, false);
+        let summary = build_summary(conn, build_id, started, true, false, false)?;
+        on_progress(SemanticBuildProgress {
+            build_id,
+            phase: "ready".to_string(),
+            rows_scanned: summary.rows_indexed,
+            rows_total,
+            documents_embedded: summary.documents_indexed,
+            mappings_written: summary.mappings_written,
+            resumed_from_row: summary.rows_indexed,
+        });
+        return Ok(summary);
     }
 
     let (build_id, mut cursor, plans, resumed) =
@@ -1865,6 +1885,33 @@ mod tests {
     }
 
     #[test]
+    fn v2_classifier_keeps_unknown_high_cardinality_entities_exact_only() {
+        let conn = Connection::open_in_memory().unwrap();
+        let columns = vec![
+            text_column("principal", "Principal", 0),
+            text_column("details", "Event Description", 1),
+        ];
+        db::create_schema(&conn, &columns).unwrap();
+        for index in 0..32 {
+            conn.execute(
+                "INSERT INTO rows(row_num, principal, details) VALUES (?1, ?2, ?3)",
+                params![
+                    index as i64 + 1,
+                    format!("user{}", alphabetic_id(index as usize)),
+                    format!(
+                        "investigator narrative describes credential access variant {} in detail",
+                        alphabetic_id(index as usize)
+                    )
+                ],
+            )
+            .unwrap();
+        }
+        let plans = classify_columns(&conn, &columns).unwrap();
+        assert_eq!(plans[0].mode, ColumnMode::ExactOnly);
+        assert_eq!(plans[1].mode, ColumnMode::Text);
+    }
+
+    #[test]
     fn v2_selection_expands_every_mapping_beyond_legacy_row_caps() {
         let mut conn = Connection::open_in_memory().unwrap();
         let columns = message_columns();
@@ -1943,6 +1990,23 @@ mod tests {
         assert_eq!(ready.phase, "ready");
         assert_eq!(ready.documents_embedded, 1);
         assert_eq!(ready.mappings_written, 600);
+
+        let cached_progress = Arc::new(Mutex::new(Vec::<SemanticBuildProgress>::new()));
+        let cached_sink = Arc::clone(&cached_progress);
+        let cached = ensure_semantic_index_v2(
+            &mut conn,
+            &columns,
+            &embedder,
+            || false,
+            move |update| cached_sink.lock().unwrap().push(update),
+        )
+        .unwrap();
+        assert!(cached.from_cache);
+        let cached_ready = cached_progress.lock().unwrap().last().unwrap().clone();
+        assert_eq!(cached_ready.phase, "ready");
+        assert_eq!(cached_ready.rows_scanned, 600);
+        assert_eq!(cached_ready.documents_embedded, 1);
+        assert_eq!(cached_ready.mappings_written, 600);
     }
 
     #[test]
