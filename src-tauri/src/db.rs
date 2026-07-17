@@ -1,16 +1,56 @@
 use anyhow::{Context, Result};
-use rusqlite::Connection;
+use rusqlite::{Connection, TransactionBehavior};
 use serde::{Deserialize, Serialize};
-use std::collections::hash_map::DefaultHasher;
+use std::collections::{hash_map::DefaultHasher, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// All production connections to an imported cache use the same bounded wait when another
 /// background task is publishing a short SQLite write transaction. Keeping this here (rather
 /// than in individual features) prevents semantic indexing, timestamp normalization, and audit
 /// writes from failing immediately merely because their batch commits overlap.
 pub const CACHE_BUSY_TIMEOUT: Duration = Duration::from_secs(3);
+const ROW_TIME_SCAVENGE_TABLE_LIMIT: usize = 4;
+const ROW_TIME_SCAVENGE_ROW_LIMIT: i64 = 32_768;
+const ROW_TIME_MAX_LIVE_OPERATIONS: usize = 32;
+static ROW_TIME_OPERATION_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug)]
+pub struct RowTimeOperationClaim {
+    generation: i64,
+    owner_token: String,
+    owner_session: String,
+    stage_name: String,
+}
+
+impl RowTimeOperationClaim {
+    pub fn generation(&self) -> i64 {
+        self.generation
+    }
+
+    pub fn owner_token(&self) -> &str {
+        &self.owner_token
+    }
+
+    pub fn owner_session(&self) -> &str {
+        &self.owner_session
+    }
+
+    pub fn stage_name(&self) -> &str {
+        &self.stage_name
+    }
+}
+
+impl Drop for RowTimeOperationClaim {
+    fn drop(&mut self) {
+        if let Ok(mut live) = live_row_time_operation_tokens().lock() {
+            live.remove(&self.owner_token);
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -98,9 +138,186 @@ pub fn cache_db_path(source_path: &Path, sheet: &str) -> Result<PathBuf> {
     Ok(cache_dir()?.join(format!("{key}_{slug}.sqlite3")))
 }
 
+fn row_time_process_session() -> &'static str {
+    static SESSION: OnceLock<String> = OnceLock::new();
+    SESSION.get_or_init(|| {
+        let started = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        format!("{}-{started}", std::process::id())
+    })
+}
+
+fn live_row_time_operation_tokens() -> &'static Mutex<HashSet<String>> {
+    static TOKENS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    TOKENS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn row_time_recovery_busy(message: impl Into<String>) -> rusqlite::Error {
+    rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+        Some(message.into()),
+    )
+}
+
+fn sqlite_table_exists(conn: &Connection, table: &str) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+        [table],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|value| value != 0)
+}
+
+fn row_time_cleanup_candidates(
+    conn: &Connection,
+    preserved: &HashSet<String>,
+    limit: usize,
+) -> rusqlite::Result<Vec<String>> {
+    let preserved = preserved.iter().cloned().collect::<Vec<_>>();
+    let exclusions = if preserved.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " AND name NOT IN ({})",
+            (1..=preserved.len())
+                .map(|index| format!("?{index}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    let sql = format!(
+        "SELECT name FROM sqlite_master
+         WHERE type = 'table'
+           AND (name GLOB '_row_time_stage_*'
+                OR name GLOB '_row_time_previous_*')
+           {exclusions}
+         ORDER BY name
+         LIMIT {limit}"
+    );
+    let mut statement = conn.prepare(&sql)?;
+    let rows = statement.query_map(rusqlite::params_from_iter(preserved.iter()), |row| {
+        row.get::<_, String>(0)
+    })?;
+    let names = rows.collect();
+    names
+}
+
+/// Reclaims timestamp staging objects left by a crashed/panicked operation. The work per open is
+/// deliberately capped. If the cap cannot finish recovery, the open fails explicitly after
+/// committing bounded progress; retrying continues cleanup instead of silently retaining an
+/// unbounded cache. Live operations in this process are excluded by persisted token + registry.
+fn scavenge_abandoned_row_time_objects(conn: &mut Connection) -> rusqlite::Result<()> {
+    let has_candidates: bool = conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM sqlite_master
+            WHERE type = 'table'
+              AND (name GLOB '_row_time_stage_*'
+                   OR name GLOB '_row_time_previous_*')
+         )",
+        [],
+        |row| row.get::<_, i64>(0),
+    )? != 0;
+    let has_operations = sqlite_table_exists(conn, "_row_time_operation")?;
+    if !has_candidates && !has_operations {
+        return Ok(());
+    }
+
+    let live_tokens = live_row_time_operation_tokens()
+        .lock()
+        .map_err(|_| row_time_recovery_busy("timestamp operation registry is unavailable"))?
+        .clone();
+    let session = row_time_process_session().to_string();
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let mut preserved = HashSet::new();
+    let mut abandoned_tokens = Vec::new();
+    if sqlite_table_exists(&tx, "_row_time_operation")? {
+        let operations = {
+            let mut statement = tx.prepare(
+                "SELECT owner_token, owner_session, stage_name, backup_name
+                 FROM _row_time_operation",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            })?;
+            let operations = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+            operations
+        };
+        for (token, owner_session, stage_name, backup_name) in operations {
+            if owner_session == session && live_tokens.contains(&token) {
+                preserved.insert(stage_name);
+                if let Some(backup_name) = backup_name {
+                    preserved.insert(backup_name);
+                }
+            } else {
+                abandoned_tokens.push(token);
+            }
+        }
+    }
+
+    let candidates =
+        row_time_cleanup_candidates(&tx, &preserved, ROW_TIME_SCAVENGE_TABLE_LIMIT + 1)?;
+    let mut remaining_rows = ROW_TIME_SCAVENGE_ROW_LIMIT;
+    for table_name in candidates.iter().take(ROW_TIME_SCAVENGE_TABLE_LIMIT) {
+        let table = quote_ident(table_name);
+        let has_row_num: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name = 'row_num')",
+            [table_name],
+            |row| row.get::<_, i64>(0),
+        )? != 0;
+        if has_row_num && remaining_rows > 0 {
+            let deleted = tx.execute(
+                &format!(
+                    "DELETE FROM {table}
+                     WHERE row_num IN (
+                        SELECT row_num FROM {table} ORDER BY row_num LIMIT ?1
+                     )"
+                ),
+                [remaining_rows],
+            )? as i64;
+            remaining_rows = remaining_rows.saturating_sub(deleted);
+        }
+        let has_rows = if has_row_num {
+            tx.query_row(
+                &format!("SELECT EXISTS(SELECT 1 FROM {table} LIMIT 1)"),
+                [],
+                |row| row.get::<_, i64>(0),
+            )? != 0
+        } else {
+            false
+        };
+        if !has_rows {
+            tx.execute_batch(&format!("DROP TABLE IF EXISTS {table}"))?;
+        }
+    }
+    if sqlite_table_exists(&tx, "_row_time_operation")? {
+        for token in abandoned_tokens {
+            tx.execute(
+                "DELETE FROM _row_time_operation WHERE owner_token = ?1",
+                [token],
+            )?;
+        }
+    }
+    let backlog = !row_time_cleanup_candidates(&tx, &preserved, 1)?.is_empty();
+    tx.commit()?;
+    if backlog {
+        return Err(row_time_recovery_busy(
+            "bounded timestamp recovery made progress but abandoned staging data remains; retry opening the cache to continue cleanup",
+        ));
+    }
+    Ok(())
+}
+
 pub fn open(db_path: &Path) -> rusqlite::Result<Connection> {
-    let conn = Connection::open(db_path)?;
+    let mut conn = Connection::open(db_path)?;
     conn.busy_timeout(CACHE_BUSY_TIMEOUT)?;
+    scavenge_abandoned_row_time_objects(&mut conn)?;
     Ok(conn)
 }
 
@@ -204,6 +421,21 @@ pub fn create_row_time_table(conn: &Connection) -> rusqlite::Result<()> {
             date_convention TEXT,
             timezone_applied TEXT,
             completed_at TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS _row_time_operation_control (
+            singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+            latest_generation INTEGER NOT NULL
+         );
+         INSERT OR IGNORE INTO _row_time_operation_control(singleton, latest_generation)
+            VALUES (1, 0);
+         CREATE TABLE IF NOT EXISTS _row_time_operation (
+            generation INTEGER PRIMARY KEY,
+            owner_token TEXT NOT NULL UNIQUE,
+            owner_session TEXT NOT NULL,
+            stage_name TEXT NOT NULL UNIQUE,
+            backup_name TEXT,
+            started_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
          );",
     )?;
 
@@ -227,6 +459,139 @@ pub fn create_row_time_table(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_row_time_epoch ON _row_time(epoch_ms, row_num);",
     )
+}
+
+pub fn begin_row_time_operation(
+    conn: &mut Connection,
+    stage_name: &str,
+    index_name: &str,
+) -> rusqlite::Result<RowTimeOperationClaim> {
+    create_row_time_table(conn)?;
+    let session = row_time_process_session().to_string();
+    let sequence = ROW_TIME_OPERATION_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let owner_token = format!("{session}-{sequence}");
+    {
+        let mut live = live_row_time_operation_tokens()
+            .lock()
+            .map_err(|_| row_time_recovery_busy("timestamp operation registry is unavailable"))?;
+        if live.len() >= ROW_TIME_MAX_LIVE_OPERATIONS {
+            return Err(row_time_recovery_busy(
+                "too many timestamp normalization operations are active",
+            ));
+        }
+        live.insert(owner_token.clone());
+    }
+
+    let result = (|| {
+        let stage = quote_ident(stage_name);
+        let index = quote_ident(index_name);
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let advanced = tx.execute(
+            "UPDATE _row_time_operation_control
+             SET latest_generation = latest_generation + 1
+             WHERE singleton = 1 AND latest_generation < ?1",
+            [i64::MAX],
+        )?;
+        if advanced != 1 {
+            return Err(row_time_recovery_busy(
+                "timestamp operation generation is unavailable",
+            ));
+        }
+        let generation: i64 = tx.query_row(
+            "SELECT latest_generation FROM _row_time_operation_control WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        let now = chrono::Utc::now().to_rfc3339();
+        tx.execute(
+            "INSERT INTO _row_time_operation (
+                generation, owner_token, owner_session, stage_name, backup_name,
+                started_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?5)",
+            rusqlite::params![generation, owner_token, session, stage_name, now],
+        )?;
+        tx.execute_batch(&format!(
+            "CREATE TABLE {stage} (
+                row_num INTEGER PRIMARY KEY,
+                epoch_ms INTEGER NOT NULL,
+                utc_text TEXT NOT NULL,
+                source_text TEXT NOT NULL,
+                parse_status TEXT NOT NULL
+             );
+             CREATE INDEX {index} ON {stage}(epoch_ms, row_num);"
+        ))?;
+        tx.commit()?;
+        Ok(RowTimeOperationClaim {
+            generation,
+            owner_token: owner_token.clone(),
+            owner_session: session.clone(),
+            stage_name: stage_name.to_string(),
+        })
+    })();
+    if result.is_err() {
+        if let Ok(mut live) = live_row_time_operation_tokens().lock() {
+            live.remove(&owner_token);
+        }
+    }
+    result
+}
+
+pub fn row_time_operation_is_latest(
+    conn: &Connection,
+    claim: &RowTimeOperationClaim,
+) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1
+            FROM _row_time_operation_control c
+            JOIN _row_time_operation o ON o.generation = c.latest_generation
+            WHERE c.singleton = 1
+              AND o.generation = ?1
+              AND o.owner_token = ?2
+              AND o.owner_session = ?3
+              AND o.stage_name = ?4
+         )",
+        rusqlite::params![
+            claim.generation,
+            claim.owner_token,
+            claim.owner_session,
+            claim.stage_name
+        ],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|value| value != 0)
+}
+
+pub fn set_row_time_operation_backup(
+    conn: &Connection,
+    claim: &RowTimeOperationClaim,
+    backup_name: &str,
+) -> rusqlite::Result<bool> {
+    conn.execute(
+        "UPDATE _row_time_operation
+         SET backup_name = ?4, updated_at = ?5
+         WHERE generation = ?1 AND owner_token = ?2 AND owner_session = ?3",
+        rusqlite::params![
+            claim.generation,
+            claim.owner_token,
+            claim.owner_session,
+            backup_name,
+            chrono::Utc::now().to_rfc3339()
+        ],
+    )
+    .map(|changed| changed == 1)
+}
+
+pub fn retire_row_time_operation(
+    conn: &Connection,
+    claim: &RowTimeOperationClaim,
+) -> rusqlite::Result<bool> {
+    conn.execute(
+        "DELETE FROM _row_time_operation
+         WHERE generation = ?1 AND owner_token = ?2 AND owner_session = ?3",
+        rusqlite::params![claim.generation, claim.owner_token, claim.owner_session],
+    )
+    .map(|changed| changed == 1)
 }
 
 pub fn create_intel_schema(conn: &Connection) -> rusqlite::Result<()> {
@@ -324,6 +689,57 @@ mod tests {
             .unwrap();
         assert_eq!(timeout_ms, CACHE_BUSY_TIMEOUT.as_millis() as i64);
         drop(conn);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn timestamp_reopen_scavenging_is_bounded_and_reports_remaining_backlog() {
+        let path = std::env::temp_dir().join(format!(
+            "log-parser-row-time-scavenge-{}-{}.sqlite3",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let mut setup = Connection::open(&path).unwrap();
+        setup
+            .execute_batch(
+                "CREATE TABLE _row_time_stage_interrupted (
+                    row_num INTEGER PRIMARY KEY,
+                    epoch_ms INTEGER NOT NULL,
+                    utc_text TEXT NOT NULL,
+                    source_text TEXT NOT NULL,
+                    parse_status TEXT NOT NULL
+                 );",
+            )
+            .unwrap();
+        let tx = setup.transaction().unwrap();
+        {
+            let mut insert = tx
+                .prepare(
+                    "INSERT INTO _row_time_stage_interrupted (
+                        row_num, epoch_ms, utc_text, source_text, parse_status
+                     ) VALUES (?1, ?1, 'x', 'x', 'test')",
+                )
+                .unwrap();
+            for row_num in 1..=(ROW_TIME_SCAVENGE_ROW_LIMIT + 1) {
+                insert.execute([row_num]).unwrap();
+            }
+        }
+        tx.commit().unwrap();
+        drop(setup);
+
+        let first_error = match open(&path) {
+            Ok(_) => panic!("one bounded reopen must not silently leave a cleanup backlog"),
+            Err(error) => error,
+        };
+        assert!(first_error
+            .to_string()
+            .contains("bounded timestamp recovery"));
+        let reopened = open(&path).expect("a retry must finish the bounded remainder");
+        assert!(!sqlite_table_exists(&reopened, "_row_time_stage_interrupted").unwrap());
+        drop(reopened);
         let _ = std::fs::remove_file(path);
     }
 

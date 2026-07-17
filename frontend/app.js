@@ -135,6 +135,7 @@
     mappingsSkipped: 0,
     cellsTruncated: 0,
     columnsOmitted: 0,
+    chunksOmitted: 0,
     resumedFromRow: 0,
     summary: null,
     error: null,
@@ -314,6 +315,7 @@
       mappingsSkipped: 0,
       cellsTruncated: 0,
       columnsOmitted: 0,
+      chunksOmitted: 0,
       resumedFromRow: 0,
       summary: null,
       error: null,
@@ -1203,6 +1205,7 @@
     const limitations = [
       [state.cellsTruncated, "oversized cells truncated"],
       [state.columnsOmitted, "eligible wide-row values omitted"],
+      [state.chunksOmitted, "chunk documents omitted or truncated"],
       [state.documentsSkipped, "new document candidates skipped"],
       [state.mappingsSkipped, "document-to-row mappings skipped"],
     ]
@@ -1285,6 +1288,7 @@
       mappingsSkipped: 0,
       cellsTruncated: 0,
       columnsOmitted: 0,
+      chunksOmitted: 0,
       resumedFromRow: 0,
       summary: null,
       error: null,
@@ -1305,6 +1309,7 @@
           mappingsSkipped: status.mappingsSkipped || 0,
           cellsTruncated: status.cellsTruncated || 0,
           columnsOmitted: status.columnsOmitted || 0,
+          chunksOmitted: status.chunksOmitted || 0,
           resumedFromRow: 0,
           summary: null,
           error: null,
@@ -1330,6 +1335,7 @@
         mappingsSkipped: summary.mappingsSkipped || 0,
         cellsTruncated: summary.cellsTruncated || 0,
         columnsOmitted: summary.columnsOmitted || 0,
+        chunksOmitted: summary.chunksOmitted || 0,
         resumedFromRow: summary.resumed ? semanticIndexState.resumedFromRow : 0,
         summary,
         error: null,
@@ -1351,6 +1357,7 @@
         mappingsSkipped: 0,
         cellsTruncated: 0,
         columnsOmitted: 0,
+        chunksOmitted: 0,
         resumedFromRow: 0,
         summary: null,
         error: String(err),
@@ -2248,6 +2255,7 @@
       mappingsSkipped,
       cellsTruncated,
       columnsOmitted,
+      chunksOmitted,
       resumedFromRow,
       phase,
     } = event.payload;
@@ -2266,6 +2274,7 @@
       mappingsSkipped: mappingsSkipped || 0,
       cellsTruncated: cellsTruncated || 0,
       columnsOmitted: columnsOmitted || 0,
+      chunksOmitted: chunksOmitted || 0,
       resumedFromRow: resumedFromRow || 0,
     };
     renderSemanticIndexState();

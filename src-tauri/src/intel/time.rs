@@ -244,13 +244,49 @@ pub fn normalize_timestamp_column_with_options(
     )
 }
 
+pub fn normalize_timestamp_column_with_options_guarded(
+    conn: &mut Connection,
+    columns: &[ColumnMeta],
+    naive_timezone: Option<&str>,
+    date_convention: Option<&str>,
+    is_current: impl FnMut() -> Result<bool>,
+) -> Result<TimestampNormalizationSummary> {
+    normalize_timestamp_column_with_progress_and_guard(
+        conn,
+        columns,
+        naive_timezone,
+        date_convention,
+        |_, _| Ok(()),
+        is_current,
+    )
+}
+
 fn normalize_timestamp_column_with_progress(
     conn: &mut Connection,
     columns: &[ColumnMeta],
     naive_timezone: Option<&str>,
     date_convention: Option<&str>,
-    mut after_batch: impl FnMut(i64, i64) -> Result<()>,
+    after_batch: impl FnMut(i64, i64) -> Result<()>,
 ) -> Result<TimestampNormalizationSummary> {
+    normalize_timestamp_column_with_progress_and_guard(
+        conn,
+        columns,
+        naive_timezone,
+        date_convention,
+        after_batch,
+        || Ok(true),
+    )
+}
+
+fn normalize_timestamp_column_with_progress_and_guard(
+    conn: &mut Connection,
+    columns: &[ColumnMeta],
+    naive_timezone: Option<&str>,
+    date_convention: Option<&str>,
+    mut after_batch: impl FnMut(i64, i64) -> Result<()>,
+    mut is_current: impl FnMut() -> Result<bool>,
+) -> Result<TimestampNormalizationSummary> {
+    require_timestamp_request_current(&mut is_current)?;
     let column = resolved_timestamp_column(conn, columns)?;
     let date_analysis = analyze_date_convention(conn, &column.sql_name)?;
     if date_analysis.conflicting {
@@ -294,6 +330,9 @@ fn normalize_timestamp_column_with_progress(
         resolved_date_convention,
         |row_num, source_text, parsed| {
             counts.record(&source_text, &parsed);
+            if counts.total_rows % ROW_TIME_BATCH_ROWS as i64 == 0 {
+                require_timestamp_request_current(&mut is_current)?;
+            }
             match &parsed {
                 ParsedTimestamp::Naive(naive) => {
                     if let Some(resolver) = resolver.as_ref() {
@@ -311,6 +350,7 @@ fn normalize_timestamp_column_with_progress(
             Ok(())
         },
     )?;
+    require_timestamp_request_current(&mut is_current)?;
 
     if counts.naive_count > 0 && resolver.is_none() {
         bail!(
@@ -319,26 +359,30 @@ fn normalize_timestamp_column_with_progress(
         );
     }
 
-    db::create_row_time_table(conn)?;
+    // Operation ordering begins only after the read-only validation pass. From this claim onward,
+    // the monotonic database generation defines newer/older publication authority; tests pause an
+    // older build after this point so a later claimant must supersede it deterministically.
     let binding = current_binding_values(conn, columns)?;
     let stage_name = unique_row_time_object_name("_row_time_stage");
     let stage_index_name = unique_row_time_object_name("idx_row_time_stage_epoch");
-    create_row_time_staging_table(conn, &stage_name, &stage_index_name)?;
+    let claim = db::begin_row_time_operation(conn, &stage_name, &stage_index_name)?;
 
     let build_result = (|| -> Result<i64> {
         let rows_written = fill_row_time_staging_table(
             conn,
-            &stage_name,
+            &claim,
             &column.sql_name,
             resolved_date_convention,
             resolver.as_ref(),
             &mut after_batch,
+            &mut is_current,
         )?;
+        require_timestamp_operation_current(conn, &claim, &mut is_current)?;
         let backup_name = publish_row_time_staging_table(
             conn,
             columns,
             &binding,
-            &stage_name,
+            &claim,
             &column.sql_name,
             resolved_date_convention,
             resolver.as_ref(),
@@ -346,7 +390,9 @@ fn normalize_timestamp_column_with_progress(
 
         // Publication is already durable and active. Reclaim the prior generation in bounded
         // transactions so cleanup cannot monopolize SQLite's single writer slot.
-        let _ = discard_row_time_table_batched(conn, &backup_name);
+        if discard_row_time_table_batched(conn, &backup_name).is_ok() {
+            let _ = db::retire_row_time_operation(conn, &claim);
+        }
         Ok(rows_written)
     })();
 
@@ -354,7 +400,9 @@ fn normalize_timestamp_column_with_progress(
         Ok(rows_written) => rows_written,
         Err(error) => {
             // The active generation was never modified if staging or publication failed.
-            let _ = discard_row_time_table_batched(conn, &stage_name);
+            if discard_row_time_table_batched(conn, claim.stage_name()).is_ok() {
+                let _ = db::retire_row_time_operation(conn, &claim);
+            }
             return Err(error);
         }
     };
@@ -375,6 +423,25 @@ fn normalize_timestamp_column_with_progress(
     })
 }
 
+fn require_timestamp_request_current(is_current: &mut impl FnMut() -> Result<bool>) -> Result<()> {
+    if !is_current()? {
+        bail!("timestamp normalization was superseded because the loaded file or sheet changed");
+    }
+    Ok(())
+}
+
+fn require_timestamp_operation_current(
+    conn: &Connection,
+    claim: &db::RowTimeOperationClaim,
+    is_current: &mut impl FnMut() -> Result<bool>,
+) -> Result<()> {
+    require_timestamp_request_current(is_current)?;
+    if !db::row_time_operation_is_latest(conn, claim)? {
+        bail!("timestamp normalization was superseded by a newer normalization");
+    }
+    Ok(())
+}
+
 fn unique_row_time_object_name(prefix: &str) -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -384,37 +451,16 @@ fn unique_row_time_object_name(prefix: &str) -> String {
     format!("{prefix}_{}_{}_{}", std::process::id(), nanos, counter)
 }
 
-fn create_row_time_staging_table(
-    conn: &mut Connection,
-    table_name: &str,
-    index_name: &str,
-) -> Result<()> {
-    let table = db::quote_ident(table_name);
-    let index = db::quote_ident(index_name);
-    let tx = conn.transaction()?;
-    tx.execute_batch(&format!(
-        "CREATE TABLE {table} (
-            row_num INTEGER PRIMARY KEY,
-            epoch_ms INTEGER NOT NULL,
-            utc_text TEXT NOT NULL,
-            source_text TEXT NOT NULL,
-            parse_status TEXT NOT NULL
-         );
-         CREATE INDEX {index} ON {table}(epoch_ms, row_num);"
-    ))?;
-    tx.commit()?;
-    Ok(())
-}
-
 fn fill_row_time_staging_table(
     conn: &mut Connection,
-    stage_name: &str,
+    claim: &db::RowTimeOperationClaim,
     source_column: &str,
     date_convention: Option<DateConvention>,
     resolver: Option<&TimezoneResolver>,
     after_batch: &mut impl FnMut(i64, i64) -> Result<()>,
+    is_current: &mut impl FnMut() -> Result<bool>,
 ) -> Result<i64> {
-    let stage = db::quote_ident(stage_name);
+    let stage = db::quote_ident(claim.stage_name());
     let mut cursor = 0_i64;
     let mut rows_read = 0_i64;
     let mut rows_written = 0_i64;
@@ -477,6 +523,7 @@ fn fill_row_time_staging_table(
         // Deliberately outside the transaction. Tests use this boundary to prove an unrelated
         // writer can commit between normalization batches.
         after_batch(rows_read, rows_written)?;
+        require_timestamp_operation_current(conn, claim, is_current)?;
     }
 }
 
@@ -484,18 +531,30 @@ fn publish_row_time_staging_table(
     conn: &mut Connection,
     columns: &[ColumnMeta],
     expected_binding: &BindingValues,
-    stage_name: &str,
+    claim: &db::RowTimeOperationClaim,
     source_column: &str,
     date_convention: Option<DateConvention>,
     resolver: Option<&TimezoneResolver>,
 ) -> Result<String> {
     let backup_name = unique_row_time_object_name("_row_time_previous");
-    let stage = db::quote_ident(stage_name);
+    let stage = db::quote_ident(claim.stage_name());
     let backup = db::quote_ident(&backup_name);
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if !db::row_time_operation_is_latest(&tx, claim)? {
+        bail!("timestamp normalization was superseded by a newer normalization before publication");
+    }
     let current_binding = current_binding_values(&tx, columns)?;
     if &current_binding != expected_binding {
         bail!("source dataset changed while timestamps were being normalized; the previous normalization remains active");
+    }
+    let current_column = resolved_timestamp_column(&tx, columns)?;
+    if current_column.sql_name != source_column {
+        bail!(
+            "timestamp mapping changed while timestamps were being normalized; the previous normalization remains active"
+        );
+    }
+    if !db::set_row_time_operation_backup(&tx, claim, &backup_name)? {
+        bail!("timestamp normalization lost ownership before publication");
     }
 
     tx.execute_batch(&format!(
@@ -1476,6 +1535,120 @@ mod tests {
             .unwrap();
         assert_eq!(stored_timezone, "UTC");
         assert_eq!(inactive_row_time_table_count(&conn), 0);
+    }
+
+    #[test]
+    fn older_paused_normalization_cannot_overwrite_newer_publication() {
+        let row_count = (ROW_TIME_BATCH_ROWS as i64) + 1;
+        let (db_file, columns) = setup_file_with_naive_timestamps(row_count);
+        let older_path = db_file.path().to_path_buf();
+        let older_columns = columns.clone();
+        let (paused_tx, paused_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let older = thread::spawn(move || {
+            let mut conn = db::open(&older_path).unwrap();
+            let mut paused = false;
+            normalize_timestamp_column_with_progress(
+                &mut conn,
+                &older_columns,
+                Some("+02:00"),
+                None,
+                |rows_read, _| {
+                    if rows_read >= ROW_TIME_BATCH_ROWS as i64 && !paused {
+                        paused = true;
+                        paused_tx.send(()).unwrap();
+                        resume_rx.recv().unwrap();
+                    }
+                    Ok(())
+                },
+            )
+        });
+
+        paused_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("older operation must pause after its claim and first staged batch");
+        let mut newer_conn = db::open(db_file.path()).unwrap();
+        let newer =
+            normalize_timestamp_column_with_options(&mut newer_conn, &columns, Some("UTC"), None)
+                .unwrap();
+        assert_eq!(newer.rows_written, row_count);
+        resume_tx.send(()).unwrap();
+
+        let older_error = older.join().unwrap().unwrap_err();
+        assert!(older_error.to_string().contains("superseded"));
+        let (utc_text, timezone): (String, String) = newer_conn
+            .query_row(
+                "SELECT t.utc_text, i.timezone_applied
+                 FROM _row_time t CROSS JOIN _row_time_info i
+                 WHERE t.row_num = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(utc_text, "2026-01-01T02:30:00Z");
+        assert_eq!(timezone, "UTC");
+        assert_eq!(inactive_row_time_table_count(&newer_conn), 0);
+        let operation_count: i64 = newer_conn
+            .query_row("SELECT COUNT(*) FROM _row_time_operation", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(operation_count, 0);
+    }
+
+    #[test]
+    fn reopen_reclaims_interrupted_stage_and_backup_without_touching_active_time() {
+        let (db_file, columns) = setup_file_with_naive_timestamps(1);
+        let mut conn = db::open(db_file.path()).unwrap();
+        normalize_timestamp_column_with_options(&mut conn, &columns, Some("UTC"), None).unwrap();
+        let active_before: String = conn
+            .query_row(
+                "SELECT utc_text FROM _row_time WHERE row_num = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        let stage_name = unique_row_time_object_name("_row_time_stage");
+        let index_name = unique_row_time_object_name("idx_row_time_stage_epoch");
+        let claim = db::begin_row_time_operation(&mut conn, &stage_name, &index_name).unwrap();
+        conn.execute(
+            &format!(
+                "INSERT INTO {} (row_num, epoch_ms, utc_text, source_text, parse_status)
+                 VALUES (1, 1, 'interrupted', 'interrupted', 'test')",
+                db::quote_ident(claim.stage_name())
+            ),
+            [],
+        )
+        .unwrap();
+        let backup_name = unique_row_time_object_name("_row_time_previous");
+        conn.execute_batch(&format!(
+            "CREATE TABLE {} AS SELECT * FROM _row_time",
+            db::quote_ident(&backup_name)
+        ))
+        .unwrap();
+        assert!(db::set_row_time_operation_backup(&conn, &claim, &backup_name).unwrap());
+
+        // Dropping the claim unregisters the in-process live token but deliberately leaves the
+        // persisted operation and objects, matching an unwind/crash before normal retirement.
+        drop(claim);
+        drop(conn);
+        let reopened = db::open(db_file.path()).unwrap();
+        let active_after: String = reopened
+            .query_row(
+                "SELECT utc_text FROM _row_time WHERE row_num = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(active_after, active_before);
+        assert_eq!(inactive_row_time_table_count(&reopened), 0);
+        let operation_count: i64 = reopened
+            .query_row("SELECT COUNT(*) FROM _row_time_operation", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(operation_count, 0);
     }
 
     #[test]

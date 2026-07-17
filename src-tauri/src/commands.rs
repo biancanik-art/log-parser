@@ -90,6 +90,7 @@ struct SemanticIndexProgressPayload {
     mappings_skipped: i64,
     cells_truncated: i64,
     columns_omitted: i64,
+    chunks_omitted: i64,
     resumed_from_row: i64,
     phase: String,
 }
@@ -103,6 +104,7 @@ pub struct SemanticIndexStatus {
     pub mappings_skipped: i64,
     pub cells_truncated: i64,
     pub columns_omitted: i64,
+    pub chunks_omitted: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -436,6 +438,20 @@ fn state_snapshot(state: &State<'_, AppState>) -> Result<(PathBuf, Vec<ColumnMet
     ))
 }
 
+fn loaded_generation_is_current(
+    state: &AppState,
+    expected_db_path: &Path,
+    expected_generation: u64,
+) -> Result<bool, String> {
+    let guard = state
+        .loaded
+        .lock()
+        .map_err(|_| "app state lock poisoned".to_string())?;
+    Ok(guard.as_ref().is_some_and(|inner| {
+        inner.generation == expected_generation && inner.db_path == expected_db_path
+    }))
+}
+
 fn publish_export_if_current(
     app: &AppHandle,
     expected_db_path: &Path,
@@ -655,6 +671,7 @@ pub fn semantic_index_status(state: State<'_, AppState>) -> Result<SemanticIndex
         mappings_skipped: coverage.mappings_skipped,
         cells_truncated: coverage.cells_truncated,
         columns_omitted: coverage.columns_omitted,
+        chunks_omitted: coverage.chunks_omitted,
     })
 }
 
@@ -698,6 +715,7 @@ pub async fn build_semantic_index(
                 mappings_skipped: 0,
                 cells_truncated: 0,
                 columns_omitted: 0,
+                chunks_omitted: 0,
                 resumed_from_row: 0,
                 phase: "loadingModel".to_string(),
             },
@@ -736,6 +754,7 @@ pub async fn build_semantic_index(
                         mappings_skipped: progress.mappings_skipped,
                         cells_truncated: progress.cells_truncated,
                         columns_omitted: progress.columns_omitted,
+                        chunks_omitted: progress.chunks_omitted,
                         resumed_from_row: progress.resumed_from_row,
                         phase: progress.phase,
                     },
@@ -1013,25 +1032,41 @@ pub async fn analyze_timestamp_column(
 
 #[tauri::command]
 pub async fn normalize_timestamp_column(
+    app: AppHandle,
     state: State<'_, AppState>,
     naive_timezone: Option<String>,
     date_convention: Option<String>,
 ) -> Result<time::TimestampNormalizationSummary, String> {
-    let (db_path, columns, _) = state_snapshot(&state)?;
-    tauri::async_runtime::spawn_blocking(
+    let (db_path, columns, generation) = state_snapshot(&state)?;
+    let normalized_db_path = db_path.clone();
+    let task_db_path = normalized_db_path.clone();
+    let app_for_task = app.clone();
+    let result = tauri::async_runtime::spawn_blocking(
         move || -> Result<time::TimestampNormalizationSummary, String> {
             let mut conn = db::open(&db_path).map_err(|e| e.to_string())?;
-            time::normalize_timestamp_column_with_options(
+            time::normalize_timestamp_column_with_options_guarded(
                 &mut conn,
                 &columns,
                 naive_timezone.as_deref(),
                 date_convention.as_deref(),
+                || {
+                    let current_state = app_for_task.state::<AppState>();
+                    loaded_generation_is_current(&current_state, &task_db_path, generation)
+                        .map_err(|error| anyhow::anyhow!(error))
+                },
             )
             .map_err(|e| e.to_string())
         },
     )
     .await
-    .map_err(|e| format!("timestamp normalization task join error: {e}"))?
+    .map_err(|e| format!("timestamp normalization task join error: {e}"))??;
+    if !loaded_generation_is_current(&state, &normalized_db_path, generation)? {
+        return Err(
+            "timestamp normalization was superseded because the loaded file or sheet changed"
+                .to_string(),
+        );
+    }
+    Ok(result)
 }
 
 #[tauri::command]
@@ -1300,6 +1335,7 @@ mod tests {
             index_mappings_skipped: 0,
             index_cells_truncated: 0,
             index_columns_omitted: 0,
+            index_chunks_omitted: 0,
             broad_row_warning: false,
             warnings: Vec::new(),
         }
@@ -1504,5 +1540,23 @@ mod tests {
         let cleanup_error =
             finish_semantic_task(Ok(()), Err("cleanup failed".to_string())).unwrap_err();
         assert_eq!(cleanup_error, "cleanup failed");
+    }
+
+    #[test]
+    fn loaded_generation_check_rejects_replaced_timestamp_context() {
+        let state = AppState::default();
+        let expected_path = PathBuf::from("expected.sqlite3");
+        *state.loaded.lock().unwrap() = Some(AppStateInner {
+            db_path: expected_path.clone(),
+            columns: Vec::new(),
+            generation: 7,
+        });
+        assert!(loaded_generation_is_current(&state, &expected_path, 7).unwrap());
+        assert!(!loaded_generation_is_current(&state, &expected_path, 8).unwrap());
+        assert!(
+            !loaded_generation_is_current(&state, Path::new("replacement.sqlite3"), 7).unwrap()
+        );
+        *state.loaded.lock().unwrap() = None;
+        assert!(!loaded_generation_is_current(&state, &expected_path, 7).unwrap());
     }
 }
