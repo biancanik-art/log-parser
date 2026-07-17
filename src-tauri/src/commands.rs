@@ -552,6 +552,23 @@ fn cancel_semantic_index_build(state: &AppState) {
     }
 }
 
+/// Advances the loaded-dataset epoch and clears its snapshot as one mutex-protected transition.
+/// Publication holds the same mutex through its final rename, so a new import/removal cannot
+/// advance the epoch in the interval between publication validation and replacement.
+///
+/// Lock order is `loaded` then `semantic_cancel`. Semantic request cleanup releases
+/// `semantic_cancel` before it checks `loaded`, so the order cannot form an ABBA cycle.
+fn advance_generation_and_clear_loaded(state: &AppState) -> Result<u64, String> {
+    let mut loaded = state
+        .loaded
+        .lock()
+        .map_err(|_| "app state lock poisoned".to_string())?;
+    let generation = state.next_generation.fetch_add(1, Ordering::SeqCst) + 1;
+    cancel_semantic_index_build(state);
+    *loaded = None;
+    Ok(generation)
+}
+
 fn clear_semantic_cancellation_if_current(
     current: &Mutex<Option<Arc<AtomicBool>>>,
     completed: &Arc<AtomicBool>,
@@ -608,9 +625,12 @@ fn loaded_generation_is_current(
         .loaded
         .lock()
         .map_err(|_| "app state lock poisoned".to_string())?;
-    Ok(guard.as_ref().is_some_and(|inner| {
-        inner.generation == expected_generation && inner.db_path == expected_db_path
-    }))
+    Ok(
+        state.next_generation.load(Ordering::SeqCst) == expected_generation
+            && guard.as_ref().is_some_and(|inner| {
+                inner.generation == expected_generation && inner.db_path == expected_db_path
+            }),
+    )
 }
 
 fn publish_export_if_current(
@@ -637,19 +657,32 @@ fn publish_export_for_state_if_current(
     temporary_path: &Path,
     destination_path: &Path,
 ) -> anyhow::Result<()> {
+    with_current_loaded_generation(state, expected_db_path, expected_generation, || {
+        export::publish_completed_export(temporary_path, destination_path)
+    })
+}
+
+fn with_current_loaded_generation<T>(
+    state: &AppState,
+    expected_db_path: &Path,
+    expected_generation: u64,
+    action: impl FnOnce() -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
     let guard = state
         .loaded
         .lock()
         .map_err(|_| anyhow::anyhow!("app state lock poisoned"))?;
-    let still_current = guard.as_ref().is_some_and(|inner| {
-        inner.generation == expected_generation && inner.db_path == expected_db_path
-    });
+    let still_current = state.next_generation.load(Ordering::SeqCst) == expected_generation
+        && guard.as_ref().is_some_and(|inner| {
+            inner.generation == expected_generation && inner.db_path == expected_db_path
+        });
     if !still_current {
         anyhow::bail!("the loaded file or sheet changed while the export was running");
     }
-    // Keep the state lock through the atomic replace. An import cannot publish a new generation
-    // between this check and publication of the completed export.
-    export::publish_completed_export(temporary_path, destination_path)
+    // Keep the state lock through the action/atomic replace. Every epoch transition takes this
+    // same lock before incrementing `next_generation`, so no new generation can begin between
+    // validation and publication.
+    action()
 }
 
 #[tauri::command]
@@ -673,15 +706,13 @@ pub async fn import_sheet(
             "Another file is already being imported — please wait for it to finish.".to_string(),
         );
     }
-    cancel_semantic_index_build(&state);
-    let generation = state.next_generation.fetch_add(1, Ordering::SeqCst) + 1;
-    {
-        let mut guard = state
-            .loaded
-            .lock()
-            .map_err(|_| "app state lock poisoned".to_string())?;
-        *guard = None;
-    }
+    let generation = match advance_generation_and_clear_loaded(&state) {
+        Ok(generation) => generation,
+        Err(error) => {
+            state.busy.store(false, Ordering::SeqCst);
+            return Err(error);
+        }
+    };
     let result = import_sheet_locked(&app, &state, path, sheet, generation).await;
     state.busy.store(false, Ordering::SeqCst);
     result
@@ -795,15 +826,15 @@ async fn import_sheet_locked(
     .map_err(|e| format!("import task join error: {e}"))??;
 
     {
+        let mut guard = state
+            .loaded
+            .lock()
+            .map_err(|_| "app state lock poisoned".to_string())?;
         if state.next_generation.load(Ordering::SeqCst) != generation {
             return Err(
                 "the file import was canceled because the loaded-file state changed".into(),
             );
         }
-        let mut guard = state
-            .loaded
-            .lock()
-            .map_err(|_| "app state lock poisoned".to_string())?;
         *guard = Some(AppStateInner {
             db_path: db_path.clone(),
             columns: columns.clone(),
@@ -956,13 +987,7 @@ pub async fn build_semantic_index(
         clear_semantic_cancellation_if_current(&state.semantic_cancel, &cancellation);
     let result = finish_semantic_task(task_result, cleanup_result)?;
 
-    let still_current = state
-        .loaded
-        .lock()
-        .map_err(|_| "app state lock poisoned".to_string())?
-        .as_ref()
-        .is_some_and(|inner| inner.generation == generation && inner.db_path == indexed_db_path);
-    if !still_current {
+    if !loaded_generation_is_current(&state, &indexed_db_path, generation)? {
         return Err(
             "the loaded file or sheet changed while the semantic index was building".to_string(),
         );
@@ -1078,13 +1103,7 @@ pub async fn parse_guided_query(
     .await
     .map_err(|error| format!("local AI parse task join error: {error}"))??;
 
-    let still_current = state
-        .loaded
-        .lock()
-        .map_err(|_| "app state lock poisoned".to_string())?
-        .as_ref()
-        .is_some_and(|inner| inner.generation == generation && inner.db_path == parsed_db_path);
-    if !still_current {
+    if !loaded_generation_is_current(&state, &parsed_db_path, generation)? {
         if let Some(audit_id) = preview.audit_id {
             if let Ok(conn) = db::open(&parsed_db_path) {
                 let _ = guided_parser::set_llm_audit_decision(
@@ -1144,13 +1163,7 @@ pub fn set_guided_parse_decision(
 
 #[tauri::command]
 pub fn clear_loaded_file(state: State<'_, AppState>) -> Result<(), String> {
-    cancel_semantic_index_build(&state);
-    let mut guard = state
-        .loaded
-        .lock()
-        .map_err(|_| "app state lock poisoned".to_string())?;
-    *guard = None;
-    state.next_generation.fetch_add(1, Ordering::SeqCst);
+    advance_generation_and_clear_loaded(&state)?;
     Ok(())
 }
 
@@ -1922,6 +1935,7 @@ mod tests {
             columns: Vec::new(),
             generation: 7,
         });
+        state.next_generation.store(7, Ordering::SeqCst);
         assert!(loaded_generation_is_current(&state, &expected_path, 7).unwrap());
         assert!(!loaded_generation_is_current(&state, &expected_path, 8).unwrap());
         assert!(
@@ -1929,6 +1943,61 @@ mod tests {
         );
         *state.loaded.lock().unwrap() = None;
         assert!(!loaded_generation_is_current(&state, &expected_path, 7).unwrap());
+    }
+
+    #[test]
+    fn pending_import_epoch_rejects_publication_even_if_loaded_still_looks_old() {
+        let state = AppState::default();
+        let expected_path = PathBuf::from("old-loaded.sqlite3");
+        *state.loaded.lock().unwrap() = Some(AppStateInner {
+            db_path: expected_path.clone(),
+            columns: Vec::new(),
+            generation: 4,
+        });
+        // Reproduce the old increment-before-loaded-lock window directly: the new import epoch is
+        // visible while `loaded` still names the prior generation.
+        state.next_generation.store(5, Ordering::SeqCst);
+        let action_called = std::cell::Cell::new(false);
+
+        let error = with_current_loaded_generation(&state, &expected_path, 4, || {
+            action_called.set(true);
+            Ok(())
+        })
+        .unwrap_err();
+
+        assert!(error.to_string().contains("loaded file or sheet changed"));
+        assert!(!action_called.get());
+        assert!(!loaded_generation_is_current(&state, &expected_path, 4).unwrap());
+    }
+
+    #[test]
+    fn publication_action_holds_loaded_lock_through_the_check_window() {
+        let state = AppState::default();
+        let expected_path = PathBuf::from("publication-window.sqlite3");
+        *state.loaded.lock().unwrap() = Some(AppStateInner {
+            db_path: expected_path.clone(),
+            columns: Vec::new(),
+            generation: 9,
+        });
+        state.next_generation.store(9, Ordering::SeqCst);
+
+        with_current_loaded_generation(&state, &expected_path, 9, || {
+            assert!(matches!(
+                state.loaded.try_lock(),
+                Err(std::sync::TryLockError::WouldBlock)
+            ));
+            assert_eq!(state.next_generation.load(Ordering::SeqCst), 9);
+            Ok(())
+        })
+        .unwrap();
+
+        let cancellation = Arc::new(AtomicBool::new(false));
+        *state.semantic_cancel.lock().unwrap() = Some(Arc::clone(&cancellation));
+        assert_eq!(advance_generation_and_clear_loaded(&state).unwrap(), 10);
+        assert_eq!(state.next_generation.load(Ordering::SeqCst), 10);
+        assert!(state.loaded.lock().unwrap().is_none());
+        assert!(state.semantic_cancel.lock().unwrap().is_none());
+        assert!(cancellation.load(Ordering::SeqCst));
     }
 
     #[test]
@@ -1984,6 +2053,7 @@ mod tests {
             columns: Vec::new(),
             generation: 12,
         });
+        state.next_generation.store(12, Ordering::SeqCst);
         let directory = import_cache_test_path("stale-report-publish").with_extension("dir");
         let _ = std::fs::remove_dir_all(&directory);
         std::fs::create_dir_all(&directory).unwrap();
