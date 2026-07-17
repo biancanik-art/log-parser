@@ -48,7 +48,10 @@ pub fn import_into_db(
     db::set_import_pragmas(&conn)?;
     db::create_schema(&conn, &columns)?;
 
-    let col_idents: Vec<String> = columns.iter().map(|c| db::quote_ident(&c.sql_name)).collect();
+    let col_idents: Vec<String> = columns
+        .iter()
+        .map(|c| db::quote_ident(&c.sql_name))
+        .collect();
     let placeholders: Vec<String> = (1..=columns.len() + 1).map(|i| format!("?{i}")).collect();
     let insert_sql = format!(
         "INSERT INTO rows (row_num, {}) VALUES ({})",
@@ -91,10 +94,7 @@ pub fn import_into_db(
     db::populate_fts(&conn, &columns)?;
     db::restore_normal_pragmas(&conn)?;
 
-    Ok(ImportResult {
-        columns,
-        row_count,
-    })
+    Ok(ImportResult { columns, row_count })
 }
 
 fn cell_to_string(cell: &Data) -> String {

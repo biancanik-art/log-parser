@@ -157,9 +157,9 @@ pub fn set_column_role_status(
         .as_ref()
         .map(|row| row.reasons.clone())
         .unwrap_or_default();
-    let unchanged_repeat = existing.as_ref().is_some_and(|row| {
-        row.sql_name == column.sql_name && row.status == status.as_str()
-    });
+    let unchanged_repeat = existing
+        .as_ref()
+        .is_some_and(|row| row.sql_name == column.sql_name && row.status == status.as_str());
     let confidence = match status {
         RoleDecisionStatus::Confirmed => {
             if !unchanged_repeat {

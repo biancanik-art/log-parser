@@ -15,7 +15,9 @@ const SEMANTIC_MARKER_TEXT: &str =
     "LSASS process memory access detected during operating system credential dumping";
 
 fn testdata_dir() -> PathBuf {
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("testdata");
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("testdata");
     std::fs::create_dir_all(&dir).unwrap();
     dir
 }
@@ -77,8 +79,12 @@ fn generate_large_fixture(path: &Path, num_rows: usize) {
                 format!("2026-01-01T00:{:02}:{:02}Z", (i / 60) % 60, i % 60),
             )
             .unwrap();
-        worksheet.write_string(row, 1, format!("HOST-{:04}", i % 300)).unwrap();
-        worksheet.write_number(row, 2, (4624 + (i % 20)) as f64).unwrap();
+        worksheet
+            .write_string(row, 1, format!("HOST-{:04}", i % 300))
+            .unwrap();
+        worksheet
+            .write_number(row, 2, (4624 + (i % 20)) as f64)
+            .unwrap();
         worksheet.write_string(row, 3, &account).unwrap();
         worksheet
             .write_string(row, 4, format!("10.0.{}.{}", (i / 256) % 256, i % 256))
@@ -94,17 +100,31 @@ fn generate_large_fixture(path: &Path, num_rows: usize) {
         worksheet.write_string(row, 7, "cmd.exe").unwrap();
         worksheet.write_string(row, 8, "explorer.exe").unwrap();
         worksheet.write_number(row, 9, (i % 10) as f64).unwrap();
-        worksheet.write_string(row, 10, format!("target{}", i % 50)).unwrap();
-        worksheet.write_string(row, 11, format!("subject{}", i % 50)).unwrap();
+        worksheet
+            .write_string(row, 10, format!("target{}", i % 50))
+            .unwrap();
+        worksheet
+            .write_string(row, 11, format!("subject{}", i % 50))
+            .unwrap();
         worksheet.write_string(row, 12, "Logon").unwrap();
         worksheet
             .write_string(row, 13, if i % 1000 == 0 { "High" } else { "Low" })
             .unwrap();
-        worksheet.write_string(row, 14, "SuspiciousActivity").unwrap();
-        worksheet.write_string(row, 15, format!("DEV-{:04}", i % 300)).unwrap();
-        worksheet.write_string(row, 16, format!("file{}.exe", i % 200)).unwrap();
-        worksheet.write_string(row, 17, format!("{:064x}", i)).unwrap();
-        worksheet.write_number(row, 18, (443 + (i % 1000)) as f64).unwrap();
+        worksheet
+            .write_string(row, 14, "SuspiciousActivity")
+            .unwrap();
+        worksheet
+            .write_string(row, 15, format!("DEV-{:04}", i % 300))
+            .unwrap();
+        worksheet
+            .write_string(row, 16, format!("file{}.exe", i % 200))
+            .unwrap();
+        worksheet
+            .write_string(row, 17, format!("{:064x}", i))
+            .unwrap();
+        worksheet
+            .write_number(row, 18, (443 + (i % 1000)) as f64)
+            .unwrap();
         worksheet
             .write_string(row, 19, if i % 2 == 0 { "TCP" } else { "UDP" })
             .unwrap();
@@ -124,7 +144,7 @@ fn generate_large_fixture(path: &Path, num_rows: usize) {
         worksheet.write_string(row, 23, "TestThreat").unwrap();
         worksheet.write_string(row, 24, format!("R{i}")).unwrap();
         worksheet.write_string(row, 25, &account).unwrap(); // duplicate "Account" column
-                                                              // column 26 (blank header) deliberately left empty for every row
+                                                            // column 26 (blank header) deliberately left empty for every row
     }
 
     workbook.save(path).unwrap();
@@ -223,7 +243,10 @@ fn large_fixture_import_and_query() {
         limit: 50,
     };
     let count = query::count_rows(&conn, &result.columns, &count_spec).unwrap();
-    assert_eq!(count, 0, "destinationport never exceeds 1442 by construction");
+    assert_eq!(
+        count, 0,
+        "destinationport never exceeds 1442 by construction"
+    );
 
     // export a filtered subset to CSV and confirm it round-trips
     let export_dir = std::env::temp_dir().join("log-parser-fixture-export");
