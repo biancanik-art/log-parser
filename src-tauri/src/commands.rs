@@ -1017,8 +1017,21 @@ pub async fn parse_guided_query(
     let preview = tauri::async_runtime::spawn_blocking(
         move || -> Result<guided_parser::GuidedQueryPreview, String> {
             let mut conn = db::open(&db_path).map_err(|e| e.to_string())?;
-            // Semantic retrieval supplements the validated lexical plan. Every non-use path is
-            // retained as a concrete preview note and a dataset-bound audit row below.
+            let mut guard = llm
+                .lock()
+                .map_err(|_| "local AI model lock poisoned".to_string())?;
+            if guard.is_none() {
+                *guard = Some(
+                    llm_parser::LlmParser::load(&model_path, &tokenizer_path)
+                        .map_err(|error| error.to_string())?,
+                );
+            }
+            let model = guard
+                .as_mut()
+                .ok_or_else(|| "local AI model failed to initialize".to_string())?;
+            // Load the larger planner first. On a first search this gives the concurrent semantic
+            // builder time to publish, avoiding an exact-only plan that is already stale by the
+            // time Qwen finishes loading. Every non-use path remains explicitly audited below.
             let semantic_preparation = prepare_semantic_selection(
                 &mut conn,
                 &columns,
@@ -1036,18 +1049,6 @@ pub async fn parse_guided_query(
                 });
             let semantic_selection_id =
                 semantic_selection_id_for_preparation(&semantic_preparation);
-            let mut guard = llm
-                .lock()
-                .map_err(|_| "local AI model lock poisoned".to_string())?;
-            if guard.is_none() {
-                *guard = Some(
-                    llm_parser::LlmParser::load(&model_path, &tokenizer_path)
-                        .map_err(|error| error.to_string())?,
-                );
-            }
-            let model = guard
-                .as_mut()
-                .ok_or_else(|| "local AI model failed to initialize".to_string())?;
             let mut preview = plan_with_prevalidated_semantic_selection(
                 semantic_selection_id,
                 |selection_id| {
@@ -1089,6 +1090,7 @@ pub async fn parse_guided_query(
                     )
                 }
             };
+            preview.semantic_status = Some(outcome.code.to_string());
             preview.match_explanation.push(outcome.message.clone());
             record_semantic_preview_outcome(
                 &conn,

@@ -1020,6 +1020,9 @@ pub fn query_requests_timeline(query_text: &str) -> bool {
         "time order",
         "ordered by time",
         "sort by time",
+        "attack path",
+        "attack chain",
+        "sequence of events",
         "earliest",
         "oldest",
         "latest",
@@ -2609,6 +2612,13 @@ mod tests {
     use super::*;
     use crate::db;
     use crate::intel::library;
+
+    #[test]
+    fn attack_path_requests_chronological_evidence() {
+        assert!(query_requests_timeline("find the attack path"));
+        assert!(query_requests_timeline("show the attack chain"));
+        assert!(query_requests_timeline("sequence of events for alice"));
+    }
 
     fn raw_columns() -> Vec<ColumnMeta> {
         vec![

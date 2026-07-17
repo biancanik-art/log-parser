@@ -86,6 +86,10 @@
   let totalCount = null;
 
   let queryMode = "normal";
+  // The plan that actually produced the rows currently shown. A new AI interpretation is kept
+  // separate until its first page succeeds, so failed/ambiguous searches cannot relabel or page
+  // the previous table through an unexecuted plan.
+  let activeEvidenceQuery = null;
   let guidedParseResult = null;
   let guidedIntentToken = null;
   let guidedAuditId = null;
@@ -144,6 +148,7 @@
   };
   let semanticIndexRequestSequence = 0;
   let activeSemanticIndexRequest = null;
+  let pendingSemanticSearch = null;
   let intelScanInFlight = false;
 
   const EVIDENCE_ROLES = new Set([
@@ -254,7 +259,7 @@
       !controlsEnabled || columns.length === 0 || sheetLoadInFlight || parsing || actionInFlight || queryInFlight;
     guidedRunBtn.disabled = actionInFlight || queryInFlight;
     guidedRejectBtn.disabled = actionInFlight || queryInFlight;
-    guidedResetBtn.disabled = actionInFlight || queryInFlight;
+    guidedResetBtn.disabled = parsing || actionInFlight || queryInFlight;
     // Keep Close available while parsing so it can cancel a slow preview, but do not let it
     // race the decision implicit in Run or an explicit Reject/Edit request.
     guidedPanelClose.disabled = actionInFlight || queryInFlight;
@@ -269,6 +274,7 @@
     cancelSearchDebounce();
     invalidateGuidedContext();
     queryMode = "normal";
+    activeEvidenceQuery = null;
     guidedParseResult = null;
     guidedIntentToken = null;
     guidedAuditId = null;
@@ -276,6 +282,7 @@
     guidedQuerySpec = null;
     guidedMatchExplanation = [];
     guidedPreviewQueryText = null;
+    pendingSemanticSearch = null;
 
     guidedSearchBox.value = "";
     guidedQueryPanel.classList.add("hidden");
@@ -381,6 +388,9 @@
       id: ++guidedActionSequence,
       type,
       contextRevision: guidedContextRevision,
+      path: currentPath,
+      sheet: currentSheet,
+      queryText: guidedPreviewQueryText,
       auditId: guidedAuditId,
       intentToken: guidedIntentToken,
       querySpec: guidedQuerySpec,
@@ -393,7 +403,19 @@
   function guidedActionIsCurrent(action) {
     return (
       guidedActiveAction === action &&
-      guidedContextRevision === action.contextRevision &&
+      loadedContextIsCurrent(action) &&
+      guidedPreviewQueryText === action.queryText &&
+      guidedSearchBox.value.trim() === action.queryText &&
+      guidedAuditId === action.auditId &&
+      guidedIntentToken === action.intentToken &&
+      guidedQuerySpec === action.querySpec
+    );
+  }
+
+  function guidedDecisionIsCurrent(action) {
+    return (
+      guidedActiveAction === action &&
+      loadedContextIsCurrent(action) &&
       guidedAuditId === action.auditId &&
       guidedIntentToken === action.intentToken &&
       guidedQuerySpec === action.querySpec
@@ -413,6 +435,20 @@
       guidedParseResult = { ...guidedParseResult, reviewStatus: status };
     }
     guidedAiStatus.textContent = `Offline AI interpretation \u2022 ${status} \u2022 processed locally`;
+  }
+
+  function guidedPlanIsReadyToRun() {
+    if (!guidedParseResult || guidedParseResult.needsClarification || guidedQuerySpec === null) {
+      return false;
+    }
+    if (!guidedParseResult.aiAssisted) {
+      return guidedAuditId === null;
+    }
+    return (
+      guidedIntentToken !== null &&
+      guidedAuditId !== null &&
+      ["unreviewed", "accepted"].includes(guidedReviewStatus)
+    );
   }
 
   function formatRoleName(role) {
@@ -820,7 +856,7 @@
     ].some((prefix) => message.startsWith(prefix));
   }
 
-  function renderGuidedPreview(result, queryText) {
+  function renderGuidedPreview(result, queryText, { showReadyPlan = true } = {}) {
     guidedParseResult = result;
     guidedIntentToken = typeof result.intentToken === "string" && result.intentToken ? result.intentToken : null;
     guidedAuditId = Number.isInteger(result.auditId) ? result.auditId : null;
@@ -857,7 +893,6 @@
     }
 
     guidedRunBtn.textContent = "Search evidence";
-    guidedQueryPanel.classList.remove("hidden");
     const previewLines = [result.previewText || "No search plan was returned."];
     const searchNotes = guidedMatchExplanation.filter((item) => item.startsWith("Semantic "));
     const matchRules = guidedMatchExplanation.filter((item) => !searchNotes.includes(item));
@@ -878,20 +913,23 @@
           : "";
       guidedAiStatus.textContent = `Offline AI interpretation \u2022 ${guidedReviewStatus || "unreviewed"}${validation}${semanticStatus}`;
       guidedAiStatus.classList.remove("hidden");
-      guidedRejectBtn.classList.toggle("hidden", guidedReviewStatus !== "unreviewed");
+      guidedRejectBtn.classList.toggle(
+        "hidden",
+        !showReadyPlan || guidedReviewStatus !== "unreviewed"
+      );
     } else {
       guidedAiStatus.textContent = "Deterministic local search plan \u2022 no model inference";
       guidedAiStatus.classList.remove("hidden");
       guidedRejectBtn.classList.add("hidden");
     }
 
-    const auditedPlanReady =
-      result.aiAssisted &&
-      guidedIntentToken !== null &&
-      guidedAuditId !== null &&
-      ["unreviewed", "accepted"].includes(guidedReviewStatus);
-    const deterministicPlanReady = !result.aiAssisted && guidedAuditId === null && guidedQuerySpec !== null;
-    if (result.needsClarification || (!auditedPlanReady && !deterministicPlanReady)) {
+    const planReady = guidedPlanIsReadyToRun();
+    if (!planReady) {
+      guidedQueryPanel.classList.remove("hidden");
+      if (!showReadyPlan) {
+        guidedAiStatus.classList.add("hidden");
+        guidedPreviewText.textContent = "I could not safely turn that request into a table search yet.";
+      }
       guidedClarification.textContent =
         result.clarificationMessage ||
         "More detail is needed before a safe evidence search can run.";
@@ -903,7 +941,8 @@
     } else {
       guidedClarification.textContent = "";
       guidedClarification.classList.add("hidden");
-      guidedRunBtn.classList.remove("hidden");
+      guidedRunBtn.classList.toggle("hidden", !showReadyPlan);
+      guidedQueryPanel.classList.toggle("hidden", !showReadyPlan);
     }
     guidedResetBtn.classList.toggle("hidden", !["guided", "querySpec"].includes(queryMode));
     updateGuidedInteractionControls();
@@ -1002,12 +1041,13 @@
   }
 
   async function refreshCount() {
+    const evidenceQuery = activeEvidenceQuery;
     const isAcceptedGuidedQuery =
       queryMode === "guided" &&
-      guidedReviewStatus === "accepted" &&
-      guidedAuditId !== null &&
-      guidedIntentToken !== null &&
-      guidedQuerySpec !== null;
+      evidenceQuery?.mode === "guided" &&
+      evidenceQuery.auditId !== null &&
+      evidenceQuery.intentToken !== null &&
+      evidenceQuery.querySpec !== null;
     if (queryMode === "guided" && !isAcceptedGuidedQuery) {
       activeCountRequest = null;
       countRequestSequence += 1;
@@ -1019,17 +1059,17 @@
     // The accepted intent is executed through run_guided_query for paging, while its
     // backend-issued QuerySpec is safe to reuse for COUNT: the predicate compiler revalidates
     // any semantic selection against the current dataset and active semantic build.
-    const countSpec = isAcceptedGuidedQuery ? guidedQuerySpec : spec;
+    const countSpec = isAcceptedGuidedQuery ? evidenceQuery.querySpec : spec;
     const request = {
       id: ++countRequestSequence,
       contextRevision: guidedContextRevision,
       path: currentPath,
       sheet: currentSheet,
       mode: queryMode,
-      auditId: guidedAuditId,
-      intentToken: guidedIntentToken,
+      auditId: evidenceQuery?.auditId ?? null,
+      intentToken: evidenceQuery?.intentToken ?? null,
       table,
-      querySpec: guidedQuerySpec,
+      evidenceQuery,
       spec: snapshotQuerySpec(countSpec),
     };
     activeCountRequest = request;
@@ -1040,11 +1080,7 @@
       loadedContextIsCurrent(request) &&
       queryMode === request.mode &&
       table === request.table &&
-      (request.mode === "normal" || guidedQuerySpec === request.querySpec) &&
-      (request.mode !== "guided" ||
-        (guidedReviewStatus === "accepted" &&
-          guidedAuditId === request.auditId &&
-          guidedIntentToken === request.intentToken));
+      (request.mode === "normal" || activeEvidenceQuery === request.evidenceQuery);
     try {
       const count = await invoke("count_rows", { spec: request.spec });
       if (!isCurrent()) return;
@@ -1091,6 +1127,8 @@
     const isQuerySpecRequest = modeAtStart === "querySpec";
     const isTrackedEvidenceRequest = isGuidedRequest || isQuerySpecRequest;
     if (isTrackedEvidenceRequest && guidedActiveQuery !== null) return null;
+    const evidenceQuery = isTrackedEvidenceRequest ? activeEvidenceQuery : null;
+    if (isTrackedEvidenceRequest && evidenceQuery?.mode !== modeAtStart) return null;
     setAiMatchColumnVisible(isTrackedEvidenceRequest);
 
     const request = {
@@ -1099,9 +1137,9 @@
       path: currentPath,
       sheet: currentSheet,
       mode: modeAtStart,
-      auditId: guidedAuditId,
-      intentToken: guidedIntentToken,
-      querySpec: guidedQuerySpec,
+      auditId: evidenceQuery?.auditId ?? null,
+      intentToken: evidenceQuery?.intentToken ?? null,
+      evidenceQuery,
       cursor: spec.cursor,
       limit: spec.limit,
       spec: isGuidedRequest ? null : snapshotQuerySpec(),
@@ -1117,10 +1155,7 @@
       activeDataRequest === request &&
       loadedContextIsCurrent(request) &&
       queryMode === request.mode &&
-      (!isTrackedEvidenceRequest ||
-        (guidedAuditId === request.auditId &&
-          guidedIntentToken === request.intentToken &&
-          guidedQuerySpec === request.querySpec)) &&
+      (!isTrackedEvidenceRequest || activeEvidenceQuery === request.evidenceQuery) &&
       table === request.table;
 
     prevPageBtn.disabled = true;
@@ -1172,7 +1207,9 @@
 
   function applyControlsAndReload() {
     cancelSearchDebounce();
+    pendingSemanticSearch = null;
     queryMode = "normal";
+    activeEvidenceQuery = null;
     setAiMatchColumnVisible(false);
     guidedResetBtn.classList.add("hidden");
     spec.search = searchBox.value.trim() || null;
@@ -1281,23 +1318,62 @@
     }
   }
 
-  function requireFreshPreviewForSemanticIndex() {
-    if (
-      !guidedParseResult ||
-      guidedPreviewQueryText === null ||
-      guidedReviewStatus !== "unreviewed" ||
+  function previewMissedSemanticIndex(result = guidedParseResult) {
+    return (
+      result?.semanticStatus === "index_not_ready" &&
+      !querySpecUsesSemanticSelection(guidedQuerySpec)
+    );
+  }
+
+  function pendingSemanticSearchIsCurrent(request) {
+    return (
+      loadedContextIsCurrent(request) &&
+      guidedSearchBox.value.trim() === request.queryText &&
+      activeEvidenceQuery?.auditId === request.auditId &&
+      activeEvidenceQuery?.intentToken === request.intentToken &&
+      activeEvidenceQuery?.querySpec === request.querySpec &&
       ["guided", "querySpec"].includes(queryMode)
-    ) {
+    );
+  }
+
+  function refreshPendingSemanticSearch() {
+    if (semanticIndexState.status !== "ready" || pendingSemanticSearch === null) return;
+    const request = pendingSemanticSearch;
+    if (!pendingSemanticSearchIsCurrent(request)) {
+      pendingSemanticSearch = null;
       return;
     }
-    guidedPreviewQueryText = null;
-    guidedRunBtn.classList.add("hidden");
-    guidedRejectBtn.classList.add("hidden");
-    guidedClarification.textContent = "Semantic matching is now ready. Preview again to include semantic evidence candidates.";
-    guidedClarification.classList.remove("hidden");
-    decideGuidedParse("edited").catch((err) =>
-      console.error("could not retire the pre-semantic AI interpretation", err)
+    if (guidedActiveParse !== null || guidedActiveAction !== null || guidedActiveQuery !== null) {
+      setTimeout(refreshPendingSemanticSearch, 250);
+      return;
+    }
+    pendingSemanticSearch = null;
+    aiSearchAvailability.textContent = "Semantic matching is ready. Refreshing the evidence results...";
+    aiSearchAvailability.classList.remove("ready");
+    searchGuidedQuery(request.queryText, { semanticRetry: true }).catch((err) =>
+      console.error("automatic semantic evidence refresh failed", err)
     );
+  }
+
+  function queueSemanticSearchRefresh(request, plan) {
+    pendingSemanticSearch = {
+      ...request,
+      auditId: plan.auditId,
+      intentToken: plan.intentToken,
+      querySpec: plan.querySpec,
+    };
+    if (semanticIndexState.status === "ready") {
+      refreshPendingSemanticSearch();
+    }
+  }
+
+  function failPendingSemanticSearch() {
+    if (pendingSemanticSearch && pendingSemanticSearchIsCurrent(pendingSemanticSearch)) {
+      aiSearchAvailability.textContent =
+        "Exact AI results remain visible. Semantic matching could not be prepared for this file.";
+      aiSearchAvailability.classList.add("ready");
+    }
+    pendingSemanticSearch = null;
   }
 
   async function startSemanticIndexForLoadedFile() {
@@ -1346,7 +1422,7 @@
           error: null,
         };
         renderSemanticIndexState();
-        requireFreshPreviewForSemanticIndex();
+        refreshPendingSemanticSearch();
         return status;
       }
 
@@ -1372,7 +1448,7 @@
         error: null,
       };
       renderSemanticIndexState();
-      requireFreshPreviewForSemanticIndex();
+      refreshPendingSemanticSearch();
       return summary;
     } catch (err) {
       if (!semanticIndexRequestIsCurrent(request)) return null;
@@ -1394,6 +1470,7 @@
         error: String(err),
       };
       renderSemanticIndexState();
+      failPendingSemanticSearch();
       return null;
     } finally {
       if (semanticIndexRequestIsCurrent(request)) activeSemanticIndexRequest = null;
@@ -1656,7 +1733,10 @@
     }
   }
 
-  async function previewGuidedQuery(queryText = guidedSearchBox.value) {
+  async function previewGuidedQuery(
+    queryText = guidedSearchBox.value,
+    { showReadyPlan = true } = {}
+  ) {
     const trimmed = queryText.trim();
     if (!trimmed) return null;
     if (guidedActiveAction !== null || guidedActiveQuery !== null || sheetLoadInFlight) return null;
@@ -1674,8 +1754,8 @@
     guidedActiveParse = request;
 
     updateGuidedInteractionControls();
-    guidedQueryPanel.classList.remove("hidden");
-    guidedPreviewText.textContent = "Building an evidence search plan...";
+    guidedQueryPanel.classList.toggle("hidden", !showReadyPlan);
+    guidedPreviewText.textContent = "Understanding the evidence request...";
     guidedClarification.classList.add("hidden");
     guidedRunBtn.classList.add("hidden");
     guidedRejectBtn.classList.add("hidden");
@@ -1703,7 +1783,7 @@
         }
         return null;
       }
-      renderGuidedPreview(result, request.queryText);
+      renderGuidedPreview(result, request.queryText, { showReadyPlan });
       return result;
     } catch (err) {
       if (!guidedParseIsCurrent(request)) return null;
@@ -1720,6 +1800,197 @@
     }
   }
 
+  function guidedSearchResultIsCurrent(request, plan) {
+    return (
+      loadedContextIsCurrent(request) &&
+      guidedSearchBox.value.trim() === request.queryText &&
+      guidedPreviewQueryText === request.queryText &&
+      guidedAuditId === plan.auditId &&
+      guidedIntentToken === plan.intentToken &&
+      guidedQuerySpec === plan.querySpec &&
+      guidedPlanIsReadyToRun()
+    );
+  }
+
+  function showGuidedSearchFailure(message, { canRetry = false } = {}) {
+    guidedQueryPanel.classList.remove("hidden");
+    guidedAiStatus.classList.add("hidden");
+    guidedPreviewText.textContent = "The AI search could not be completed.";
+    guidedClarification.textContent = message;
+    guidedClarification.classList.remove("hidden");
+    guidedRunBtn.textContent = "Retry search";
+    guidedRunBtn.classList.toggle("hidden", !canRetry);
+    guidedRejectBtn.classList.add("hidden");
+    aiSearchAvailability.textContent = "The last AI search did not change the table.";
+    aiSearchAvailability.classList.remove("ready");
+  }
+
+  async function searchGuidedQuery(
+    queryText = guidedSearchBox.value,
+    { semanticRetry = false } = {}
+  ) {
+    const trimmed = queryText.trim();
+    if (!trimmed) return null;
+    if (guidedActiveParse !== null || guidedActiveAction !== null || guidedActiveQuery !== null || sheetLoadInFlight) {
+      return null;
+    }
+    pendingSemanticSearch = null;
+    const request = {
+      contextRevision: guidedContextRevision,
+      path: currentPath,
+      sheet: currentSheet,
+      queryText: trimmed,
+    };
+    aiSearchAvailability.textContent = "Understanding the request and searching the imported table...";
+    aiSearchAvailability.classList.remove("ready");
+
+    let result;
+    try {
+      result = await previewGuidedQuery(trimmed, { showReadyPlan: false });
+    } catch (err) {
+      if (loadedContextIsCurrent(request) && guidedSearchBox.value.trim() === request.queryText) {
+        showGuidedSearchFailure(`The request could not be understood: ${err}`);
+      }
+      throw err;
+    }
+    const plan = {
+      auditId: guidedAuditId,
+      intentToken: guidedIntentToken,
+      querySpec: guidedQuerySpec,
+    };
+    if (!result || !guidedSearchResultIsCurrent(request, plan)) {
+      if (loadedContextIsCurrent(request) && guidedParseResult?.needsClarification) {
+        aiSearchAvailability.textContent = "Add the requested detail, then search again.";
+        aiSearchAvailability.classList.remove("ready");
+      }
+      return result;
+    }
+
+    const missedSemanticIndex = previewMissedSemanticIndex(result);
+    if (missedSemanticIndex && semanticIndexState.status === "ready" && !semanticRetry) {
+      if (guidedAuditId !== null && guidedReviewStatus === "unreviewed") {
+        let retired;
+        try {
+          retired = await decideGuidedParse("edited");
+        } catch (err) {
+          showGuidedSearchFailure(`The first search plan could not be refreshed safely: ${err}`);
+          throw err;
+        }
+        if (!retired || !loadedContextIsCurrent(request) || guidedSearchBox.value.trim() !== request.queryText) {
+          return result;
+        }
+      }
+      return searchGuidedQuery(trimmed, { semanticRetry: true });
+    }
+
+    guidedQueryPanel.classList.add("hidden");
+    try {
+      const page = await runGuidedQuery(guidedIntentToken);
+      if (!guidedSearchResultIsCurrent(request, plan)) return result;
+      if (page === null) {
+        showGuidedSearchFailure("The table query failed. You can retry the same request.", {
+          canRetry: true,
+        });
+        return result;
+      }
+      const shown = Array.isArray(page.rows) ? page.rows.length : 0;
+      const resultMessage =
+        shown === 0
+          ? "Search complete. No evidence rows matched this request."
+          : `Showing ${shown.toLocaleString()} AI evidence row${shown === 1 ? "" : "s"}${page.hasMore ? " on this page" : ""}.`;
+      if (missedSemanticIndex && semanticIndexState.status === "ready" && !semanticRetry) {
+        return searchGuidedQuery(trimmed, { semanticRetry: true });
+      }
+      if (missedSemanticIndex && semanticIndexState.status === "building") {
+        queueSemanticSearchRefresh(request, plan);
+        aiSearchAvailability.textContent =
+          shown === 0
+            ? "No exact rows matched yet. Semantic matching is still preparing; results will refresh automatically."
+            : `${resultMessage} Semantic matching is still preparing; results will refresh automatically.`;
+      } else if (missedSemanticIndex) {
+        aiSearchAvailability.textContent = `${resultMessage} Semantic matching was not available for this run.`;
+      } else {
+        aiSearchAvailability.textContent = resultMessage;
+      }
+      aiSearchAvailability.classList.add("ready");
+      guidedQueryPanel.classList.add("hidden");
+      guidedResetBtn.classList.remove("hidden");
+      return result;
+    } catch (err) {
+      if (loadedContextIsCurrent(request) && guidedSearchBox.value.trim() === request.queryText) {
+        showGuidedSearchFailure(`The search could not start: ${err}`, {
+          canRetry: guidedPlanIsReadyToRun(),
+        });
+      }
+      throw err;
+    }
+  }
+
+  async function requestInitialEvidencePage(action, mode) {
+    const targetTable = table;
+    if (!targetTable) throw new Error("the evidence table is not available");
+    const previousRows = targetTable.getData();
+    prevPageBtn.disabled = true;
+    nextPageBtn.disabled = true;
+    showProgress("Searching evidence...", 0.5);
+    try {
+      const page =
+        mode === "guided"
+          ? await invoke("run_guided_query", {
+              intentToken: action.intentToken,
+              auditId: action.auditId,
+              cursor: null,
+              limit: PAGE_SIZE,
+            })
+          : await invoke("query_rows", {
+              spec: { ...action.querySpec, cursor: null, limit: PAGE_SIZE },
+            });
+      if (!guidedActionIsCurrent(action) || table !== targetTable) return null;
+      if (!page || !Array.isArray(page.rows)) {
+        throw new Error("the evidence query returned an invalid page");
+      }
+      await targetTable.replaceData(page.rows);
+      if (!guidedActionIsCurrent(action) || table !== targetTable) {
+        if (table === targetTable && loadedContextIsCurrent(action)) {
+          await targetTable.replaceData(previousRows);
+        }
+        return null;
+      }
+      return page;
+    } finally {
+      if (guidedActionIsCurrent(action)) {
+        prevPageBtn.disabled = cursorStack.length === 0;
+        nextPageBtn.disabled = !hasMore;
+        hideProgress();
+      }
+    }
+  }
+
+  function publishInitialEvidencePage(action, mode, page) {
+    if (mode === "querySpec") {
+      spec = { ...action.querySpec, cursor: null, limit: PAGE_SIZE };
+    }
+    queryMode = mode;
+    totalCount = null;
+    resetPagination();
+    nextCursor = page.nextCursor;
+    hasMore = Boolean(page.hasMore);
+    activeEvidenceQuery = {
+      mode,
+      auditId: action.auditId,
+      intentToken: action.intentToken,
+      querySpec: action.querySpec,
+    };
+    setAiMatchColumnVisible(true);
+    guidedResetBtn.classList.remove("hidden");
+    guidedRunBtn.textContent = "Search evidence";
+    guidedRunBtn.classList.remove("hidden");
+    prevPageBtn.disabled = true;
+    nextPageBtn.disabled = !hasMore;
+    updateRowCountLabel();
+    refreshCount();
+  }
+
   async function runGuidedQuery(intentToken = guidedIntentToken) {
     cancelSearchDebounce();
     const deterministicPlanReady =
@@ -1731,17 +2002,10 @@
       const action = beginGuidedAction("run-deterministic");
       if (!action) return null;
       try {
-        queryMode = "querySpec";
-        spec = { ...guidedQuerySpec, cursor: null, limit: PAGE_SIZE };
-        totalCount = null;
-        resetPagination();
-        guidedResetBtn.classList.remove("hidden");
         guidedRunBtn.textContent = "Searching...";
-        const page = await refreshData();
-        if (guidedActionIsCurrent(action)) {
-          guidedRunBtn.textContent = page ? "Search evidence" : "Retry";
-          guidedRunBtn.classList.remove("hidden");
-          refreshCount();
+        const page = await requestInitialEvidencePage(action, "querySpec");
+        if (page && guidedActionIsCurrent(action)) {
+          publishInitialEvidencePage(action, "querySpec", page);
         }
         return page;
       } finally {
@@ -1760,10 +2024,9 @@
     if (!action) return null;
 
     try {
-      guidedRunBtn.textContent = "Accepting plan...";
-      // Make the audit transition explicit so an acceptance failure (stale scan/library,
-      // rejected preview, or token mismatch) cannot be displayed as accepted. The query command
-      // repeats this check idempotently for direct-IPC safety.
+      guidedRunBtn.textContent = "Starting search...";
+      // Submitting "Search evidence" is the examiner's acceptance. The backend repeats this
+      // transition idempotently before every direct execution and validates the exact token.
       await invoke("accept_guided_query", {
         intentToken: action.intentToken,
         auditId: action.auditId,
@@ -1772,17 +2035,10 @@
 
       setGuidedReviewStatus("accepted");
       guidedRejectBtn.classList.add("hidden");
-      queryMode = "guided";
-      totalCount = null;
-      resetPagination();
-      guidedResetBtn.classList.remove("hidden");
       guidedRunBtn.textContent = "Searching...";
-
-      const page = await refreshData();
-      if (guidedActionIsCurrent(action)) {
-        guidedRunBtn.textContent = page ? "Search evidence" : "Retry";
-        guidedRunBtn.classList.remove("hidden");
-        refreshCount();
+      const page = await requestInitialEvidencePage(action, "guided");
+      if (page && guidedActionIsCurrent(action)) {
+        publishInitialEvidencePage(action, "guided", page);
       }
       return page;
     } catch (err) {
@@ -1807,7 +2063,7 @@
         intentToken: action.intentToken,
         decision,
       });
-      if (!guidedActionIsCurrent(action)) return false;
+      if (!guidedDecisionIsCurrent(action)) return false;
       setGuidedReviewStatus(decision);
       guidedRunBtn.classList.add("hidden");
       guidedRejectBtn.classList.add("hidden");
@@ -2076,6 +2332,7 @@
     if (!destPath) return;
 
     const modeAtStart = queryMode;
+    const evidenceQuery = activeEvidenceQuery;
     const context = {
       contextRevision: guidedContextRevision,
       path: currentPath,
@@ -2090,17 +2347,25 @@
       const result =
         modeAtStart === "guided"
           ? await invoke("export_guided_data", {
-              intentToken: guidedIntentToken,
-              auditId: guidedAuditId,
+              intentToken: evidenceQuery?.intentToken,
+              auditId: evidenceQuery?.auditId,
               format,
               destPath,
             })
           : await invoke("export_data", { spec: exportSpec, format, destPath });
-      if (!loadedContextIsCurrent(context) || queryMode !== modeAtStart) return;
+      if (
+        !loadedContextIsCurrent(context) ||
+        queryMode !== modeAtStart ||
+        (["guided", "querySpec"].includes(modeAtStart) && activeEvidenceQuery !== evidenceQuery)
+      ) return;
       hideProgress();
       alert(`Exported ${result.rowCount.toLocaleString()} rows to ${result.destPath}`);
     } catch (err) {
-      if (!loadedContextIsCurrent(context) || queryMode !== modeAtStart) return;
+      if (
+        !loadedContextIsCurrent(context) ||
+        queryMode !== modeAtStart ||
+        (["guided", "querySpec"].includes(modeAtStart) && activeEvidenceQuery !== evidenceQuery)
+      ) return;
       hideProgress();
       alert(`Export failed: ${err}`);
     }
@@ -2160,6 +2425,7 @@
   searchBox.addEventListener("input", debouncedApply);
   guidedSearchBox.addEventListener("input", () => {
     const currentText = guidedSearchBox.value.trim();
+    pendingSemanticSearch = null;
     if (guidedActiveParse && currentText !== guidedActiveParse.queryText) {
       cancelActiveGuidedParse();
       guidedQueryPanel.classList.remove("hidden");
@@ -2169,7 +2435,7 @@
       guidedPreviewQueryText = null;
       guidedRunBtn.classList.add("hidden");
       guidedRejectBtn.classList.add("hidden");
-      guidedClarification.textContent = "Request changed. Preview the updated search before running it.";
+      guidedClarification.textContent = "Request changed. Search again to use the updated wording.";
       guidedClarification.classList.remove("hidden");
       if (guidedAuditId !== null && guidedReviewStatus === "unreviewed") {
         decideGuidedParse("edited").catch((err) =>
@@ -2180,15 +2446,20 @@
   });
   guidedSearchForm.addEventListener("submit", (event) => {
     event.preventDefault();
-    previewGuidedQuery().catch((err) => alert(`Evidence search preview failed: ${err}`));
+    searchGuidedQuery().catch((err) => alert(`Evidence search failed: ${err}`));
   });
   guidedRunBtn.addEventListener("click", () => {
-    runGuidedQuery().catch((err) => alert(`Evidence search failed: ${err}`));
+    const retrying = guidedRunBtn.textContent === "Retry search";
+    const action = retrying ? searchGuidedQuery() : runGuidedQuery();
+    action.catch((err) => alert(`Evidence search failed: ${err}`));
   });
   guidedRejectBtn.addEventListener("click", () => {
     decideGuidedParse("rejected").catch((err) => alert(`Could not record decision: ${err}`));
   });
   guidedResetBtn.addEventListener("click", () => {
+    resetGuidedQueryUi();
+    aiSearchAvailability.textContent = "Ready to search every imported row. No enrichment scan is required.";
+    aiSearchAvailability.classList.add("ready");
     applyControlsAndReload();
   });
   guidedPanelClose.addEventListener("click", () => {
@@ -2434,6 +2705,10 @@
     previewAiEvidenceQueryForTest(queryText) {
       guidedSearchBox.value = queryText;
       return previewGuidedQuery(queryText);
+    },
+    searchAiEvidenceForTest(queryText) {
+      guidedSearchBox.value = queryText;
+      return searchGuidedQuery(queryText);
     },
     runAiEvidenceQueryForTest(intentToken = guidedIntentToken) {
       return runGuidedQuery(intentToken);

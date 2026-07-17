@@ -27,6 +27,10 @@ pub struct GuidedQueryPreview {
     pub audit_id: Option<i64>,
     pub review_status: String,
     pub validation_status: Option<String>,
+    /// Structured semantic-retrieval outcome supplied by the command layer (for example
+    /// `applied` or `index_not_ready`). The UI uses this only to schedule a safe automatic
+    /// refresh; the trusted selection remains embedded and validated in `query_spec`.
+    pub semantic_status: Option<String>,
     pub query_spec: Option<QuerySpec>,
     pub match_explanation: Vec<String>,
 }
@@ -324,6 +328,7 @@ pub fn parse_guided_query_with_llm_and_semantic_selection(
         audit_id: Some(audit_id),
         review_status: "unreviewed".to_string(),
         validation_status: Some(result.validation_status),
+        semantic_status: None,
         query_spec,
         match_explanation,
     })
@@ -453,6 +458,7 @@ fn parse_with_context(
         audit_id: None,
         review_status: "not_applicable".to_string(),
         validation_status: None,
+        semantic_status: None,
         query_spec: None,
         match_explanation: Vec::new(),
     })
@@ -697,6 +703,7 @@ fn clarification(message: &str, suggestions: &[&str]) -> Result<GuidedQueryPrevi
         audit_id: None,
         review_status: "not_applicable".to_string(),
         validation_status: None,
+        semantic_status: None,
         query_spec: None,
         match_explanation: Vec::new(),
     })
@@ -861,6 +868,7 @@ fn deterministic_llm_preflight(
             audit_id: None,
             review_status: "not_applicable".to_string(),
             validation_status: None,
+            semantic_status: None,
             query_spec: None,
             match_explanation: Vec::new(),
         }));

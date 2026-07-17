@@ -31,16 +31,19 @@ See the [wiki](../../wiki) for a full user guide.
   query over the complete raw table. MiniLM can supplement that plan with
   semantically similar evidence. Neither path is restricted by data mappings
   or rows found by the optional threat scan.
-- A validated, examiner-visible query plan before execution, plus a
-  `Why matched` explanation on returned rows. Generated search values must be
-  grounded in the examiner's request. The models cannot execute SQL, read
-  arbitrary files, launch processes, or access the network.
+- One-step AI search: submitting a request validates and executes its bounded
+  plan immediately, and asks for clarification only when a safe search cannot
+  be formed. Returned rows include a `Why matched` explanation. Generated
+  search values must be grounded in the examiner's request. The models cannot
+  execute SQL, read arbitrary files, launch processes, or access the network.
 - Resumable semantic preparation after import. Repeated log templates are
   deduplicated, volatile IDs remain available to exact search, and balanced
   per-column chunks keep later columns represented. Lexical/structured AI
   search is available while this runs. Semantic document selection is
   deliberately bounded and disclosed, while every raw row mapped to a
-  selected document remains included in count, pagination, and export.
+  selected document remains included in count, pagination, and export. If an
+  exact-only search finishes while semantic preparation is still running, its
+  results refresh automatically when semantic matching becomes ready.
 - One-click multi-sheet XLSX report export: a case-summary sheet, a
   chronological MITRE-mapped timeline, and one sheet per matched
   technique category — every row traceable back to its original source

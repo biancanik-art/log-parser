@@ -20,7 +20,7 @@ import urllib.request
 
 
 CHUNK_SIZE = 8 * 1024 * 1024
-USER_AGENT = "log-parser-build/0.2.0"
+USER_AGENT = "log-parser-build/0.2.1"
 NETWORK_TIMEOUT_SECONDS = 60
 MAX_DOWNLOAD_ATTEMPTS = 4
 INITIAL_RETRY_DELAY_SECONDS = 2

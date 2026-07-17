@@ -33,9 +33,10 @@
       <form id="guided-search-form" class="guided-search-form">
         <label for="guided-search-box" class="sr-only">Describe evidence to find</label>
         <input id="guided-search-box" type="search" maxlength="4096" placeholder="Example: failed logons for alice, then show related PowerShell activity chronologically" disabled />
-        <button id="guided-search-submit" class="btn btn-primary" disabled>Preview search</button>
+        <button id="guided-search-submit" class="btn btn-primary" disabled>Search evidence</button>
+        <button id="guided-reset-btn" type="button" class="btn hidden">Clear AI search</button>
       </form>
-      <div id="ai-search-availability" class="ai-search-availability">Import a file to search its evidence.</div>
+      <div id="ai-search-availability" class="ai-search-availability" aria-live="polite">Import a file to search its evidence.</div>
       <div id="semantic-index-status" class="semantic-index-status">Semantic matching starts automatically after import.</div>
     </section>
 
@@ -44,10 +45,10 @@
       <div id="progress-label"></div>
     </div>
 
-    <section id="guided-query-panel" class="intel-panel guided-query-panel hidden">
+    <section id="guided-query-panel" class="intel-panel guided-query-panel hidden" aria-live="polite">
       <div class="intel-panel-header">
-        <strong>Evidence search plan</strong>
-        <button id="guided-panel-close" class="btn btn-small" title="Dismiss preview" aria-label="Dismiss evidence search preview">&times;</button>
+        <strong>AI search needs attention</strong>
+        <button id="guided-panel-close" class="btn btn-small" title="Dismiss message" aria-label="Dismiss AI search message">&times;</button>
       </div>
       <div id="guided-ai-status" class="guided-ai-status hidden"></div>
       <div id="guided-preview-text" class="intel-panel-body"></div>
@@ -55,7 +56,6 @@
       <div class="intel-panel-actions">
         <button id="guided-run-btn" class="btn btn-primary hidden">Search evidence</button>
         <button id="guided-reject-btn" class="btn hidden">Reject interpretation</button>
-        <button id="guided-reset-btn" class="btn hidden">Return to table filters</button>
       </div>
     </section>
 

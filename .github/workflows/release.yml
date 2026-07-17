@@ -4,7 +4,6 @@ on:
   push:
     tags:
       - 'v*.*.*'
-  workflow_dispatch:
 
 jobs:
   release:
@@ -18,8 +17,6 @@ jobs:
             args: '--target aarch64-apple-darwin'
           - platform: 'macos-latest'
             args: '--target x86_64-apple-darwin'
-          - platform: 'ubuntu-22.04'
-            args: ''
           - platform: 'windows-latest'
             args: ''
 
@@ -27,16 +24,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: install Linux dependencies
-        if: matrix.platform == 'ubuntu-22.04'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf xdg-utils
-
       - name: install Rust stable
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+
+      - name: install Node for frontend regression tests
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Verify the direct AI search flow
+        run: |
+          node --check frontend/app.js
+          node --test frontend/tests/guided-query-flow.test.cjs
 
       - name: Rust build cache
         uses: Swatinem/rust-cache@v2
@@ -65,7 +66,7 @@ jobs:
           tagName: ${{ github.ref_name }}
           releaseName: 'log-parser v__VERSION__'
           releaseBody: |
-            Pre-built installers for Windows, macOS (Apple Silicon and Intel), and Linux.
+            Pre-built installers for Windows and macOS (Apple Silicon and Intel).
             See the assets below to download and install.
           releaseDraft: true
           prerelease: false
