@@ -10,7 +10,122 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tauri::{path::BaseDirectory, AppHandle, Emitter, Manager, State};
+
+const IMPORT_CACHE_RECOVERY_MAX_ATTEMPTS: usize = 64;
+const IMPORT_CACHE_RECOVERY_MAX_ELAPSED: Duration = Duration::from_secs(15);
+
+#[derive(Debug)]
+enum ImportCacheOpenError {
+    Reimportable,
+    Preserved(String),
+}
+
+fn cache_open_error_is_reimportable(error: &rusqlite::Error) -> bool {
+    matches!(
+        error.sqlite_error_code(),
+        Some(rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase)
+    )
+}
+
+fn cache_metadata_error_is_reimportable(error: &rusqlite::Error, table: &str) -> bool {
+    if cache_open_error_is_reimportable(error) {
+        return true;
+    }
+    match error {
+        rusqlite::Error::QueryReturnedNoRows => true,
+        rusqlite::Error::SqliteFailure(code, Some(message)) => {
+            code.code == rusqlite::ErrorCode::Unknown
+                && (message == &format!("no such table: {table}")
+                    || message.starts_with("no such column:"))
+        }
+        // Conversion/index/type failures mean the cache metadata itself does not match the
+        // schema this version writes. Other SQLite failures may be transient access, I/O, or
+        // contention errors and must preserve the existing database.
+        rusqlite::Error::SqliteFailure(_, _) => false,
+        rusqlite::Error::FromSqlConversionFailure(_, _, _)
+        | rusqlite::Error::IntegralValueOutOfRange(_, _)
+        | rusqlite::Error::Utf8Error(_)
+        | rusqlite::Error::InvalidColumnIndex(_)
+        | rusqlite::Error::InvalidColumnName(_)
+        | rusqlite::Error::InvalidColumnType(_, _, _) => true,
+        _ => false,
+    }
+}
+
+fn load_existing_cache_metadata_for_import(
+    conn: &rusqlite::Connection,
+) -> Result<(Vec<ColumnMeta>, ImportInfo), ImportCacheOpenError> {
+    let columns = db::load_columns(conn).map_err(|error| {
+        if cache_metadata_error_is_reimportable(&error, "_meta") {
+            ImportCacheOpenError::Reimportable
+        } else {
+            ImportCacheOpenError::Preserved(format!(
+                "the existing cache opened, but its column metadata could not be read safely; it was preserved and was not re-imported: {error}"
+            ))
+        }
+    })?;
+    let info = db::load_import_info(conn).map_err(|error| {
+        if cache_metadata_error_is_reimportable(&error, "_import_info") {
+            ImportCacheOpenError::Reimportable
+        } else {
+            ImportCacheOpenError::Preserved(format!(
+                "the existing cache opened, but its import metadata could not be read safely; it was preserved and was not re-imported: {error}"
+            ))
+        }
+    })?;
+    Ok((columns, info))
+}
+
+fn open_existing_cache_for_import(
+    db_path: &Path,
+) -> Result<rusqlite::Connection, ImportCacheOpenError> {
+    open_existing_cache_for_import_with_limits(
+        db_path,
+        IMPORT_CACHE_RECOVERY_MAX_ATTEMPTS,
+        IMPORT_CACHE_RECOVERY_MAX_ELAPSED,
+    )
+}
+
+fn open_existing_cache_for_import_with_limits(
+    db_path: &Path,
+    max_attempts: usize,
+    max_elapsed: Duration,
+) -> Result<rusqlite::Connection, ImportCacheOpenError> {
+    let started = std::time::Instant::now();
+    let max_attempts = max_attempts.max(1);
+    let mut attempts = 0_usize;
+    let mut recovery_started = false;
+
+    loop {
+        attempts += 1;
+        match db::open(db_path) {
+            Ok(conn) => return Ok(conn),
+            Err(error) if db::is_row_time_recovery_backlog(&error) => {
+                recovery_started = true;
+                if attempts >= max_attempts || started.elapsed() >= max_elapsed {
+                    return Err(ImportCacheOpenError::Preserved(format!(
+                        "timestamp recovery for the existing cache did not finish after {attempts} bounded open attempts; the existing cache was preserved and was not re-imported: {error}"
+                    )));
+                }
+            }
+            Err(error) if recovery_started => {
+                return Err(ImportCacheOpenError::Preserved(format!(
+                    "timestamp recovery for the existing cache could not continue after {attempts} bounded open attempts; the existing cache was preserved and was not re-imported: {error}"
+                )));
+            }
+            Err(error) if cache_open_error_is_reimportable(&error) => {
+                return Err(ImportCacheOpenError::Reimportable);
+            }
+            Err(error) => {
+                return Err(ImportCacheOpenError::Preserved(format!(
+                    "the existing cache could not be opened safely; it was preserved and was not re-imported. Retry after resolving database access or contention: {error}"
+                )));
+            }
+        }
+    }
+}
 
 pub struct AppStateInner {
     pub db_path: PathBuf,
@@ -537,14 +652,18 @@ async fn import_sheet_locked(
     let (columns, row_count, from_cache) = tauri::async_runtime::spawn_blocking(
         move || -> Result<(Vec<ColumnMeta>, i64, bool), String> {
             if db_path_for_task.exists() {
-                if let Ok(conn) = db::open(&db_path_for_task) {
-                    if let (Ok(columns), Ok(info)) =
-                        (db::load_columns(&conn), db::load_import_info(&conn))
-                    {
-                        if info.sheet_name == sheet_for_task {
+                match open_existing_cache_for_import(&db_path_for_task) {
+                    Ok(conn) => match load_existing_cache_metadata_for_import(&conn) {
+                        Ok((columns, info)) if info.sheet_name == sheet_for_task => {
                             return Ok((columns, info.row_count, true));
                         }
+                        Ok(_) | Err(ImportCacheOpenError::Reimportable) => {}
+                        Err(ImportCacheOpenError::Preserved(message)) => return Err(message),
+                    },
+                    Err(ImportCacheOpenError::Preserved(message)) => {
+                        return Err(message);
                     }
+                    Err(ImportCacheOpenError::Reimportable) => {}
                 }
                 // Cache file exists but isn't usable (sheet-name mismatch, or corrupt/partial
                 // leftovers) — fall through and rebuild it below rather than failing outright.
@@ -1322,6 +1441,177 @@ mod tests {
             col_index: 0,
             inferred_type: "text".to_string(),
         }]
+    }
+
+    fn import_cache_test_path(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "log-parser-{label}-{}-{}.sqlite3",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ))
+    }
+
+    fn create_existing_cache_with_abandoned_stage(path: &Path, stage_rows: i64) {
+        let columns = test_columns();
+        let mut conn = Connection::open(path).unwrap();
+        db::create_schema(&conn, &columns).unwrap();
+        conn.execute(
+            "INSERT INTO rows (row_num, description) VALUES (1, 'preserved evidence')",
+            [],
+        )
+        .unwrap();
+        db::record_import_info(
+            &conn,
+            &ImportInfo {
+                source_path: "preserved.xlsx".to_string(),
+                sheet_name: "Evidence".to_string(),
+                row_count: 1,
+                imported_at: "2026-07-17T00:00:00Z".to_string(),
+            },
+        )
+        .unwrap();
+        conn.execute_batch(
+            "CREATE TABLE _column_roles (marker TEXT NOT NULL);
+             INSERT INTO _column_roles(marker) VALUES ('role-marker');
+             CREATE TABLE _llm_parse_audit (marker TEXT NOT NULL);
+             INSERT INTO _llm_parse_audit(marker) VALUES ('audit-marker');
+             CREATE TABLE _semantic_v2_active (marker TEXT NOT NULL);
+             INSERT INTO _semantic_v2_active(marker) VALUES ('semantic-marker');
+             CREATE TABLE _row_time_stage_interrupted (
+                row_num INTEGER PRIMARY KEY,
+                epoch_ms INTEGER NOT NULL,
+                utc_text TEXT NOT NULL,
+                source_text TEXT NOT NULL,
+                parse_status TEXT NOT NULL
+             );",
+        )
+        .unwrap();
+        let tx = conn.transaction().unwrap();
+        {
+            let mut insert = tx
+                .prepare(
+                    "INSERT INTO _row_time_stage_interrupted (
+                        row_num, epoch_ms, utc_text, source_text, parse_status
+                     ) VALUES (?1, ?1, 'x', 'x', 'test')",
+                )
+                .unwrap();
+            for row_num in 1..=stage_rows {
+                insert.execute([row_num]).unwrap();
+            }
+        }
+        tx.commit().unwrap();
+    }
+
+    fn marker(conn: &Connection, table: &str) -> String {
+        conn.query_row(&format!("SELECT marker FROM {table}"), [], |row| row.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn cache_open_retries_timestamp_recovery_without_replacing_saved_state() {
+        let path = import_cache_test_path("import-cache-recovery");
+        create_existing_cache_with_abandoned_stage(&path, 32_769);
+
+        let conn = open_existing_cache_for_import(&path)
+            .expect("normal cache loading must drive bounded timestamp recovery to completion");
+        let (columns, info) = load_existing_cache_metadata_for_import(&conn).unwrap();
+        assert_eq!(columns.len(), 1);
+        assert_eq!(columns[0].sql_name, "description");
+        assert_eq!(columns[0].original_name, "Description");
+        assert_eq!(info.sheet_name, "Evidence");
+        assert_eq!(marker(&conn, "_column_roles"), "role-marker");
+        assert_eq!(marker(&conn, "_llm_parse_audit"), "audit-marker");
+        assert_eq!(marker(&conn, "_semantic_v2_active"), "semantic-marker");
+        assert_eq!(
+            conn.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM sqlite_master
+                    WHERE type = 'table' AND name = '_row_time_stage_interrupted'
+                 )",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0
+        );
+        drop(conn);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn exhausted_timestamp_recovery_returns_preservation_error_without_reimport() {
+        let path = import_cache_test_path("import-cache-recovery-limit");
+        create_existing_cache_with_abandoned_stage(&path, 32_769);
+
+        let error =
+            match open_existing_cache_for_import_with_limits(&path, 1, Duration::from_secs(60)) {
+                Err(ImportCacheOpenError::Preserved(message)) => message,
+                Err(other) => panic!("unexpected cache-open classification: {other:?}"),
+                Ok(_) => panic!("one bounded pass must leave an explicit recovery backlog"),
+            };
+        assert!(error.contains("existing cache was preserved"));
+        assert!(error.contains("was not re-imported"));
+
+        let raw = Connection::open(&path).unwrap();
+        assert_eq!(marker(&raw, "_column_roles"), "role-marker");
+        assert_eq!(marker(&raw, "_llm_parse_audit"), "audit-marker");
+        assert_eq!(marker(&raw, "_semantic_v2_active"), "semantic-marker");
+        assert_eq!(
+            raw.query_row(
+                "SELECT COUNT(*) FROM _row_time_stage_interrupted",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1
+        );
+        drop(raw);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn cache_error_policy_preserves_contention_and_reimports_only_corruption() {
+        let busy = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+            Some("database is busy".to_string()),
+        );
+        assert!(!cache_open_error_is_reimportable(&busy));
+        assert!(!cache_metadata_error_is_reimportable(&busy, "_meta"));
+
+        let corrupt = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CORRUPT),
+            Some("database disk image is malformed".to_string()),
+        );
+        assert!(cache_open_error_is_reimportable(&corrupt));
+        assert!(cache_metadata_error_is_reimportable(&corrupt, "_meta"));
+    }
+
+    #[test]
+    fn metadata_read_contention_returns_preservation_error_and_keeps_markers() {
+        let path = import_cache_test_path("import-cache-metadata-busy");
+        create_existing_cache_with_abandoned_stage(&path, 0);
+        let reader = Connection::open(&path).unwrap();
+        reader.busy_timeout(Duration::from_millis(1)).unwrap();
+        let writer = Connection::open(&path).unwrap();
+        writer.execute_batch("BEGIN EXCLUSIVE").unwrap();
+
+        match load_existing_cache_metadata_for_import(&reader) {
+            Err(ImportCacheOpenError::Preserved(message)) => {
+                assert!(message.contains("preserved"));
+                assert!(message.contains("not re-imported"));
+            }
+            other => panic!("metadata contention must preserve the cache: {other:?}"),
+        }
+        writer.execute_batch("ROLLBACK").unwrap();
+        assert_eq!(marker(&reader, "_column_roles"), "role-marker");
+        assert_eq!(marker(&reader, "_llm_parse_audit"), "audit-marker");
+        assert_eq!(marker(&reader, "_semantic_v2_active"), "semantic-marker");
+        drop(writer);
+        drop(reader);
+        let _ = std::fs::remove_file(path);
     }
 
     fn selection(documents_retained: usize) -> semantic::SemanticSelectionSummary {

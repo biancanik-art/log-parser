@@ -16,6 +16,9 @@ pub const CACHE_BUSY_TIMEOUT: Duration = Duration::from_secs(3);
 const ROW_TIME_SCAVENGE_TABLE_LIMIT: usize = 4;
 const ROW_TIME_SCAVENGE_ROW_LIMIT: i64 = 32_768;
 const ROW_TIME_MAX_LIVE_OPERATIONS: usize = 32;
+const ROW_TIME_FOREIGN_OPERATION_LEASE: Duration = Duration::from_secs(10 * 60);
+const ROW_TIME_RECOVERY_BACKLOG_MESSAGE: &str =
+    "bounded timestamp recovery made progress but abandoned staging data remains; retry opening the cache to continue cleanup";
 static ROW_TIME_OPERATION_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug)]
@@ -161,6 +164,18 @@ fn row_time_recovery_busy(message: impl Into<String>) -> rusqlite::Error {
     )
 }
 
+/// Distinguishes the deliberate, progress-making recovery retry from ordinary SQLite busy
+/// errors. Cache loading may retry only this exact condition; treating a lock/contention error
+/// as recovery progress could otherwise replace or hide an unusable cache.
+pub fn is_row_time_recovery_backlog(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(code, Some(message))
+            if code.code == rusqlite::ErrorCode::DatabaseBusy
+                && message == ROW_TIME_RECOVERY_BACKLOG_MESSAGE
+    )
+}
+
 fn sqlite_table_exists(conn: &Connection, table: &str) -> rusqlite::Result<bool> {
     conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
@@ -204,11 +219,36 @@ fn row_time_cleanup_candidates(
     names
 }
 
+/// A foreign process refreshes `updated_at` after every staged batch. A short grace lease avoids
+/// mistaking its freshly committed claim for a crashed operation while still making abandoned
+/// cross-process objects eligible for bounded cleanup later.
+fn row_time_foreign_operation_lease_is_fresh(updated_at: &str) -> bool {
+    let Ok(updated_at) = chrono::DateTime::parse_from_rfc3339(updated_at) else {
+        return false;
+    };
+    let age = chrono::Utc::now().signed_duration_since(updated_at.with_timezone(&chrono::Utc));
+    if age < chrono::Duration::zero() {
+        return true;
+    }
+    age.to_std()
+        .map(|age| age <= ROW_TIME_FOREIGN_OPERATION_LEASE)
+        .unwrap_or(false)
+}
+
+fn scavenge_abandoned_row_time_objects(conn: &mut Connection) -> rusqlite::Result<()> {
+    scavenge_abandoned_row_time_objects_with_hooks(conn, || {}, || {})
+}
+
 /// Reclaims timestamp staging objects left by a crashed/panicked operation. The work per open is
 /// deliberately capped. If the cap cannot finish recovery, the open fails explicitly after
 /// committing bounded progress; retrying continues cleanup instead of silently retaining an
-/// unbounded cache. Live operations in this process are excluded by persisted token + registry.
-fn scavenge_abandoned_row_time_objects(conn: &mut Connection) -> rusqlite::Result<()> {
+/// unbounded cache. Same-process operations use the live registry; fresh foreign operations use
+/// the persisted heartbeat lease.
+fn scavenge_abandoned_row_time_objects_with_hooks(
+    conn: &mut Connection,
+    before_publication_authority: impl FnOnce(),
+    after_publication_authority: impl FnOnce(),
+) -> rusqlite::Result<()> {
     let has_candidates: bool = conn.query_row(
         "SELECT EXISTS(
             SELECT 1 FROM sqlite_master
@@ -219,23 +259,33 @@ fn scavenge_abandoned_row_time_objects(conn: &mut Connection) -> rusqlite::Resul
         [],
         |row| row.get::<_, i64>(0),
     )? != 0;
-    let has_operations = sqlite_table_exists(conn, "_row_time_operation")?;
-    if !has_candidates && !has_operations {
+    let has_operation_rows = sqlite_table_exists(conn, "_row_time_operation")?
+        && conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM _row_time_operation LIMIT 1)",
+            [],
+            |row| row.get::<_, i64>(0),
+        )? != 0;
+    if !has_candidates && !has_operation_rows {
         return Ok(());
     }
 
+    // The test hook models a claim being committed after the cheap read-only preflight. Taking
+    // SQLite publication authority before consulting the process registry makes that ordering
+    // safe: an operation is either visible in both places, or cannot commit until this cleanup
+    // transaction has finished.
+    before_publication_authority();
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    after_publication_authority();
     let live_tokens = live_row_time_operation_tokens()
         .lock()
-        .map_err(|_| row_time_recovery_busy("timestamp operation registry is unavailable"))?
-        .clone();
+        .map_err(|_| row_time_recovery_busy("timestamp operation registry is unavailable"))?;
     let session = row_time_process_session().to_string();
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let mut preserved = HashSet::new();
     let mut abandoned_tokens = Vec::new();
     if sqlite_table_exists(&tx, "_row_time_operation")? {
         let operations = {
             let mut statement = tx.prepare(
-                "SELECT owner_token, owner_session, stage_name, backup_name
+                "SELECT owner_token, owner_session, stage_name, backup_name, updated_at
                  FROM _row_time_operation",
             )?;
             let rows = statement.query_map([], |row| {
@@ -244,13 +294,17 @@ fn scavenge_abandoned_row_time_objects(conn: &mut Connection) -> rusqlite::Resul
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
                     row.get::<_, Option<String>>(3)?,
+                    row.get::<_, String>(4)?,
                 ))
             })?;
             let operations = rows.collect::<rusqlite::Result<Vec<_>>>()?;
             operations
         };
-        for (token, owner_session, stage_name, backup_name) in operations {
-            if owner_session == session && live_tokens.contains(&token) {
+        for (token, owner_session, stage_name, backup_name, updated_at) in operations {
+            let live_in_this_process = owner_session == session && live_tokens.contains(&token);
+            let leased_by_another_process =
+                owner_session != session && row_time_foreign_operation_lease_is_fresh(&updated_at);
+            if live_in_this_process || leased_by_another_process {
                 preserved.insert(stage_name);
                 if let Some(backup_name) = backup_name {
                     preserved.insert(backup_name);
@@ -307,9 +361,7 @@ fn scavenge_abandoned_row_time_objects(conn: &mut Connection) -> rusqlite::Resul
     let backlog = !row_time_cleanup_candidates(&tx, &preserved, 1)?.is_empty();
     tx.commit()?;
     if backlog {
-        return Err(row_time_recovery_busy(
-            "bounded timestamp recovery made progress but abandoned staging data remains; retry opening the cache to continue cleanup",
-        ));
+        return Err(row_time_recovery_busy(ROW_TIME_RECOVERY_BACKLOG_MESSAGE));
     }
     Ok(())
 }
@@ -466,26 +518,38 @@ pub fn begin_row_time_operation(
     stage_name: &str,
     index_name: &str,
 ) -> rusqlite::Result<RowTimeOperationClaim> {
+    begin_row_time_operation_with_hook(conn, stage_name, index_name, || {})
+}
+
+fn begin_row_time_operation_with_hook(
+    conn: &mut Connection,
+    stage_name: &str,
+    index_name: &str,
+    after_publication_authority: impl FnOnce(),
+) -> rusqlite::Result<RowTimeOperationClaim> {
     create_row_time_table(conn)?;
     let session = row_time_process_session().to_string();
     let sequence = ROW_TIME_OPERATION_COUNTER.fetch_add(1, Ordering::Relaxed);
     let owner_token = format!("{session}-{sequence}");
-    {
-        let mut live = live_row_time_operation_tokens()
-            .lock()
-            .map_err(|_| row_time_recovery_busy("timestamp operation registry is unavailable"))?;
-        if live.len() >= ROW_TIME_MAX_LIVE_OPERATIONS {
-            return Err(row_time_recovery_busy(
-                "too many timestamp normalization operations are active",
-            ));
-        }
-        live.insert(owner_token.clone());
+    let stage = quote_ident(stage_name);
+    let index = quote_ident(index_name);
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    after_publication_authority();
+
+    // Scavenging uses the same SQLite-then-registry lock order. Keep the registry guard through
+    // commit so a published operation row and its in-process liveness token become visible as
+    // one ordered event to every later scavenger.
+    let mut live = live_row_time_operation_tokens()
+        .lock()
+        .map_err(|_| row_time_recovery_busy("timestamp operation registry is unavailable"))?;
+    if live.len() >= ROW_TIME_MAX_LIVE_OPERATIONS {
+        return Err(row_time_recovery_busy(
+            "too many timestamp normalization operations are active",
+        ));
     }
+    live.insert(owner_token.clone());
 
     let result = (|| {
-        let stage = quote_ident(stage_name);
-        let index = quote_ident(index_name);
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let advanced = tx.execute(
             "UPDATE _row_time_operation_control
              SET latest_generation = latest_generation + 1
@@ -529,10 +593,9 @@ pub fn begin_row_time_operation(
         })
     })();
     if result.is_err() {
-        if let Ok(mut live) = live_row_time_operation_tokens().lock() {
-            live.remove(&owner_token);
-        }
+        live.remove(&owner_token);
     }
+    drop(live);
     result
 }
 
@@ -540,26 +603,30 @@ pub fn row_time_operation_is_latest(
     conn: &Connection,
     claim: &RowTimeOperationClaim,
 ) -> rusqlite::Result<bool> {
-    conn.query_row(
-        "SELECT EXISTS(
-            SELECT 1
-            FROM _row_time_operation_control c
-            JOIN _row_time_operation o ON o.generation = c.latest_generation
-            WHERE c.singleton = 1
-              AND o.generation = ?1
-              AND o.owner_token = ?2
-              AND o.owner_session = ?3
-              AND o.stage_name = ?4
-         )",
+    // The ownership check doubles as the persisted heartbeat used by other application
+    // processes. Scavengers retain a foreign claim while this timestamp remains within the
+    // bounded lease window.
+    conn.execute(
+        "UPDATE _row_time_operation
+         SET updated_at = ?5
+         WHERE generation = ?1
+           AND owner_token = ?2
+           AND owner_session = ?3
+           AND stage_name = ?4
+           AND generation = (
+                SELECT latest_generation
+                FROM _row_time_operation_control
+                WHERE singleton = 1
+           )",
         rusqlite::params![
             claim.generation,
             claim.owner_token,
             claim.owner_session,
-            claim.stage_name
+            claim.stage_name,
+            chrono::Utc::now().to_rfc3339()
         ],
-        |row| row.get::<_, i64>(0),
     )
-    .map(|value| value != 0)
+    .map(|changed| changed == 1)
 }
 
 pub fn set_row_time_operation_backup(
@@ -672,6 +739,250 @@ pub fn load_import_info(conn: &Connection) -> rusqlite::Result<ImportInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn timestamp_test_path(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "log-parser-{label}-{}-{}.sqlite3",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ))
+    }
+
+    fn create_timestamp_object(conn: &Connection, table_name: &str) {
+        conn.execute_batch(&format!(
+            "CREATE TABLE {} (
+                row_num INTEGER PRIMARY KEY,
+                epoch_ms INTEGER NOT NULL,
+                utc_text TEXT NOT NULL,
+                source_text TEXT NOT NULL,
+                parse_status TEXT NOT NULL
+             );",
+            quote_ident(table_name)
+        ))
+        .unwrap();
+    }
+
+    #[test]
+    fn timestamp_recovery_backlog_condition_is_dedicated() {
+        let backlog = row_time_recovery_busy(ROW_TIME_RECOVERY_BACKLOG_MESSAGE);
+        assert!(is_row_time_recovery_backlog(&backlog));
+
+        let ordinary_busy = row_time_recovery_busy("database is locked by another writer");
+        assert!(!is_row_time_recovery_backlog(&ordinary_busy));
+        assert!(!is_row_time_recovery_backlog(
+            &rusqlite::Error::QueryReturnedNoRows
+        ));
+    }
+
+    #[test]
+    fn empty_timestamp_operation_table_does_not_take_writer_authority_on_open() {
+        let path = timestamp_test_path("row-time-empty-operation");
+        let setup = Connection::open(&path).unwrap();
+        create_row_time_table(&setup).unwrap();
+        drop(setup);
+
+        let writer = Connection::open(&path).unwrap();
+        writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let reopened =
+            open(&path).expect("zero operation rows must keep ordinary cache opens read-only");
+        assert!(sqlite_table_exists(&reopened, "_row_time_operation").unwrap());
+        drop(reopened);
+        writer.execute_batch("ROLLBACK").unwrap();
+        drop(writer);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn scavenger_rechecks_same_process_claim_after_preflight_interleaving() {
+        let path = timestamp_test_path("row-time-registry-recheck");
+        let setup = Connection::open(&path).unwrap();
+        create_timestamp_object(&setup, "_row_time_stage_abandoned");
+        drop(setup);
+
+        let mut scavenger = Connection::open(&path).unwrap();
+        scavenger.busy_timeout(CACHE_BUSY_TIMEOUT).unwrap();
+        let mut claimant = Connection::open(&path).unwrap();
+        claimant.busy_timeout(CACHE_BUSY_TIMEOUT).unwrap();
+        let mut claim = None;
+        scavenge_abandoned_row_time_objects_with_hooks(
+            &mut scavenger,
+            || {
+                claim = Some(
+                    begin_row_time_operation(
+                        &mut claimant,
+                        "_row_time_stage_live_interleaving",
+                        "_row_time_stage_live_interleaving_epoch",
+                    )
+                    .unwrap(),
+                );
+            },
+            || {},
+        )
+        .unwrap();
+
+        let claim = claim.expect("the interleaved operation must be published");
+        assert!(sqlite_table_exists(&scavenger, claim.stage_name()).unwrap());
+        assert!(!sqlite_table_exists(&scavenger, "_row_time_stage_abandoned").unwrap());
+        assert_eq!(
+            claimant
+                .query_row(
+                    "SELECT COUNT(*) FROM _row_time_operation WHERE owner_token = ?1",
+                    [claim.owner_token()],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+
+        retire_row_time_operation(&claimant, &claim).unwrap();
+        drop(claim);
+        drop(claimant);
+        drop(scavenger);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn timestamp_claim_and_scavenger_share_database_then_registry_lock_order() {
+        let path = timestamp_test_path("row-time-lock-order");
+        let setup = Connection::open(&path).unwrap();
+        create_timestamp_object(&setup, "_row_time_stage_abandoned");
+        drop(setup);
+
+        let mut scavenger = Connection::open(&path).unwrap();
+        scavenger.busy_timeout(CACHE_BUSY_TIMEOUT).unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (authority_tx, authority_rx) = std::sync::mpsc::channel();
+        let mut claimant = None;
+        let claimant_path = path.clone();
+        scavenge_abandoned_row_time_objects_with_hooks(
+            &mut scavenger,
+            || {},
+            || {
+                claimant = Some(std::thread::spawn(move || {
+                    let mut conn = Connection::open(claimant_path).unwrap();
+                    conn.busy_timeout(CACHE_BUSY_TIMEOUT).unwrap();
+                    started_tx.send(()).unwrap();
+                    let claim = begin_row_time_operation_with_hook(
+                        &mut conn,
+                        "_row_time_stage_waiting_claim",
+                        "_row_time_stage_waiting_claim_epoch",
+                        || authority_tx.send(()).unwrap(),
+                    )
+                    .unwrap();
+                    (conn, claim)
+                }));
+                started_rx
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("claimant thread must start");
+
+                // The scavenger owns SQLite publication authority, so the claimant must not
+                // reach its registry acquisition point yet and the registry itself must remain
+                // available. This would fail (or deadlock in production) with registry -> DB.
+                assert!(authority_rx
+                    .recv_timeout(Duration::from_millis(25))
+                    .is_err());
+                let registry_deadline = std::time::Instant::now() + Duration::from_secs(1);
+                let registry_available = loop {
+                    if let Ok(guard) = live_row_time_operation_tokens().try_lock() {
+                        drop(guard);
+                        break true;
+                    }
+                    if std::time::Instant::now() >= registry_deadline {
+                        break false;
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                };
+                assert!(registry_available);
+            },
+        )
+        .unwrap();
+
+        let (claimant_conn, claim) = claimant.unwrap().join().unwrap();
+        authority_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("claimant must acquire publication authority after scavenging commits");
+        assert!(sqlite_table_exists(&claimant_conn, claim.stage_name()).unwrap());
+        retire_row_time_operation(&claimant_conn, &claim).unwrap();
+        drop(claim);
+        drop(claimant_conn);
+        drop(scavenger);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn foreign_process_claim_is_leased_then_reclaimed_when_stale() {
+        let path = timestamp_test_path("row-time-foreign-lease");
+        let setup = Connection::open(&path).unwrap();
+        create_row_time_table(&setup).unwrap();
+        setup
+            .execute(
+                "INSERT INTO _row_time (
+                    row_num, epoch_ms, utc_text, source_text, parse_status
+                 ) VALUES (7, 7, 'canonical', 'canonical', 'test')",
+                [],
+            )
+            .unwrap();
+        create_timestamp_object(&setup, "_row_time_stage_foreign");
+        create_timestamp_object(&setup, "_row_time_previous_foreign");
+        let now = chrono::Utc::now().to_rfc3339();
+        setup
+            .execute(
+                "INSERT INTO _row_time_operation (
+                    generation, owner_token, owner_session, stage_name, backup_name,
+                    started_at, updated_at
+                 ) VALUES (1, 'foreign-token', 'foreign-process-session',
+                    '_row_time_stage_foreign', '_row_time_previous_foreign', ?1, ?1)",
+                [now],
+            )
+            .unwrap();
+        drop(setup);
+
+        let fresh = open(&path).expect("a fresh foreign-process lease must be retained");
+        assert!(sqlite_table_exists(&fresh, "_row_time_stage_foreign").unwrap());
+        assert!(sqlite_table_exists(&fresh, "_row_time_previous_foreign").unwrap());
+        assert_eq!(
+            fresh
+                .query_row("SELECT COUNT(*) FROM _row_time_operation", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            1
+        );
+        fresh
+            .execute(
+                "UPDATE _row_time_operation SET updated_at = '2000-01-01T00:00:00Z'",
+                [],
+            )
+            .unwrap();
+        drop(fresh);
+
+        let reclaimed = open(&path).expect("an expired foreign-process lease must be reclaimed");
+        assert!(!sqlite_table_exists(&reclaimed, "_row_time_stage_foreign").unwrap());
+        assert!(!sqlite_table_exists(&reclaimed, "_row_time_previous_foreign").unwrap());
+        assert_eq!(
+            reclaimed
+                .query_row("SELECT COUNT(*) FROM _row_time_operation", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            reclaimed
+                .query_row(
+                    "SELECT source_text FROM _row_time WHERE row_num = 7",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "canonical"
+        );
+        drop(reclaimed);
+        let _ = std::fs::remove_file(path);
+    }
 
     #[test]
     fn cache_connections_share_the_bounded_busy_timeout() {
