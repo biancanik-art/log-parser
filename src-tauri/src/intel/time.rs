@@ -4,11 +4,15 @@ use chrono::{
     DateTime, FixedOffset, LocalResult, NaiveDate, NaiveDateTime, SecondsFormat, TimeZone, Utc,
 };
 use chrono_tz::Tz;
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const ROW_TIME_BINDING_VERSION: &str = "row-time-v2";
+const ROW_TIME_BATCH_ROWS: usize = 512;
+static ROW_TIME_BUILD_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum TimestampValueKind {
@@ -231,6 +235,22 @@ pub fn normalize_timestamp_column_with_options(
     naive_timezone: Option<&str>,
     date_convention: Option<&str>,
 ) -> Result<TimestampNormalizationSummary> {
+    normalize_timestamp_column_with_progress(
+        conn,
+        columns,
+        naive_timezone,
+        date_convention,
+        |_, _| Ok(()),
+    )
+}
+
+fn normalize_timestamp_column_with_progress(
+    conn: &mut Connection,
+    columns: &[ColumnMeta],
+    naive_timezone: Option<&str>,
+    date_convention: Option<&str>,
+    mut after_batch: impl FnMut(i64, i64) -> Result<()>,
+) -> Result<TimestampNormalizationSummary> {
     let column = resolved_timestamp_column(conn, columns)?;
     let date_analysis = analyze_date_convention(conn, &column.sql_name)?;
     if date_analysis.conflicting {
@@ -265,34 +285,28 @@ pub fn normalize_timestamp_column_with_options(
         .map(TimezoneResolver::from_answer)
         .transpose()?;
 
+    // Validate every conversion before creating staging state. The source scan is paginated, so
+    // it never keeps a read statement open while a semantic/audit writer is trying to commit.
     let mut counts = TimestampCounts::default();
-    let mut rows_to_write = Vec::new();
-
     scan_timestamp_column(
         conn,
         &column.sql_name,
         resolved_date_convention,
         |row_num, source_text, parsed| {
             counts.record(&source_text, &parsed);
-            match parsed {
-                ParsedTimestamp::Absolute { utc, parse_status } => {
-                    rows_to_write.push(row_time_record(row_num, utc, &source_text, parse_status));
-                }
+            match &parsed {
                 ParsedTimestamp::Naive(naive) => {
                     if let Some(resolver) = resolver.as_ref() {
-                        let utc = resolver.apply(naive, &source_text, row_num)?;
-                        rows_to_write.push(row_time_record(
-                            row_num,
-                            utc,
-                            &source_text,
-                            resolver.parse_status(),
-                        ));
+                        // Validate DST gaps/overlaps before any staged row is written.
+                        resolver.apply(*naive, &source_text, row_num)?;
                     }
                 }
                 ParsedTimestamp::AmbiguousDate => {
                     bail!("ambiguous slash date escaped date-convention validation")
                 }
-                ParsedTimestamp::Blank | ParsedTimestamp::Invalid => {}
+                ParsedTimestamp::Absolute { .. }
+                | ParsedTimestamp::Blank
+                | ParsedTimestamp::Invalid => {}
             }
             Ok(())
         },
@@ -307,47 +321,49 @@ pub fn normalize_timestamp_column_with_options(
 
     db::create_row_time_table(conn)?;
     let binding = current_binding_values(conn, columns)?;
-    let tx = conn.transaction()?;
-    tx.execute("DELETE FROM _row_time", [])?;
-    tx.execute("DELETE FROM _row_time_info", [])?;
-    {
-        let mut stmt = tx.prepare(
-            "INSERT INTO _row_time (row_num, epoch_ms, utc_text, source_text, parse_status)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+    let stage_name = unique_row_time_object_name("_row_time_stage");
+    let stage_index_name = unique_row_time_object_name("idx_row_time_stage_epoch");
+    create_row_time_staging_table(conn, &stage_name, &stage_index_name)?;
+
+    let build_result = (|| -> Result<i64> {
+        let rows_written = fill_row_time_staging_table(
+            conn,
+            &stage_name,
+            &column.sql_name,
+            resolved_date_convention,
+            resolver.as_ref(),
+            &mut after_batch,
         )?;
-        for record in &rows_to_write {
-            stmt.execute(rusqlite::params![
-                record.row_num,
-                record.epoch_ms,
-                record.utc_text,
-                record.source_text,
-                record.parse_status
-            ])?;
+        let backup_name = publish_row_time_staging_table(
+            conn,
+            columns,
+            &binding,
+            &stage_name,
+            &column.sql_name,
+            resolved_date_convention,
+            resolver.as_ref(),
+        )?;
+
+        // Publication is already durable and active. Reclaim the prior generation in bounded
+        // transactions so cleanup cannot monopolize SQLite's single writer slot.
+        let _ = discard_row_time_table_batched(conn, &backup_name);
+        Ok(rows_written)
+    })();
+
+    let rows_written = match build_result {
+        Ok(rows_written) => rows_written,
+        Err(error) => {
+            // The active generation was never modified if staging or publication failed.
+            let _ = discard_row_time_table_batched(conn, &stage_name);
+            return Err(error);
         }
-    }
-    tx.execute(
-        "INSERT INTO _row_time_info (
-            binding_version, source_column, schema_sha256, import_sha256, row_count,
-            date_convention, timezone_applied, completed_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-        rusqlite::params![
-            ROW_TIME_BINDING_VERSION,
-            column.sql_name,
-            binding.schema_sha256,
-            binding.import_sha256,
-            binding.row_count,
-            resolved_date_convention.map(DateConvention::label),
-            resolver.as_ref().map(TimezoneResolver::label),
-            chrono::Utc::now().to_rfc3339(),
-        ],
-    )?;
-    tx.commit()?;
+    };
 
     Ok(TimestampNormalizationSummary {
         timestamp_column: column.sql_name,
         original_name: column.original_name,
         rows_read: counts.total_rows,
-        rows_written: rows_to_write.len() as i64,
+        rows_written,
         explicit_count: counts.explicit_count,
         epoch_count: counts.epoch_count,
         naive_count: counts.naive_count,
@@ -357,6 +373,176 @@ pub fn normalize_timestamp_column_with_options(
         date_convention_applied: resolved_date_convention
             .map(|convention| convention.label().to_string()),
     })
+}
+
+fn unique_row_time_object_name(prefix: &str) -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let counter = ROW_TIME_BUILD_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{prefix}_{}_{}_{}", std::process::id(), nanos, counter)
+}
+
+fn create_row_time_staging_table(
+    conn: &mut Connection,
+    table_name: &str,
+    index_name: &str,
+) -> Result<()> {
+    let table = db::quote_ident(table_name);
+    let index = db::quote_ident(index_name);
+    let tx = conn.transaction()?;
+    tx.execute_batch(&format!(
+        "CREATE TABLE {table} (
+            row_num INTEGER PRIMARY KEY,
+            epoch_ms INTEGER NOT NULL,
+            utc_text TEXT NOT NULL,
+            source_text TEXT NOT NULL,
+            parse_status TEXT NOT NULL
+         );
+         CREATE INDEX {index} ON {table}(epoch_ms, row_num);"
+    ))?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn fill_row_time_staging_table(
+    conn: &mut Connection,
+    stage_name: &str,
+    source_column: &str,
+    date_convention: Option<DateConvention>,
+    resolver: Option<&TimezoneResolver>,
+    after_batch: &mut impl FnMut(i64, i64) -> Result<()>,
+) -> Result<i64> {
+    let stage = db::quote_ident(stage_name);
+    let mut cursor = 0_i64;
+    let mut rows_read = 0_i64;
+    let mut rows_written = 0_i64;
+
+    loop {
+        let source_rows = load_timestamp_source_batch(conn, source_column, cursor)?;
+        if source_rows.is_empty() {
+            return Ok(rows_written);
+        }
+        cursor = source_rows
+            .last()
+            .map(|(row_num, _)| *row_num)
+            .unwrap_or(cursor);
+        rows_read += source_rows.len() as i64;
+
+        let mut records = Vec::with_capacity(source_rows.len());
+        for (row_num, source_text) in source_rows {
+            match parse_timestamp(&source_text, date_convention) {
+                ParsedTimestamp::Absolute { utc, parse_status } => {
+                    records.push(row_time_record(row_num, utc, &source_text, parse_status));
+                }
+                ParsedTimestamp::Naive(naive) => {
+                    let resolver = resolver.ok_or_else(|| {
+                        anyhow!("timestamp validation changed while building normalized rows")
+                    })?;
+                    let utc = resolver.apply(naive, &source_text, row_num)?;
+                    records.push(row_time_record(
+                        row_num,
+                        utc,
+                        &source_text,
+                        resolver.parse_status(),
+                    ));
+                }
+                ParsedTimestamp::AmbiguousDate => {
+                    bail!("ambiguous slash date escaped date-convention validation")
+                }
+                ParsedTimestamp::Blank | ParsedTimestamp::Invalid => {}
+            }
+        }
+
+        let tx = conn.transaction()?;
+        {
+            let mut insert = tx.prepare(&format!(
+                "INSERT INTO {stage} (row_num, epoch_ms, utc_text, source_text, parse_status)
+                 VALUES (?1, ?2, ?3, ?4, ?5)"
+            ))?;
+            for record in &records {
+                insert.execute(rusqlite::params![
+                    record.row_num,
+                    record.epoch_ms,
+                    record.utc_text,
+                    record.source_text,
+                    record.parse_status
+                ])?;
+            }
+        }
+        tx.commit()?;
+        rows_written += records.len() as i64;
+
+        // Deliberately outside the transaction. Tests use this boundary to prove an unrelated
+        // writer can commit between normalization batches.
+        after_batch(rows_read, rows_written)?;
+    }
+}
+
+fn publish_row_time_staging_table(
+    conn: &mut Connection,
+    columns: &[ColumnMeta],
+    expected_binding: &BindingValues,
+    stage_name: &str,
+    source_column: &str,
+    date_convention: Option<DateConvention>,
+    resolver: Option<&TimezoneResolver>,
+) -> Result<String> {
+    let backup_name = unique_row_time_object_name("_row_time_previous");
+    let stage = db::quote_ident(stage_name);
+    let backup = db::quote_ident(&backup_name);
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let current_binding = current_binding_values(&tx, columns)?;
+    if &current_binding != expected_binding {
+        bail!("source dataset changed while timestamps were being normalized; the previous normalization remains active");
+    }
+
+    tx.execute_batch(&format!(
+        "ALTER TABLE _row_time RENAME TO {backup};
+         ALTER TABLE {stage} RENAME TO _row_time;"
+    ))?;
+    tx.execute("DELETE FROM _row_time_info", [])?;
+    tx.execute(
+        "INSERT INTO _row_time_info (
+            binding_version, source_column, schema_sha256, import_sha256, row_count,
+            date_convention, timezone_applied, completed_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        rusqlite::params![
+            ROW_TIME_BINDING_VERSION,
+            source_column,
+            current_binding.schema_sha256,
+            current_binding.import_sha256,
+            current_binding.row_count,
+            date_convention.map(DateConvention::label),
+            resolver.map(TimezoneResolver::label),
+            chrono::Utc::now().to_rfc3339(),
+        ],
+    )?;
+    tx.commit()?;
+    Ok(backup_name)
+}
+
+fn discard_row_time_table_batched(conn: &mut Connection, table_name: &str) -> Result<()> {
+    let table = db::quote_ident(table_name);
+    loop {
+        let tx = conn.transaction()?;
+        let deleted = tx.execute(
+            &format!(
+                "DELETE FROM {table}
+                 WHERE row_num IN (
+                    SELECT row_num FROM {table} ORDER BY row_num LIMIT {ROW_TIME_BATCH_ROWS}
+                 )"
+            ),
+            [],
+        )?;
+        tx.commit()?;
+        if deleted == 0 {
+            break;
+        }
+    }
+    conn.execute_batch(&format!("DROP TABLE IF EXISTS {table}"))?;
+    Ok(())
 }
 
 #[derive(Debug, Default)]
@@ -417,7 +603,7 @@ fn row_time_record(
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Eq, PartialEq)]
 struct BindingValues {
     schema_sha256: String,
     import_sha256: String,
@@ -535,21 +721,23 @@ enum SlashDateEvidence {
 }
 
 fn analyze_date_convention(conn: &Connection, sql_name: &str) -> Result<DateConventionAnalysis> {
-    let ident = db::quote_ident(sql_name);
-    let sql = format!("SELECT {ident} FROM rows ORDER BY row_num ASC");
-    let mut stmt = conn.prepare(&sql)?;
-    let mut rows = stmt.query([])?;
     let mut month_first = false;
     let mut day_first = false;
     let mut ambiguous_samples = Vec::new();
-    while let Some(row) = rows.next()? {
-        let value: Option<String> = row.get(0)?;
-        let Some(value) = value else { continue };
-        match slash_date_evidence(&value) {
-            Some(SlashDateEvidence::MonthFirst) => month_first = true,
-            Some(SlashDateEvidence::DayFirst) => day_first = true,
-            Some(SlashDateEvidence::Ambiguous) => push_sample(&mut ambiguous_samples, &value),
-            None => {}
+    let mut cursor = 0_i64;
+    loop {
+        let batch = load_timestamp_source_batch(conn, sql_name, cursor)?;
+        if batch.is_empty() {
+            break;
+        }
+        cursor = batch.last().map(|(row_num, _)| *row_num).unwrap_or(cursor);
+        for (_, value) in batch {
+            match slash_date_evidence(&value) {
+                Some(SlashDateEvidence::MonthFirst) => month_first = true,
+                Some(SlashDateEvidence::DayFirst) => day_first = true,
+                Some(SlashDateEvidence::Ambiguous) => push_sample(&mut ambiguous_samples, &value),
+                None => {}
+            }
         }
     }
     let conflicting = month_first && day_first;
@@ -641,18 +829,39 @@ fn scan_timestamp_column(
     date_convention: Option<DateConvention>,
     mut on_row: impl FnMut(i64, String, ParsedTimestamp) -> Result<()>,
 ) -> Result<()> {
+    let mut cursor = 0_i64;
+    loop {
+        let batch = load_timestamp_source_batch(conn, sql_name, cursor)?;
+        if batch.is_empty() {
+            return Ok(());
+        }
+        cursor = batch.last().map(|(row_num, _)| *row_num).unwrap_or(cursor);
+        for (row_num, source_text) in batch {
+            let parsed = parse_timestamp(&source_text, date_convention);
+            on_row(row_num, source_text, parsed)?;
+        }
+    }
+}
+
+fn load_timestamp_source_batch(
+    conn: &Connection,
+    sql_name: &str,
+    after_row_num: i64,
+) -> Result<Vec<(i64, String)>> {
     let ident = db::quote_ident(sql_name);
-    let sql = format!("SELECT row_num, {ident} FROM rows ORDER BY row_num ASC");
+    let sql = format!(
+        "SELECT row_num, {ident} FROM rows
+         WHERE row_num > ?1 ORDER BY row_num ASC LIMIT {ROW_TIME_BATCH_ROWS}"
+    );
     let mut stmt = conn.prepare(&sql)?;
-    let mut rows = stmt.query([])?;
+    let mut rows = stmt.query([after_row_num])?;
+    let mut batch = Vec::with_capacity(ROW_TIME_BATCH_ROWS);
     while let Some(row) = rows.next()? {
         let row_num: i64 = row.get(0)?;
         let source_text: Option<String> = row.get(1)?;
-        let source_text = source_text.unwrap_or_default();
-        let parsed = parse_timestamp(&source_text, date_convention);
-        on_row(row_num, source_text, parsed)?;
+        batch.push((row_num, source_text.unwrap_or_default()));
     }
-    Ok(())
+    Ok(batch)
 }
 
 fn parse_timestamp(value: &str, date_convention: Option<DateConvention>) -> ParsedTimestamp {
@@ -842,6 +1051,27 @@ fn table_exists(conn: &Connection, table: &str) -> rusqlite::Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::{Path, PathBuf};
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
+
+    struct TestDbFile(PathBuf);
+
+    impl TestDbFile {
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestDbFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+            for suffix in ["-journal", "-wal", "-shm"] {
+                let _ = std::fs::remove_file(format!("{}{suffix}", self.0.display()));
+            }
+        }
+    }
 
     fn setup_with_timestamp(values: &[&str]) -> (Connection, Vec<ColumnMeta>) {
         let conn = Connection::open_in_memory().unwrap();
@@ -875,6 +1105,75 @@ mod tests {
             .unwrap();
         }
         (conn, columns)
+    }
+
+    fn setup_file_with_naive_timestamps(row_count: i64) -> (TestDbFile, Vec<ColumnMeta>) {
+        let unique = ROW_TIME_BUILD_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "log-parser-row-time-{}-{}-{unique}.sqlite3",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let mut conn = db::open(&path).unwrap();
+        let columns = vec![
+            ColumnMeta {
+                sql_name: "timegenerated".into(),
+                original_name: "TimeGenerated".into(),
+                col_index: 0,
+                inferred_type: "text".into(),
+            },
+            ColumnMeta {
+                sql_name: "account".into(),
+                original_name: "Account".into(),
+                col_index: 1,
+                inferred_type: "text".into(),
+            },
+        ];
+        db::create_schema(&conn, &columns).unwrap();
+        db::create_column_roles_table(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO _column_roles (role, sql_name, confidence, status, reasons_json)
+             VALUES ('timestamp', 'timegenerated', 1.0, 'confirmed', '[]')",
+            [],
+        )
+        .unwrap();
+        conn.execute_batch(
+            "CREATE TABLE _test_audit (
+                id INTEGER PRIMARY KEY,
+                action TEXT NOT NULL
+             );",
+        )
+        .unwrap();
+        let tx = conn.transaction().unwrap();
+        {
+            let mut insert = tx
+                .prepare(
+                    "INSERT INTO rows (row_num, timegenerated, account)
+                     VALUES (?1, '2026-01-01 02:30:00', 'alice')",
+                )
+                .unwrap();
+            for row_num in 1..=row_count {
+                insert.execute([row_num]).unwrap();
+            }
+        }
+        tx.commit().unwrap();
+        drop(conn);
+        (TestDbFile(path), columns)
+    }
+
+    fn inactive_row_time_table_count(conn: &Connection) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'table'
+               AND (name GLOB '_row_time_stage_*'
+                    OR name GLOB '_row_time_previous_*')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
     }
 
     #[test]
@@ -1066,6 +1365,117 @@ mod tests {
         )
         .expect_err("conflicting source conventions cannot be normalized safely");
         assert!(error.to_string().contains("mixes unambiguous"));
+    }
+
+    #[test]
+    fn normalization_releases_writer_lock_between_batches_and_publishes_atomically() {
+        let row_count = (ROW_TIME_BATCH_ROWS as i64) + 1;
+        let (db_file, columns) = setup_file_with_naive_timestamps(row_count);
+        let mut initial = db::open(db_file.path()).unwrap();
+        normalize_timestamp_column_with_options(&mut initial, &columns, Some("UTC"), None).unwrap();
+        drop(initial);
+
+        let normalize_path = db_file.path().to_path_buf();
+        let normalize_columns = columns.clone();
+        let (paused_tx, paused_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let normalize_thread = thread::spawn(move || {
+            let mut conn = db::open(&normalize_path).unwrap();
+            let mut paused = false;
+            normalize_timestamp_column_with_progress(
+                &mut conn,
+                &normalize_columns,
+                Some("+02:00"),
+                None,
+                |rows_read, _| {
+                    if rows_read >= ROW_TIME_BATCH_ROWS as i64 && !paused {
+                        paused = true;
+                        paused_tx.send(()).unwrap();
+                        resume_rx.recv().unwrap();
+                    }
+                    Ok(())
+                },
+            )
+        });
+
+        paused_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("normalization should pause after its first committed batch");
+        let observer = db::open(db_file.path()).unwrap();
+        let still_published: String = observer
+            .query_row(
+                "SELECT utc_text FROM _row_time WHERE row_num = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(still_published, "2026-01-01T02:30:00Z");
+        observer
+            .execute("INSERT INTO _test_audit (action) VALUES ('accepted')", [])
+            .expect("timestamp normalization must not retain a write transaction between batches");
+        resume_tx.send(()).unwrap();
+
+        let summary = normalize_thread.join().unwrap().unwrap();
+        assert_eq!(summary.rows_read, row_count);
+        assert_eq!(summary.rows_written, row_count);
+        let newly_published: String = observer
+            .query_row(
+                "SELECT utc_text FROM _row_time WHERE row_num = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(newly_published, "2026-01-01T00:30:00Z");
+        let stored_timezone: String = observer
+            .query_row("SELECT timezone_applied FROM _row_time_info", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(stored_timezone, "+02:00");
+        let audit_count: i64 = observer
+            .query_row("SELECT COUNT(*) FROM _test_audit", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(audit_count, 1);
+        assert_eq!(inactive_row_time_table_count(&observer), 0);
+    }
+
+    #[test]
+    fn failed_staged_normalization_preserves_previous_result_and_cleans_up() {
+        let row_count = (ROW_TIME_BATCH_ROWS as i64) + 1;
+        let (db_file, columns) = setup_file_with_naive_timestamps(row_count);
+        let mut conn = db::open(db_file.path()).unwrap();
+        normalize_timestamp_column_with_options(&mut conn, &columns, Some("UTC"), None).unwrap();
+
+        let error = normalize_timestamp_column_with_progress(
+            &mut conn,
+            &columns,
+            Some("+02:00"),
+            None,
+            |rows_read, _| {
+                if rows_read >= ROW_TIME_BATCH_ROWS as i64 {
+                    return Err(anyhow::anyhow!("injected failure after committed batch"));
+                }
+                Ok(())
+            },
+        )
+        .expect_err("injected staging failure must abort normalization");
+        assert!(error.to_string().contains("injected failure"));
+
+        let still_published: String = conn
+            .query_row(
+                "SELECT utc_text FROM _row_time WHERE row_num = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(still_published, "2026-01-01T02:30:00Z");
+        let stored_timezone: String = conn
+            .query_row("SELECT timezone_applied FROM _row_time_info", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(stored_timezone, "UTC");
+        assert_eq!(inactive_row_time_table_count(&conn), 0);
     }
 
     #[test]

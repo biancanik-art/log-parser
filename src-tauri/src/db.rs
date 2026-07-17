@@ -4,6 +4,13 @@ use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+/// All production connections to an imported cache use the same bounded wait when another
+/// background task is publishing a short SQLite write transaction. Keeping this here (rather
+/// than in individual features) prevents semantic indexing, timestamp normalization, and audit
+/// writes from failing immediately merely because their batch commits overlap.
+pub const CACHE_BUSY_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -92,7 +99,9 @@ pub fn cache_db_path(source_path: &Path, sheet: &str) -> Result<PathBuf> {
 }
 
 pub fn open(db_path: &Path) -> rusqlite::Result<Connection> {
-    Connection::open(db_path)
+    let conn = Connection::open(db_path)?;
+    conn.busy_timeout(CACHE_BUSY_TIMEOUT)?;
+    Ok(conn)
 }
 
 /// Relaxed durability for the initial bulk load only — data is read-only after import, so a
@@ -186,7 +195,6 @@ pub fn create_row_time_table(conn: &Connection) -> rusqlite::Result<()> {
             source_text TEXT NOT NULL,
             parse_status TEXT NOT NULL
          );
-         CREATE INDEX IF NOT EXISTS idx_row_time_epoch ON _row_time(epoch_ms, row_num);
          CREATE TABLE IF NOT EXISTS _row_time_info (
             binding_version TEXT NOT NULL,
             source_column TEXT NOT NULL,
@@ -197,6 +205,27 @@ pub fn create_row_time_table(conn: &Connection) -> rusqlite::Result<()> {
             timezone_applied TEXT,
             completed_at TEXT NOT NULL
          );",
+    )?;
+
+    // A staged timestamp build keeps its generation-specific index when its table is atomically
+    // renamed to `_row_time`. Do not rebuild the same potentially large index under the legacy
+    // canonical name every time normalization runs.
+    let mut indexes = conn.prepare("SELECT name FROM pragma_index_list('_row_time')")?;
+    let names = indexes
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for name in names {
+        let mut columns = conn.prepare("SELECT name FROM pragma_index_info(?1) ORDER BY seqno")?;
+        let indexed = columns
+            .query_map([name], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if indexed.starts_with(&["epoch_ms".to_string(), "row_num".to_string()]) {
+            return Ok(());
+        }
+    }
+
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_row_time_epoch ON _row_time(epoch_ms, row_num);",
     )
 }
 
@@ -278,6 +307,25 @@ pub fn load_import_info(conn: &Connection) -> rusqlite::Result<ImportInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cache_connections_share_the_bounded_busy_timeout() {
+        let path = std::env::temp_dir().join(format!(
+            "log-parser-busy-timeout-{}-{}.sqlite3",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let conn = open(&path).unwrap();
+        let timeout_ms: i64 = conn
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(timeout_ms, CACHE_BUSY_TIMEOUT.as_millis() as i64);
+        drop(conn);
+        let _ = std::fs::remove_file(path);
+    }
 
     /// Confirms FTS5 is actually compiled into rusqlite's bundled SQLite amalgamation. There is
     /// no `fts5` Cargo feature to opt into — this is the empirical check the plan calls for
