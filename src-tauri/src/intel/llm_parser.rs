@@ -220,7 +220,7 @@ impl LlmContext {
         if columns.is_empty() {
             bail!("the imported table has no searchable columns");
         }
-        let all_timeline_candidates = timestamp_candidates(conn, columns)?;
+        let all_timeline_candidates = timestamp_candidates(conn, columns, query_text)?;
         let selected_timeline_column =
             selected_timeline_candidate(query_text, &all_timeline_candidates).and_then(
                 |candidate| {
@@ -679,6 +679,7 @@ fn representative_rows(conn: &Connection, columns: &[ColumnMeta]) -> Result<Vec<
 fn timestamp_candidates(
     conn: &Connection,
     columns: &[ColumnMeta],
+    query_text: &str,
 ) -> Result<Vec<TimelineCandidate>> {
     let suggested: Option<(String, f64, String)> = if table_exists(conn, "_column_roles")? {
         conn.query_row(
@@ -705,10 +706,19 @@ fn timestamp_candidates(
         .map(|(index, column)| (column.sql_name.as_str(), index))
         .collect::<HashMap<_, _>>();
     let representative = representative_rows(conn, &sampled_columns)?;
+    let examiner_selected = if query_requests_timeline(query_text) {
+        unique_explicit_timeline_column(query_text, columns)
+    } else {
+        None
+    };
 
     let mut candidates = Vec::new();
-    for column in columns {
+    for (column_index, column) in columns.iter().enumerate() {
         let mut score: u16 = 0;
+        let examiner_selected_column = examiner_selected == Some(column_index);
+        if examiner_selected_column {
+            score = 1_000;
+        }
         let inferred_timestamp = column.inferred_type.eq_ignore_ascii_case("timestamp");
         let (header_score, strong_header) = timestamp_header_signal(column);
         score = score.saturating_add(header_score);
@@ -757,7 +767,11 @@ fn timestamp_candidates(
             score = score.saturating_add(((valid * 450) / values.len()) as u16);
         }
         if score >= 400
-            && (valid > 0 || inferred_header_supported || strong_header || suggested_role)
+            && (valid > 0
+                || inferred_header_supported
+                || strong_header
+                || suggested_role
+                || examiner_selected_column)
         {
             candidates.push(TimelineCandidate {
                 column: column.sql_name.clone(),
@@ -775,6 +789,88 @@ fn timestamp_candidates(
             .then_with(|| left.column.cmp(&right.column))
     });
     Ok(candidates)
+}
+
+fn unique_explicit_timeline_column(query_text: &str, columns: &[ColumnMeta]) -> Option<usize> {
+    let query_tokens = normalized_unquoted_tokens(query_text);
+    let mut original_name_counts = HashMap::<Vec<String>, usize>::new();
+    for column in columns {
+        if let Some(tokens) = column_reference_tokens(&column.original_name) {
+            *original_name_counts.entry(tokens).or_insert(0) += 1;
+        }
+    }
+
+    let literal_ranges = quoted_literal_ranges(query_text);
+    let unquoted_lexical = lexical_tokens(query_text, &literal_ranges);
+    let quoted_timeline_references = quoted_spans(query_text)
+        .into_iter()
+        .filter(|span| {
+            let preceding = unquoted_lexical
+                .iter()
+                .take_while(|token| token.end <= span.opening_index)
+                .map(|token| token.normalized.as_str())
+                .collect::<Vec<_>>();
+            timeline_selector_prefix(&preceding)
+        })
+        .filter_map(|span| decode_quoted_identifier(query_text, span))
+        .collect::<Vec<_>>();
+
+    let mut selected = Vec::new();
+    for (index, column) in columns.iter().enumerate() {
+        let sql_selected = query_has_timeline_selector(&query_tokens, &column.sql_name);
+        let original_key = column_reference_tokens(&column.original_name);
+        let original_selected = original_key
+            .as_ref()
+            .and_then(|key| original_name_counts.get(key))
+            .is_some_and(|count| *count == 1)
+            && query_has_timeline_selector(&query_tokens, &column.original_name);
+        let quoted_selected = quoted_timeline_references.iter().any(|name| {
+            column.sql_name.as_str() == name.as_str()
+                || column.original_name.as_str() == name.as_str()
+        }) && columns
+            .iter()
+            .filter(|candidate| {
+                quoted_timeline_references.iter().any(|name| {
+                    candidate.sql_name.as_str() == name.as_str()
+                        || candidate.original_name.as_str() == name.as_str()
+                })
+            })
+            .count()
+            == 1;
+        if sql_selected || original_selected || quoted_selected {
+            selected.push(index);
+        }
+    }
+    selected.sort_unstable();
+    selected.dedup();
+    match selected.as_slice() {
+        [index] => Some(*index),
+        _ => None,
+    }
+}
+
+fn query_has_timeline_selector(query_tokens: &[String], name: &str) -> bool {
+    let Some(name_tokens) = column_reference_tokens(name) else {
+        return false;
+    };
+    query_tokens
+        .windows(name_tokens.len())
+        .enumerate()
+        .any(|(start, candidate)| {
+            candidate == name_tokens && timeline_selector_prefix(&query_tokens[..start])
+        })
+}
+
+fn timeline_selector_prefix<T: AsRef<str>>(prefix: &[T]) -> bool {
+    let last = prefix.last().map(AsRef::as_ref);
+    if matches!(last, Some("column" | "field" | "timestamp" | "using")) {
+        return true;
+    }
+    matches!(last, Some("by"))
+        && prefix
+            .get(prefix.len().saturating_sub(2))
+            .map(AsRef::as_ref)
+            .is_some_and(|token| matches!(token, "sort" | "sorted" | "order" | "ordered"))
 }
 
 fn timestamp_header_signal(column: &ColumnMeta) -> (u16, bool) {
@@ -2895,6 +2991,59 @@ mod tests {
     }
 
     #[test]
+    fn explicit_sparse_timeline_column_is_not_lost_by_representative_sampling() {
+        let columns = vec![
+            ColumnMeta {
+                sql_name: "ts".into(),
+                original_name: "ts".into(),
+                col_index: 0,
+                inferred_type: "text".into(),
+            },
+            ColumnMeta {
+                sql_name: "message".into(),
+                original_name: "Message".into(),
+                col_index: 1,
+                inferred_type: "text".into(),
+            },
+        ];
+        let mut conn = Connection::open_in_memory().unwrap();
+        db::create_schema(&conn, &columns).unwrap();
+        let tx = conn.transaction().unwrap();
+        for row_num in 1..=100i64 {
+            let timestamp = if row_num == 2 {
+                "2026-07-17T01:02:03Z"
+            } else {
+                ""
+            };
+            tx.execute(
+                "INSERT INTO rows(row_num, ts, message) VALUES (?1, ?2, 'failed')",
+                rusqlite::params![row_num, timestamp],
+            )
+            .unwrap();
+        }
+        tx.commit().unwrap();
+
+        let unnamed =
+            LlmContext::from_table(&conn, &columns, "show failed rows as a timeline").unwrap();
+        assert_eq!(unnamed.recommended_timeline_column(), None);
+
+        for query in [
+            "show failed rows as a timeline sorted by ts",
+            "show failed rows as a timeline sorted by `ts`",
+        ] {
+            let context = LlmContext::from_table(&conn, &columns, query).unwrap();
+            assert_eq!(context.recommended_timeline_column(), Some("ts"), "{query}");
+            assert!(context
+                .timeline_candidates
+                .iter()
+                .any(|candidate| candidate.column == "ts"));
+            assert!(context
+                .timeline_issue()
+                .is_some_and(|issue| issue.contains("not normalized")));
+        }
+    }
+
+    #[test]
     fn tokenizer_budget_reserves_output_and_prunes_only_optional_prompt_context() {
         assert_eq!(MAX_SAFE_CONTEXT_TOKENS, 4_096);
         assert_eq!(
@@ -3018,7 +3167,7 @@ mod tests {
                     as *mut std::ffi::c_void,
             );
         }
-        let candidates = timestamp_candidates(&conn, &columns).unwrap();
+        let candidates = timestamp_candidates(&conn, &columns, "").unwrap();
         // SAFETY: passing a null callback disables the handler before its state is dropped.
         unsafe {
             rusqlite::ffi::sqlite3_progress_handler(conn.handle(), 0, None, std::ptr::null_mut());
@@ -3067,7 +3216,7 @@ mod tests {
 
         let conn = Connection::open_in_memory().unwrap();
         db::create_schema(&conn, &columns).unwrap();
-        let candidates = timestamp_candidates(&conn, &columns).unwrap();
+        let candidates = timestamp_candidates(&conn, &columns, "").unwrap();
         let names = candidates
             .iter()
             .map(|candidate| candidate.column.as_str())
