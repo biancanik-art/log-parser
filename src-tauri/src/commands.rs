@@ -366,7 +366,8 @@ fn expression_uses_semantic_selection(expression: &QueryExpression, selection_id
         QueryExpression::SemanticSelection {
             selection_id: candidate,
         } => candidate == selection_id,
-        QueryExpression::Search { .. }
+        QueryExpression::MatchNone
+        | QueryExpression::Search { .. }
         | QueryExpression::Predicate { .. }
         | QueryExpression::RowIds { .. } => false,
     }

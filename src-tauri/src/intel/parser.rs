@@ -482,9 +482,6 @@ pub fn query_spec_from_raw_intent(
     else {
         bail!("guided intent is not a raw evidence search");
     };
-    if alternatives.is_empty() {
-        bail!("raw evidence search has no alternatives");
-    }
     let mut branches = Vec::with_capacity(alternatives.len());
     for alternative in alternatives {
         if alternative.terms.is_empty() && alternative.filters.is_empty() {
@@ -513,10 +510,10 @@ pub fn query_spec_from_raw_intent(
             QueryExpression::And { children }
         });
     }
-    let lexical_expression = if branches.len() == 1 {
-        branches.pop().expect("one expression branch")
-    } else {
-        QueryExpression::Or { children: branches }
+    let lexical_expression = match branches.len() {
+        0 => None,
+        1 => Some(branches.pop().expect("one expression branch")),
+        _ => Some(QueryExpression::Or { children: branches }),
     };
     if semantic_row_ids.len() > crate::query::MAX_ROW_IDS
         || semantic_row_ids.iter().any(|row_num| *row_num <= 0)
@@ -534,7 +531,7 @@ pub fn query_spec_from_raw_intent(
     }) {
         bail!("raw evidence search contains an invalid semantic selection ID");
     }
-    let mut retrieval_branches = vec![lexical_expression];
+    let mut retrieval_branches = lexical_expression.into_iter().collect::<Vec<_>>();
     if !semantic_ids.is_empty() {
         retrieval_branches.push(QueryExpression::RowIds {
             values: semantic_ids,
@@ -545,17 +542,17 @@ pub fn query_spec_from_raw_intent(
             selection_id: selection_id.clone(),
         });
     }
-    let expression = if retrieval_branches.len() == 1 {
-        retrieval_branches.pop().expect("one retrieval branch")
-    } else {
-        QueryExpression::Or {
+    let expression = match retrieval_branches.len() {
+        0 => Some(QueryExpression::MatchNone),
+        1 => Some(retrieval_branches.pop().expect("one retrieval branch")),
+        _ => Some(QueryExpression::Or {
             children: retrieval_branches,
-        }
+        }),
     };
     Ok(QuerySpec {
         search: None,
         filters: Vec::<ColumnFilter>::new(),
-        expression: Some(expression),
+        expression,
         sort: sort.as_ref().map(|sort| SortSpec {
             column: sort.column.clone(),
             direction: match sort.direction {
@@ -607,10 +604,16 @@ fn raw_preview_text(intent: &GuidedIntent) -> String {
             )
         },
     );
-    format!(
-        "Search every raw row using {} alternative(s) and {predicates} literal predicate(s); sort by {sort_text}.",
-        alternatives.len()
-    )
+    if alternatives.is_empty() {
+        format!(
+            "Search for a conceptual evidence timeline without requiring investigative wording to appear literally; sort by {sort_text}."
+        )
+    } else {
+        format!(
+            "Search every raw row using {} alternative(s) and {predicates} literal predicate(s); sort by {sort_text}.",
+            alternatives.len()
+        )
+    }
 }
 
 fn raw_match_explanation(intent: &GuidedIntent) -> Vec<String> {
@@ -623,10 +626,17 @@ fn raw_match_explanation(intent: &GuidedIntent) -> Vec<String> {
     else {
         return Vec::new();
     };
-    let mut explanation = vec![
-        "Alternatives are OR'ed; every term and filter inside one alternative is AND'ed."
-            .to_string(),
-    ];
+    let mut explanation = if alternatives.is_empty() {
+        vec![
+            "The investigative phrase is not used as a literal filter; only validated semantic matches are returned, and no rows are claimed when no semantic selection is available."
+                .to_string(),
+        ]
+    } else {
+        vec![
+            "Alternatives are OR'ed; every term and filter inside one alternative is AND'ed."
+                .to_string(),
+        ]
+    };
     explanation.extend(
         alternatives
             .iter()
@@ -660,16 +670,26 @@ fn raw_match_explanation(intent: &GuidedIntent) -> Vec<String> {
         ));
     }
     if !semantic_row_ids.is_empty() {
-        explanation.push(format!(
-            "Semantic recall: {} locally-ranked raw row candidate(s) OR the literal plan",
-            semantic_row_ids.len()
-        ));
+        explanation.push(if alternatives.is_empty() {
+            format!(
+                "Semantic retrieval selected {} locally-ranked raw row candidate(s)",
+                semantic_row_ids.len()
+            )
+        } else {
+            format!(
+                "Semantic recall: {} locally-ranked raw row candidate(s) OR the literal plan",
+                semantic_row_ids.len()
+            )
+        });
     }
     if semantic_selection_id.is_some() {
-        explanation.push(
+        explanation.push(if alternatives.is_empty() {
+            "Semantic retrieval uses the persisted document selection and expands every mapped raw row."
+                .to_string()
+        } else {
             "Semantic recall: the persisted document selection is OR'ed with the complete literal plan and expands every mapped raw row."
-                .to_string(),
-        );
+                .to_string()
+        });
     }
     explanation
 }

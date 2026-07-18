@@ -68,6 +68,10 @@ pub const MAX_QUERY_PARAMETERS: usize = 2048;
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum QueryExpression {
+    /// Trusted planners use an explicit empty result while an evidence concept requires semantic
+    /// retrieval but no validated selection is available yet. This is safer than fabricating a
+    /// literal predicate or treating every imported row as a match.
+    MatchNone,
     And {
         children: Vec<QueryExpression>,
     },
@@ -288,6 +292,7 @@ impl ExpressionCompiler<'_> {
         }
 
         match expression {
+            QueryExpression::MatchNone => Ok("0".to_string()),
             QueryExpression::And { children } => self.compile_children("AND", children, depth),
             QueryExpression::Or { children } => self.compile_children("OR", children, depth),
             QueryExpression::Not { child } => {
@@ -1156,6 +1161,18 @@ mod tests {
         ] {
             assert!(build_predicate(&columns, &expression_spec(expression)).is_err());
         }
+    }
+
+    #[test]
+    fn match_none_is_a_serializable_explicit_zero_row_expression() {
+        assert_eq!(
+            serde_json::to_value(QueryExpression::MatchNone).unwrap(),
+            serde_json::json!({ "type": "matchNone" })
+        );
+        let (conn, columns) = setup();
+        let spec = expression_spec(QueryExpression::MatchNone);
+        assert_eq!(count_rows(&conn, &columns, &spec).unwrap(), 0);
+        assert!(query_rows(&conn, &columns, &spec).unwrap().rows.is_empty());
     }
 
     #[test]

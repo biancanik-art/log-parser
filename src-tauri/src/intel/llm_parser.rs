@@ -28,7 +28,7 @@ pub const MODEL_SHA256: &str = "6a1a2eb6d15622bf3c96857206351ba97e1af16c30d7a74e
 pub const TOKENIZER_SHA256: &str =
     "c0382117ea329cdf097041132f6d735924b697924d6f6fc3945713e96ce87539";
 pub const PROVIDER: &str = "local-candle";
-pub const PROMPT_TEMPLATE_VERSION: &str = "raw-evidence-search-v4";
+pub const PROMPT_TEMPLATE_VERSION: &str = "raw-evidence-search-v5";
 pub const MAX_QUERY_CHARS: usize = 4096;
 pub const MAX_ALTERNATIVES: usize = 8;
 pub const MAX_TERMS_PER_ALTERNATIVE: usize = 4;
@@ -64,7 +64,7 @@ Security and correctness rules:
 - alternatives are OR. Inside one alternative, every term and filter is AND. Use 1-8 alternatives, 0-4 literal terms each, and 0-8 filters each. Every alternative must contain at least one term or filter.
 - Every non-empty term and filter value must come from examiner_query_json, never from a table sample or your own knowledge. Preserve text inside quotes byte-for-byte.
 - Use terms for literal full-row evidence text. A term searches every imported column in each raw row, including columns omitted from a bounded prompt catalog. Do not invent specialized indicators, identities, event IDs, or assert that a match is malicious.
-- Use filters when the examiner names a column or the table context makes the mapping clear. Copy examiner-supplied literal values. A login/logon or logout/logoff spelling variant is allowed only as an additional OR alternative that otherwise exactly duplicates an alternative containing the examiner's original spelling. Never replace or AND the original spelling with a variant.
+- Use a column filter only when the examiner explicitly names that column. Otherwise keep the examiner-supplied literal as an all-column term so an inferred column cannot hide evidence. When explicit filters represent the request, leave terms empty: never paraphrase, combine, or duplicate filter clauses into a term. Every term must be one contiguous literal slice of examiner_query_json. A login/logon or logout/logoff spelling variant is allowed only as an additional OR alternative that otherwise exactly duplicates an alternative containing the examiner's original spelling. Never replace or AND the original spelling with a variant.
 - sort is optional. When the examiner requests a timeline, use recommendedTimelineColumn when present. If timelineIssue is present, return unknown and repeat that issue briefly.
 - If the examiner requests explanation, causality, attribution, or conclusions rather than table retrieval, return unknown.
 - The assistant output is already prefilled with {"intent":"rawEvidenceSearch","alternatives":[ . Continue immediately with the first alternative object. Do not repeat the prefix, emit a query/SQL field, or wrap the result. Close the alternatives array, optionally add sort, then close the one JSON object.
@@ -100,6 +100,10 @@ struct PromptColumn {
     samples: Vec<String>,
     #[serde(skip)]
     required_for_prompt: bool,
+    #[serde(skip)]
+    explicitly_filter_scoped: bool,
+    #[serde(skip)]
+    original_name_unique: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -308,6 +312,8 @@ impl LlmContext {
                 inferred_type: bounded_text(&column.inferred_type, 32, "text"),
                 samples,
                 required_for_prompt: selected.required_for_prompt,
+                explicitly_filter_scoped: selected.explicitly_filter_scoped,
+                original_name_unique: selected.original_name_unique,
             });
         }
 
@@ -456,6 +462,8 @@ struct PromptColumnRank<'a> {
     column: &'a ColumnMeta,
     source_position: usize,
     explicitly_referenced: bool,
+    explicitly_filter_scoped: bool,
+    original_name_unique: bool,
     recommended_timeline: bool,
     relevance_score: usize,
     timestamp_score: u16,
@@ -465,6 +473,8 @@ struct PromptColumnRank<'a> {
 struct SelectedPromptColumn {
     column: ColumnMeta,
     required_for_prompt: bool,
+    explicitly_filter_scoped: bool,
+    original_name_unique: bool,
 }
 
 /// Selects the only columns the local model may use for column-specific filters and sorting.
@@ -479,7 +489,11 @@ fn select_prompt_columns(
     // Quoted strings are evidence literals, not schema references. In particular, pasting a
     // command line or log fragment containing a column-like word must not displace real schema
     // context from a wide-table prompt.
-    let query_tokens = normalized_unquoted_tokens(query_text);
+    let query_quoted_ranges = quoted_literal_ranges(query_text);
+    let query_tokens = lexical_tokens(query_text, &query_quoted_ranges)
+        .into_iter()
+        .map(|token| token.normalized)
+        .collect::<Vec<_>>();
     let query_token_set = query_tokens
         .iter()
         .map(String::as_str)
@@ -505,7 +519,21 @@ fn select_prompt_columns(
         .enumerate()
         .map(|(source_position, column)| {
             let original_key = column_reference_tokens(&column.original_name);
-            let sql_name_referenced = query_contains_name_tokens(&query_tokens, &column.sql_name);
+            let original_name_unique = original_key
+                .as_ref()
+                .and_then(|key| original_name_counts.get(key))
+                .is_some_and(|count| *count == 1);
+            let sql_name_referenced = !sql_name_collides_with_ambiguous_original(
+                &column.sql_name,
+                &column.original_name,
+                original_name_unique,
+            ) && sql_identifier_occurs_unquoted(
+                &column.sql_name,
+                query_text,
+                &query_quoted_ranges,
+            );
+            let sql_name_filter_scoped =
+                sql_name_referenced && query_has_filter_column_syntax(query_text, &column.sql_name);
             // Duplicate display headers are ambiguous. Their unique sanitized SQL names still
             // let the examiner select a specific one deterministically.
             let original_name_referenced = original_key
@@ -513,6 +541,12 @@ fn select_prompt_columns(
                 .and_then(|key| original_name_counts.get(key))
                 .is_some_and(|count| *count == 1)
                 && query_contains_name_tokens(&query_tokens, &column.original_name);
+            let original_name_filter_scoped = original_key
+                .as_ref()
+                .and_then(|key| original_name_counts.get(key))
+                .is_some_and(|count| *count == 1)
+                && query_has_filter_column_syntax(query_text, &column.original_name);
+            let quoted_filter_scoped = quoted_column_references.contains(&source_position);
             let column_tokens = bounded_plain_tokens(&column.sql_name, MAX_PROMPT_SQL_NAME_CHARS)
                 .into_iter()
                 .chain(bounded_plain_tokens(&column.original_name, 128))
@@ -543,7 +577,11 @@ fn select_prompt_columns(
                 source_position,
                 explicitly_referenced: sql_name_referenced
                     || original_name_referenced
-                    || quoted_column_references.contains(&source_position),
+                    || quoted_filter_scoped,
+                explicitly_filter_scoped: sql_name_filter_scoped
+                    || original_name_filter_scoped
+                    || quoted_filter_scoped,
+                original_name_unique,
                 recommended_timeline: recommended_timeline_column
                     .is_some_and(|name| name == column.sql_name),
                 relevance_score,
@@ -597,6 +635,8 @@ fn select_prompt_columns(
         .map(|candidate| SelectedPromptColumn {
             column: candidate.column.clone(),
             required_for_prompt: candidate.explicitly_referenced || candidate.recommended_timeline,
+            explicitly_filter_scoped: candidate.explicitly_filter_scoped,
+            original_name_unique: candidate.original_name_unique,
         })
         .collect())
 }
@@ -611,6 +651,54 @@ fn query_contains_name_tokens(query_tokens: &[String], name: &str) -> bool {
             .any(|window| window == name_tokens)
 }
 
+fn query_has_filter_column_syntax(query_text: &str, name: &str) -> bool {
+    let Some(name_tokens) = column_reference_tokens(name) else {
+        return false;
+    };
+    if name_tokens.is_empty() {
+        return false;
+    }
+    let literal_ranges = quoted_literal_ranges(query_text);
+    let query_tokens = lexical_tokens(query_text, &literal_ranges);
+    query_tokens
+        .windows(name_tokens.len())
+        .enumerate()
+        .any(|(start, candidate)| {
+            if !candidate
+                .iter()
+                .map(|token| token.normalized.as_str())
+                .eq(name_tokens.iter().map(String::as_str))
+            {
+                return false;
+            }
+            let explicitly_labeled = start
+                .checked_sub(1)
+                .and_then(|index| query_tokens.get(index))
+                .is_some_and(|token| {
+                    matches!(token.normalized.as_str(), "column" | "field" | "filter")
+                });
+            let mut suffix = &query_tokens[start + name_tokens.len()..];
+            let mut operator_anchor = candidate.last().map_or(0, |token| token.end);
+            if suffix
+                .first()
+                .is_some_and(|token| matches!(token.normalized.as_str(), "column" | "field"))
+            {
+                operator_anchor = suffix[0].end;
+                suffix = &suffix[1..];
+            }
+            let raw_suffix = query_text
+                .get(operator_anchor..)
+                .unwrap_or_default()
+                .trim_start();
+            explicitly_labeled
+                || token_sequence_starts_comparison(suffix)
+                || raw_suffix.starts_with('=')
+                || raw_suffix.starts_with('<')
+                || raw_suffix.starts_with('>')
+                || raw_suffix.starts_with("!=")
+        })
+}
+
 fn column_reference_tokens(name: &str) -> Option<Vec<String>> {
     let bounded = name.chars().take(MAX_QUERY_CHARS + 1).collect::<String>();
     if bounded.chars().count() > MAX_QUERY_CHARS {
@@ -618,6 +706,23 @@ fn column_reference_tokens(name: &str) -> Option<Vec<String>> {
     } else {
         Some(plain_tokens(&bounded))
     }
+}
+
+fn sql_name_collides_with_ambiguous_original(
+    sql_name: &str,
+    original_name: &str,
+    original_name_unique: bool,
+) -> bool {
+    if original_name_unique {
+        return false;
+    }
+    matches!(
+        (
+            column_reference_tokens(sql_name),
+            column_reference_tokens(original_name)
+        ),
+        (Some(sql_tokens), Some(original_tokens)) if sql_tokens == original_tokens
+    )
 }
 
 fn bounded_plain_tokens(value: &str, max_chars: usize) -> Vec<String> {
@@ -792,6 +897,7 @@ fn timestamp_candidates(
 }
 
 fn unique_explicit_timeline_column(query_text: &str, columns: &[ColumnMeta]) -> Option<usize> {
+    let quoted_ranges = quoted_literal_ranges(query_text);
     let query_tokens = normalized_unquoted_tokens(query_text);
     let mut original_name_counts = HashMap::<Vec<String>, usize>::new();
     for column in columns {
@@ -817,12 +923,18 @@ fn unique_explicit_timeline_column(query_text: &str, columns: &[ColumnMeta]) -> 
 
     let mut selected = Vec::new();
     for (index, column) in columns.iter().enumerate() {
-        let sql_selected = query_has_timeline_selector(&query_tokens, &column.sql_name);
         let original_key = column_reference_tokens(&column.original_name);
-        let original_selected = original_key
+        let original_name_unique = original_key
             .as_ref()
             .and_then(|key| original_name_counts.get(key))
-            .is_some_and(|count| *count == 1)
+            .is_some_and(|count| *count == 1);
+        let sql_selected = !sql_name_collides_with_ambiguous_original(
+            &column.sql_name,
+            &column.original_name,
+            original_name_unique,
+        ) && sql_identifier_occurs_unquoted(&column.sql_name, query_text, &quoted_ranges)
+            && query_has_timeline_selector(&query_tokens, &column.sql_name);
+        let original_selected = original_name_unique
             && query_has_timeline_selector(&query_tokens, &column.original_name);
         let quoted_selected = quoted_timeline_references.iter().any(|name| {
             column.sql_name.as_str() == name.as_str()
@@ -1009,6 +1121,417 @@ fn query_names_column(query_text: &str, candidate: &TimelineCandidate) -> bool {
     [&candidate.column, &candidate.original_name]
         .into_iter()
         .any(|value| query_contains_name_tokens(&query_tokens, value))
+}
+
+fn query_explicitly_names_prompt_column(
+    _query_text: &str,
+    context: &LlmContext,
+    sql_name: &str,
+) -> bool {
+    context
+        .columns
+        .iter()
+        .find(|column| column.sql_name == sql_name)
+        .is_some_and(|column| column.explicitly_filter_scoped)
+}
+
+fn query_authorizes_explicit_filter(
+    query_text: &str,
+    context: &LlmContext,
+    filter: &RawSearchFilter,
+) -> bool {
+    explicit_filter_clauses(query_text, context)
+        .iter()
+        .any(|clause| {
+            clause.filter.column == filter.column
+                && clause.filter.op == filter.op
+                && ((clause.filter.value.is_empty() && filter.value.is_empty())
+                    || same_unquoted_literal(&clause.filter.value, &filter.value))
+        })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExplicitFilterClause {
+    filter: RawSearchFilter,
+    start: usize,
+    end: usize,
+}
+
+fn explicit_filter_clauses(query_text: &str, context: &LlmContext) -> Vec<ExplicitFilterClause> {
+    let spans = quoted_spans(query_text);
+    let literal_ranges = spans
+        .iter()
+        .filter(|span| span.content_start < span.content_end)
+        .map(|span| (span.content_start, span.content_end))
+        .collect::<Vec<_>>();
+    let tokens = lexical_tokens(query_text, &literal_ranges);
+    let mut clauses = Vec::new();
+
+    for column in context
+        .columns
+        .iter()
+        .filter(|column| column.explicitly_filter_scoped)
+    {
+        for (name, require_exact_surface, allowed) in [
+            (
+                column.sql_name.as_str(),
+                true,
+                !sql_name_collides_with_ambiguous_original(
+                    &column.sql_name,
+                    &column.original_name,
+                    column.original_name_unique,
+                ),
+            ),
+            (
+                column.original_name.as_str(),
+                false,
+                column.original_name_unique,
+            ),
+        ] {
+            if !allowed {
+                continue;
+            }
+            let Some(name_tokens) = column_reference_tokens(name) else {
+                continue;
+            };
+            for (start, candidate) in tokens.windows(name_tokens.len()).enumerate() {
+                if !candidate
+                    .iter()
+                    .map(|token| token.normalized.as_str())
+                    .eq(name_tokens.iter().map(String::as_str))
+                {
+                    continue;
+                }
+                let Some(first) = candidate.first() else {
+                    continue;
+                };
+                let Some(last) = candidate.last() else {
+                    continue;
+                };
+                if require_exact_surface
+                    && !query_text[first.start..last.end].eq_ignore_ascii_case(name)
+                {
+                    continue;
+                }
+                if let Some(clause) = parse_filter_clause_after_reference(
+                    query_text,
+                    &tokens,
+                    first.start,
+                    last.end,
+                    start + name_tokens.len(),
+                    &column.sql_name,
+                ) {
+                    if !clauses.contains(&clause) {
+                        clauses.push(clause);
+                    }
+                }
+            }
+        }
+
+        for span in &spans {
+            if !quoted_span_has_column_syntax(query_text, *span, &tokens) {
+                continue;
+            }
+            let Some(name) = decode_quoted_identifier(query_text, *span) else {
+                continue;
+            };
+            if name != column.sql_name
+                && !(column.original_name_unique && name == column.original_name)
+            {
+                continue;
+            }
+            let suffix_index = tokens
+                .iter()
+                .position(|token| token.start >= span.closing_end)
+                .unwrap_or(tokens.len());
+            if let Some(clause) = parse_filter_clause_after_reference(
+                query_text,
+                &tokens,
+                span.opening_index,
+                span.closing_end,
+                suffix_index,
+                &column.sql_name,
+            ) {
+                if !clauses.contains(&clause) {
+                    clauses.push(clause);
+                }
+            }
+        }
+    }
+    clauses.sort_by_key(|clause| (clause.start, clause.end));
+    clauses
+}
+
+fn parse_filter_clause_after_reference(
+    query_text: &str,
+    tokens: &[QueryToken],
+    reference_start: usize,
+    reference_end: usize,
+    mut suffix_index: usize,
+    column: &str,
+) -> Option<ExplicitFilterClause> {
+    let mut operator_anchor = reference_end;
+    if tokens
+        .get(suffix_index)
+        .is_some_and(|token| matches!(token.normalized.as_str(), "column" | "field"))
+    {
+        operator_anchor = tokens[suffix_index].end;
+        suffix_index += 1;
+    }
+
+    let raw_suffix = query_text
+        .get(operator_anchor..)
+        .unwrap_or_default()
+        .trim_start();
+    if ["!==", "==", "<>", ">=", "<="]
+        .iter()
+        .any(|operator| raw_suffix.starts_with(operator))
+    {
+        return None;
+    }
+    let (operator, consumed, symbol_chars) = if raw_suffix.starts_with("!=") {
+        (RawFilterOp::NotEquals, 0, 2)
+    } else if raw_suffix.starts_with('=') {
+        (RawFilterOp::Equals, 0, 1)
+    } else if raw_suffix.starts_with('>') && !raw_suffix.starts_with(">=") {
+        (RawFilterOp::GreaterThan, 0, 1)
+    } else if raw_suffix.starts_with('<') && !raw_suffix.starts_with("<=") {
+        (RawFilterOp::LessThan, 0, 1)
+    } else {
+        let (operator, consumed) = parse_filter_operator_tokens(&tokens[suffix_index..])?;
+        (operator, consumed, 0)
+    };
+
+    let value_start_index = suffix_index.saturating_add(consumed);
+    let operator_end = if consumed == 0 {
+        let untrimmed = query_text.get(operator_anchor..)?;
+        operator_anchor + (untrimmed.len() - untrimmed.trim_start().len()) + symbol_chars
+    } else {
+        tokens
+            .get(value_start_index.saturating_sub(1))
+            .map_or(operator_anchor, |token| token.end)
+    };
+    let token_clause_end = tokens[value_start_index..]
+        .iter()
+        .find(|token| matches!(token.normalized.as_str(), "and" | "or"))
+        .map_or(query_text.len(), |token| token.start);
+    let modifier_end = known_filter_value_suffix_start(
+        query_text,
+        tokens,
+        value_start_index,
+        operator_end,
+        token_clause_end,
+        matches!(operator, RawFilterOp::IsEmpty | RawFilterOp::IsNotEmpty),
+    )
+    .unwrap_or(token_clause_end);
+    let clause_end = first_unquoted_clause_delimiter(query_text, operator_end, modifier_end)
+        .unwrap_or(modifier_end);
+    let value = if matches!(operator, RawFilterOp::IsEmpty | RawFilterOp::IsNotEmpty) {
+        if !query_text
+            .get(operator_end..clause_end)?
+            .trim()
+            .trim_matches(|character| matches!(character, '.' | '?' | '!'))
+            .is_empty()
+        {
+            return None;
+        }
+        String::new()
+    } else {
+        exact_filter_clause_value(query_text.get(operator_end..clause_end)?)?
+    };
+    Some(ExplicitFilterClause {
+        filter: RawSearchFilter {
+            column: column.to_string(),
+            op: operator,
+            value,
+        },
+        start: reference_start,
+        end: clause_end,
+    })
+}
+
+fn known_filter_value_suffix_start(
+    query_text: &str,
+    tokens: &[QueryToken],
+    value_start_index: usize,
+    operator_end: usize,
+    upper_end: usize,
+    empty_value_allowed: bool,
+) -> Option<usize> {
+    let value_tokens = tokens[value_start_index..]
+        .iter()
+        .take_while(|token| token.start < upper_end)
+        .collect::<Vec<_>>();
+    let token = |index: usize| {
+        value_tokens
+            .get(index)
+            .map(|value| value.normalized.as_str())
+    };
+    (0..value_tokens.len()).find_map(|index| {
+        let has_value_before = index > 0
+            || empty_value_allowed
+            || query_text
+                .get(operator_end..value_tokens[index].start)
+                .is_some_and(|prefix| !prefix.trim().is_empty());
+        if !has_value_before {
+            return None;
+        }
+        let is_suffix = matches!(token(index), Some("chronologically"))
+            || matches!(
+                token(index),
+                Some(
+                    "ascending"
+                        | "descending"
+                        | "earliest"
+                        | "latest"
+                        | "newest"
+                        | "oldest"
+                )
+            )
+            || (matches!(
+                token(index),
+                Some("sort" | "sorted" | "order" | "ordered")
+            ) && token(index + 1) == Some("by"))
+            || (token(index) == Some("in")
+                && token(index + 1) == Some("chronological")
+                && token(index + 2) == Some("order"))
+            || (token(index) == Some("as")
+                && (token(index + 1) == Some("timeline")
+                    || (token(index + 1) == Some("a")
+                        && token(index + 2) == Some("timeline"))));
+        is_suffix.then_some(value_tokens[index].start)
+    })
+}
+
+fn first_unquoted_clause_delimiter(query_text: &str, start: usize, end: usize) -> Option<usize> {
+    let spans = quoted_spans(query_text);
+    query_text
+        .get(start..end)?
+        .char_indices()
+        .find_map(|(offset, character)| {
+            let index = start + offset;
+            let quoted = spans
+                .iter()
+                .any(|span| index >= span.opening_index && index < span.closing_end);
+            (!quoted && matches!(character, ',' | ';' | '\n' | '\r')).then_some(index)
+        })
+}
+
+fn exact_filter_clause_value(raw: &str) -> Option<String> {
+    let trimmed = raw
+        .trim()
+        .trim_end_matches(|character| matches!(character, '.' | '?' | '!'))
+        .trim_end();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let spans = quoted_spans(trimmed);
+    if let Some(span) = spans.first().filter(|span| span.opening_index == 0) {
+        let remainder = trimmed.get(span.closing_end..)?.trim();
+        if !remainder.is_empty() {
+            return None;
+        }
+        decode_quoted_identifier(trimmed, *span)
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn parse_filter_operator_tokens(tokens: &[QueryToken]) -> Option<(RawFilterOp, usize)> {
+    let token = |index: usize| tokens.get(index).map(|value| value.normalized.as_str());
+    match token(0)? {
+        "contains" | "containing" | "matches" | "matching" => Some((RawFilterOp::Contains, 1)),
+        "equals" | "notequals" | "notcontains" | "startswith" | "endswith" | "isempty"
+        | "isnotempty" => Some((
+            match token(0)? {
+                "equals" => RawFilterOp::Equals,
+                "notequals" => RawFilterOp::NotEquals,
+                "notcontains" => RawFilterOp::NotContains,
+                "startswith" => RawFilterOp::StartsWith,
+                "endswith" => RawFilterOp::EndsWith,
+                "isempty" => RawFilterOp::IsEmpty,
+                "isnotempty" => RawFilterOp::IsNotEmpty,
+                _ => unreachable!(),
+            },
+            1,
+        )),
+        "equal" if token(1) == Some("to") => Some((RawFilterOp::Equals, 2)),
+        "starts" if token(1) == Some("with") => Some((RawFilterOp::StartsWith, 2)),
+        "ends" if token(1) == Some("with") => Some((RawFilterOp::EndsWith, 2)),
+        "greater" if token(1) == Some("than") => Some((RawFilterOp::GreaterThan, 2)),
+        "less" if token(1) == Some("than") => Some((RawFilterOp::LessThan, 2)),
+        "not" if matches!(token(1), Some("equal" | "equals")) => Some((RawFilterOp::NotEquals, 2)),
+        "not" if matches!(token(1), Some("contain" | "contains" | "matching")) => {
+            Some((RawFilterOp::NotContains, 2))
+        }
+        "does" if token(1) == Some("not") && matches!(token(2), Some("equal" | "equals")) => {
+            Some((RawFilterOp::NotEquals, 3))
+        }
+        "does"
+            if token(1) == Some("not")
+                && matches!(token(2), Some("contain" | "contains" | "match")) =>
+        {
+            Some((RawFilterOp::NotContains, 3))
+        }
+        "is" if token(1) == Some("empty") => Some((RawFilterOp::IsEmpty, 2)),
+        "is" if token(1) == Some("not") && token(2) == Some("empty") => {
+            Some((RawFilterOp::IsNotEmpty, 3))
+        }
+        "is" if token(1) == Some("not") => Some((RawFilterOp::NotEquals, 2)),
+        "is" => Some((RawFilterOp::Equals, 1)),
+        _ => None,
+    }
+}
+
+/// A bare request for an attack path/chain is an investigative concept, not evidence text that
+/// must literally occur in a cell. Keep this deliberately narrow: quoted phrases and requests
+/// that name any additional value continue through the ordinary grounded planner.
+fn query_is_bare_attack_path_request(query_text: &str) -> bool {
+    if !quoted_literal_ranges(query_text).is_empty() {
+        return false;
+    }
+    let tokens = normalized_unquoted_tokens(query_text);
+    let contains_concept = tokens
+        .windows(2)
+        .any(|window| matches!(window, [first, second] if first == "attack" && matches!(second.as_str(), "path" | "chain")));
+    if !contains_concept {
+        return false;
+    }
+    let request_words = [
+        "a",
+        "an",
+        "attack",
+        "build",
+        "chain",
+        "chronological",
+        "chronologically",
+        "create",
+        "earliest",
+        "evidence",
+        "find",
+        "for",
+        "get",
+        "give",
+        "identify",
+        "latest",
+        "likely",
+        "me",
+        "of",
+        "path",
+        "please",
+        "possible",
+        "potential",
+        "reconstruct",
+        "show",
+        "suspected",
+        "the",
+        "timeline",
+    ]
+    .into_iter()
+    .collect::<HashSet<_>>();
+    tokens
+        .iter()
+        .all(|token| request_words.contains(token.as_str()))
 }
 
 pub fn query_requests_timeline(query_text: &str) -> bool {
@@ -1239,6 +1762,13 @@ fn token_sequence_starts_comparison(tokens: &[QueryToken]) -> bool {
         Some("starts" | "ends") => token(1) == Some("with"),
         Some("greater" | "less") => token(1) == Some("than"),
         Some("not") => matches!(token(1), Some("contains" | "equal" | "equals" | "matching")),
+        Some("does") => {
+            token(1) == Some("not")
+                && matches!(
+                    token(2),
+                    Some("contain" | "contains" | "equal" | "equals" | "match")
+                )
+        }
         // Natural-language equality such as `"Status" is failed` is column comparison syntax.
         Some("is") => true,
         _ => false,
@@ -1423,6 +1953,32 @@ fn deterministic_preclassification(
                 "Name and normalize one timestamp column before requesting a timeline.",
                 "timeline request has unresolved timestamp metadata",
             ));
+        }
+        if query_is_bare_attack_path_request(query_text) {
+            let Some(column) = context.recommended_timeline_column() else {
+                return Some(preclassified_unknown(
+                    "An attack-path view needs a usable timestamp column.",
+                    "Name and normalize one timestamp column before requesting an attack path.",
+                    "attack-path request has no safe timestamp column",
+                ));
+            };
+            return Some(ValidationResult {
+                intent: GuidedIntent::RawEvidenceSearch {
+                    alternatives: Vec::new(),
+                    sort: Some(RawSearchSort {
+                        column: column.to_string(),
+                        direction: requested_sort_direction(query_text),
+                        normalized_time: context.normalized_time_available(),
+                    }),
+                    semantic_row_ids: Vec::new(),
+                    semantic_selection_id: None,
+                },
+                status: "validated",
+                detail: Some(
+                    "bare attack-path request uses validated semantic retrieval with an explicit empty fallback"
+                        .to_string(),
+                ),
+            });
         }
         if !timeline_request_has_evidence_scope(query_text, context) {
             return Some(preclassified_unknown(
@@ -2091,6 +2647,47 @@ fn literal_occurs_unquoted(
     case_insensitive_bounded_contains(&query_text[cursor..], value)
 }
 
+fn sql_identifier_occurs_unquoted(
+    value: &str,
+    query_text: &str,
+    quoted_ranges: &[(usize, usize)],
+) -> bool {
+    let mut cursor = 0usize;
+    for (start, end) in quoted_ranges {
+        if case_insensitive_identifier_contains(&query_text[cursor..*start], value) {
+            return true;
+        }
+        cursor = *end;
+    }
+    case_insensitive_identifier_contains(&query_text[cursor..], value)
+}
+
+fn case_insensitive_identifier_contains(haystack: &str, needle: &str) -> bool {
+    let haystack = haystack
+        .chars()
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+    let needle = needle
+        .chars()
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+    if needle.is_empty() {
+        return false;
+    }
+    haystack.match_indices(&needle).any(|(start, matched)| {
+        let end = start + matched.len();
+        let is_identifier = |character: char| character.is_alphanumeric() || character == '_';
+        haystack[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|character| !is_identifier(character))
+            && haystack[end..]
+                .chars()
+                .next()
+                .is_none_or(|character| !is_identifier(character))
+    })
+}
+
 fn case_insensitive_bounded_contains(haystack: &str, needle: &str) -> bool {
     let haystack = haystack
         .chars()
@@ -2144,6 +2741,262 @@ fn same_unquoted_literal(left: &str, right: &str) -> bool {
             .chars()
             .flat_map(char::to_lowercase)
             .eq(right.chars().flat_map(char::to_lowercase))
+}
+
+/// The model may suggest a plausible column from samples even when the examiner did not name
+/// one. Such a filter must never narrow recall. Positive text predicates are safely promoted to
+/// all-column terms; predicates whose meaning depends on a particular column are rejected.
+fn promote_unqualified_filters_to_terms(
+    query_text: &str,
+    context: &LlmContext,
+    terms: &mut Vec<String>,
+    filters: &mut Vec<RawSearchFilter>,
+    synonym_authorizations: &[(String, RawFilterOp, String, String)],
+) -> Result<(), String> {
+    let mut trusted_filters = Vec::with_capacity(filters.len());
+    for filter in filters.drain(..) {
+        if query_explicitly_names_prompt_column(query_text, context, &filter.column) {
+            let authorized_synonym =
+                synonym_authorizations
+                    .iter()
+                    .any(|(column, op, proposed, source)| {
+                        column == &filter.column
+                            && *op == filter.op
+                            && same_unquoted_literal(proposed, &filter.value)
+                            && query_authorizes_explicit_filter(
+                                query_text,
+                                context,
+                                &RawSearchFilter {
+                                    column: column.clone(),
+                                    op: *op,
+                                    value: source.clone(),
+                                },
+                            )
+                    });
+            if !query_authorizes_explicit_filter(query_text, context, &filter)
+                && !authorized_synonym
+            {
+                return Err(format!(
+                    "model filter {} {} '{}' did not match one explicit examiner column/operator/value clause",
+                    filter.column,
+                    raw_filter_op_name(filter.op),
+                    bounded_text(&filter.value, 80, "<empty>")
+                ));
+            }
+            trusted_filters.push(filter);
+            continue;
+        }
+        if !matches!(
+            filter.op,
+            RawFilterOp::Equals
+                | RawFilterOp::Contains
+                | RawFilterOp::StartsWith
+                | RawFilterOp::EndsWith
+        ) {
+            return Err(format!(
+                "model inferred a column-specific {} filter for '{}' without the examiner naming that column",
+                raw_filter_op_name(filter.op),
+                filter.column
+            ));
+        }
+        if !terms
+            .iter()
+            .any(|term| same_unquoted_literal(term, &filter.value))
+        {
+            terms.push(filter.value);
+        }
+    }
+    if terms.len() > MAX_TERMS_PER_ALTERNATIVE {
+        return Err(format!(
+            "promoting inferred filters would exceed {MAX_TERMS_PER_ALTERNATIVE} safe all-column terms"
+        ));
+    }
+    *filters = trusted_filters;
+    Ok(())
+}
+
+fn remove_redundant_query_syntax_terms(
+    query_text: &str,
+    context: &LlmContext,
+    terms: &mut Vec<String>,
+    filters: &[RawSearchFilter],
+) {
+    let complete_request = query_text
+        .trim()
+        .trim_end_matches(|character| matches!(character, '.' | '?' | '!'))
+        .trim_end();
+    let original_term_count = terms.len();
+    let quoted_literals = quoted_literal_ranges(query_text)
+        .into_iter()
+        .filter_map(|(start, end)| query_text.get(start..end))
+        .collect::<Vec<_>>();
+    let structured_clauses = explicit_filter_clauses(query_text, context)
+        .into_iter()
+        .filter_map(|clause| query_text.get(clause.start..clause.end))
+        .map(|clause| {
+            clause
+                .trim()
+                .trim_end_matches(|character| matches!(character, '.' | '?' | '!'))
+                .trim()
+                .to_string()
+        })
+        .collect::<Vec<_>>();
+    terms.retain(|term| {
+        if quoted_literals
+            .iter()
+            .any(|literal| *literal == term.as_str())
+        {
+            return true;
+        }
+        // The model may echo the request verbatim, including its trailing sentence
+        // punctuation; compare with the same punctuation trim applied to both sides.
+        let trimmed_term = term
+            .trim()
+            .trim_end_matches(|character| matches!(character, '.' | '?' | '!'))
+            .trim_end();
+        let whole_request_is_syntax = same_unquoted_literal(trimmed_term, complete_request)
+            && (!filters.is_empty() || original_term_count > 1);
+        // Column names, operators, and values copied out of a structured clause are query
+        // syntax, not additional full-row evidence. Quoting remains the examiner's escape hatch
+        // when the same text is intentionally required as raw evidence.
+        let duplicates_clause = structured_clauses
+            .iter()
+            .any(|clause| case_insensitive_bounded_contains(clause, term));
+        !whole_request_is_syntax && !duplicates_clause
+    });
+}
+
+fn raw_filter_op_name(op: RawFilterOp) -> &'static str {
+    match op {
+        RawFilterOp::Equals => "equals",
+        RawFilterOp::NotEquals => "notEquals",
+        RawFilterOp::Contains => "contains",
+        RawFilterOp::NotContains => "notContains",
+        RawFilterOp::StartsWith => "startsWith",
+        RawFilterOp::EndsWith => "endsWith",
+        RawFilterOp::IsEmpty => "isEmpty",
+        RawFilterOp::IsNotEmpty => "isNotEmpty",
+        RawFilterOp::GreaterThan => "greaterThan",
+        RawFilterOp::LessThan => "lessThan",
+    }
+}
+
+fn filters_equivalent(left: &RawSearchFilter, right: &RawSearchFilter) -> bool {
+    left.column == right.column
+        && left.op == right.op
+        && ((left.value.is_empty() && right.value.is_empty())
+            || same_unquoted_literal(&left.value, &right.value))
+}
+
+fn alternative_contains_filter(
+    alternative: &RawSearchAlternative,
+    expected: &RawSearchFilter,
+) -> bool {
+    alternative
+        .filters
+        .iter()
+        .any(|filter| filters_equivalent(filter, expected))
+}
+
+fn validate_explicit_filter_structure(
+    query_text: &str,
+    context: &LlmContext,
+    alternatives: &[RawSearchAlternative],
+    synonym_authorizations: &[(String, RawFilterOp, String, String)],
+) -> Result<(), String> {
+    let clauses = explicit_filter_clauses(query_text, context);
+    if clauses.is_empty() {
+        return Ok(());
+    }
+
+    let quoted = quoted_spans(query_text);
+    if query_text.char_indices().any(|(index, character)| {
+        matches!(character, '(' | ')')
+            && !quoted
+                .iter()
+                .any(|span| index >= span.opening_index && index < span.closing_end)
+    }) {
+        return Err(
+            "parenthesized Boolean filter expressions are not supported; write explicit OR alternatives"
+                .to_string(),
+        );
+    }
+
+    let mut expected_groups = vec![vec![clauses[0].filter.clone()]];
+    for pair in clauses.windows(2) {
+        let left = &pair[0];
+        let right = &pair[1];
+        let between = query_text.get(left.end..right.start).unwrap_or_default();
+        let tokens = normalized_unquoted_tokens(between);
+        let has_and = tokens.iter().any(|token| token == "and");
+        let has_or = tokens.iter().any(|token| token == "or");
+        if has_and && has_or {
+            return Err("ambiguous Boolean connector between explicit filters".to_string());
+        }
+        if has_or {
+            expected_groups.push(vec![right.filter.clone()]);
+        } else {
+            expected_groups
+                .last_mut()
+                .expect("one explicit filter group exists")
+                .push(right.filter.clone());
+        }
+    }
+
+    let filter_matches = |actual: &RawSearchFilter, expected: &RawSearchFilter| {
+        filters_equivalent(actual, expected)
+            || synonym_authorizations.iter().any(
+                |(column, op, proposed, source)| {
+                    actual.column == *column
+                        && actual.op == *op
+                        && expected.column == *column
+                        && expected.op == *op
+                        && same_unquoted_literal(&actual.value, proposed)
+                        && same_unquoted_literal(&expected.value, source)
+                },
+            )
+    };
+    let matches_group = |alternative: &RawSearchAlternative, expected: &[RawSearchFilter]| {
+        alternative.filters.len() == expected.len()
+            && one_to_one_match(&alternative.filters, expected, |actual, expected| {
+                filter_matches(actual, expected)
+            })
+    };
+
+    for alternative in alternatives {
+        if !expected_groups
+            .iter()
+            .any(|expected| matches_group(alternative, expected))
+        {
+            return Err(
+                "model changed the AND/OR structure of the examiner's explicit filters"
+                    .to_string(),
+            );
+        }
+    }
+    for expected in &expected_groups {
+        if !alternatives
+            .iter()
+            .any(|alternative| matches_group(alternative, expected))
+        {
+            let rendered = expected
+                .iter()
+                .map(|filter| {
+                    format!(
+                        "{} {} '{}'",
+                        filter.column,
+                        raw_filter_op_name(filter.op),
+                        bounded_text(&filter.value, 80, "<empty>")
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" AND ");
+            return Err(format!(
+                "model omitted the explicit examiner filter branch: {rendered}"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn alternatives_equivalent(left: &RawSearchAlternative, right: &RawSearchAlternative) -> bool {
@@ -2227,6 +3080,7 @@ fn parse_and_validate(raw: &str, query_text: &str, context: &LlmContext) -> Vali
             }
             let known_columns = context.known_columns();
             let mut grounded_alternatives = Vec::new();
+            let mut all_synonym_filters = Vec::new();
             let mut leaf_count = 0usize;
             for alternative in alternatives {
                 let ModelRawAlternative {
@@ -2326,11 +3180,16 @@ fn parse_and_validate(raw: &str, query_text: &str, context: &LlmContext) -> Vali
                                     );
                                 };
                                 has_synonym = true;
-                                synonym_filters.push((
+                                let authorization = (
                                     filter.column.clone(),
                                     filter.op,
+                                    value.clone(),
                                     examiner_literal.clone(),
-                                ));
+                                );
+                                if !all_synonym_filters.contains(&authorization) {
+                                    all_synonym_filters.push(authorization.clone());
+                                }
+                                synonym_filters.push(authorization);
                                 examiner_literal
                             }
                         };
@@ -2366,11 +3225,36 @@ fn parse_and_validate(raw: &str, query_text: &str, context: &LlmContext) -> Vali
                         filters.push(trusted);
                     }
                 }
+                if let Err(detail) = promote_unqualified_filters_to_terms(
+                    query_text,
+                    context,
+                    &mut terms,
+                    &mut filters,
+                    &synonym_filters,
+                ) {
+                    return invalid(&detail);
+                }
+                if let Err(detail) = promote_unqualified_filters_to_terms(
+                    query_text,
+                    context,
+                    &mut counterpart_terms,
+                    &mut counterpart_filters,
+                    &[],
+                ) {
+                    return invalid(&detail);
+                }
+                remove_redundant_query_syntax_terms(query_text, context, &mut terms, &filters);
+                remove_redundant_query_syntax_terms(
+                    query_text,
+                    context,
+                    &mut counterpart_terms,
+                    &counterpart_filters,
+                );
                 let plan = RawSearchAlternative { terms, filters };
                 if synonym_terms
                     .iter()
                     .any(|source| branch_contains_source_term(&plan, source))
-                    || synonym_filters.iter().any(|(column, op, source)| {
+                    || synonym_filters.iter().any(|(column, op, _, source)| {
                         branch_contains_source_filter(&plan, column, *op, source)
                     })
                 {
@@ -2410,6 +3294,22 @@ fn parse_and_validate(raw: &str, query_text: &str, context: &LlmContext) -> Vali
                 if !trusted_alternatives.contains(&alternative.plan) {
                     trusted_alternatives.push(alternative.plan);
                 }
+            }
+            if let Err(detail) =
+                validate_explicit_filter_structure(
+                    query_text,
+                    context,
+                    &trusted_alternatives,
+                    &all_synonym_filters,
+                )
+            {
+                return invalid(&detail);
+            }
+            // The bare concept is intentionally executed only through a validated semantic
+            // selection. Until one exists, MatchNone avoids both fabricated literal evidence and
+            // the misleading claim that every imported row belongs to an attack path.
+            if query_is_bare_attack_path_request(query_text) {
+                trusted_alternatives.clear();
             }
 
             let mut trusted_sort = match sort {
@@ -2618,6 +3518,88 @@ mod tests {
         assert!(query_requests_timeline("find the attack path"));
         assert!(query_requests_timeline("show the attack chain"));
         assert!(query_requests_timeline("sequence of events for alice"));
+        assert!(query_is_bare_attack_path_request(
+            "show a likely attack path"
+        ));
+        assert!(query_is_bare_attack_path_request(
+            "reconstruct the suspected attack chain chronologically"
+        ));
+        assert!(!query_is_bare_attack_path_request(
+            "find the attack path for alice"
+        ));
+    }
+
+    #[test]
+    fn bare_attack_path_never_becomes_a_literal_filter_and_returns_a_timeline() {
+        let mut conn = raw_db("2026-07-17T01:02:03Z");
+        time::normalize_timestamp_column_with_options(&mut conn, &raw_columns(), None, None)
+            .unwrap();
+        let query = "find the attack path";
+        let context = LlmContext::from_table(&conn, &raw_columns(), query).unwrap();
+
+        let deterministic = deterministic_preclassification(query, &context)
+            .expect("bare attack-path requests must bypass model literal planning");
+        assert_eq!(deterministic.status, "validated");
+        let GuidedIntent::RawEvidenceSearch {
+            alternatives, sort, ..
+        } = &deterministic.intent
+        else {
+            panic!("expected a raw evidence search");
+        };
+        assert!(alternatives.is_empty());
+        assert_eq!(
+            sort.as_ref().map(|sort| sort.column.as_str()),
+            Some("event_time")
+        );
+
+        let spec =
+            crate::intel::parser::query_spec_from_raw_intent(&deterministic.intent, None, Some(10))
+                .unwrap();
+        assert!(matches!(
+            spec.expression,
+            Some(crate::query::QueryExpression::MatchNone)
+        ));
+        let page = crate::query::query_rows(&conn, &raw_columns(), &spec).unwrap();
+        assert!(
+            page.rows.is_empty(),
+            "no raw row may be claimed without a semantic match"
+        );
+
+        let mut semantic_intent = deterministic.intent.clone();
+        let GuidedIntent::RawEvidenceSearch {
+            semantic_row_ids, ..
+        } = &mut semantic_intent
+        else {
+            unreachable!();
+        };
+        *semantic_row_ids = vec![1];
+        let semantic_spec =
+            crate::intel::parser::query_spec_from_raw_intent(&semantic_intent, None, Some(10))
+                .unwrap();
+        assert_eq!(
+            crate::query::query_rows(&conn, &raw_columns(), &semantic_spec)
+                .unwrap()
+                .rows
+                .len(),
+            1
+        );
+
+        // Defense in depth for the exact bad model shape observed in v0.2.0: request wording
+        // and an inferred column filter are discarded rather than ANDed into a zero-row query.
+        let released_shape = r#"{"intent":"rawEvidenceSearch","alternatives":[{"terms":["find the attack path"],"filters":[{"column":"status","op":"contains","value":"attack path"}]}]}"#;
+        let validated = parse_and_validate(released_shape, query, &context);
+        assert_eq!(validated.status, "validated", "{:?}", validated.detail);
+        let spec =
+            crate::intel::parser::query_spec_from_raw_intent(&validated.intent, None, Some(10))
+                .unwrap();
+        assert!(matches!(
+            spec.expression,
+            Some(crate::query::QueryExpression::MatchNone)
+        ));
+        assert!(crate::query::query_rows(&conn, &raw_columns(), &spec)
+            .unwrap()
+            .rows
+            .is_empty());
     }
 
     fn raw_columns() -> Vec<ColumnMeta> {
@@ -2915,6 +3897,343 @@ mod tests {
     }
 
     #[test]
+    fn inferred_columns_cannot_narrow_unqualified_evidence_words() {
+        let conn = raw_db("2026-07-17T01:02:03Z");
+
+        let query = "credentials";
+        let context = LlmContext::from_table(&conn, &raw_columns(), query).unwrap();
+        let released_shape = r#"{"intent":"rawEvidenceSearch","alternatives":[{"terms":["credentials"],"filters":[{"column":"account","op":"contains","value":"credentials"}]}]}"#;
+        let result = parse_and_validate(released_shape, query, &context);
+        assert_eq!(result.status, "validated", "{:?}", result.detail);
+        let GuidedIntent::RawEvidenceSearch { alternatives, .. } = result.intent else {
+            panic!("expected a raw evidence search");
+        };
+        assert_eq!(alternatives.len(), 1);
+        assert_eq!(alternatives[0].terms, ["credentials"]);
+        assert!(alternatives[0].filters.is_empty());
+
+        let filter_only = r#"{"intent":"rawEvidenceSearch","alternatives":[{"terms":[],"filters":[{"column":"account","op":"equals","value":"credentials"}]}]}"#;
+        let result = parse_and_validate(filter_only, query, &context);
+        let GuidedIntent::RawEvidenceSearch { alternatives, .. } = result.intent else {
+            panic!("expected a promoted all-column search");
+        };
+        assert_eq!(alternatives[0].terms, ["credentials"]);
+        assert!(alternatives[0].filters.is_empty());
+
+        let explicitly_scoped_query = "account contains credentials";
+        let context =
+            LlmContext::from_table(&conn, &raw_columns(), explicitly_scoped_query).unwrap();
+        let explicit = parse_and_validate(released_shape, explicitly_scoped_query, &context);
+        let GuidedIntent::RawEvidenceSearch { alternatives, .. } = explicit.intent else {
+            panic!("expected an explicitly scoped raw evidence search");
+        };
+        assert_eq!(alternatives[0].filters.len(), 1);
+        assert_eq!(alternatives[0].filters[0].column, "account");
+
+        let collision_query = "find suspicious status";
+        let collision_context =
+            LlmContext::from_table(&conn, &raw_columns(), collision_query).unwrap();
+        let collision = r#"{"intent":"rawEvidenceSearch","alternatives":[{"terms":["find suspicious status"],"filters":[{"column":"status","op":"contains","value":"suspicious"}]}]}"#;
+        let result = parse_and_validate(collision, collision_query, &collision_context);
+        let GuidedIntent::RawEvidenceSearch { alternatives, .. } = result.intent else {
+            panic!("header-like evidence word must remain an all-column term");
+        };
+        assert_eq!(alternatives[0].terms, ["suspicious"]);
+        assert!(alternatives[0].filters.is_empty());
+
+        let punctuated_query = "find suspicious status?";
+        let punctuated_context =
+            LlmContext::from_table(&conn, &raw_columns(), punctuated_query).unwrap();
+        let punctuated = r#"{"intent":"rawEvidenceSearch","alternatives":[{"terms":["find suspicious status"],"filters":[{"column":"status","op":"contains","value":"suspicious"}]}]}"#;
+        let result = parse_and_validate(punctuated, punctuated_query, &punctuated_context);
+        let GuidedIntent::RawEvidenceSearch { alternatives, .. } = result.intent else {
+            panic!("punctuation must not preserve model-copied request syntax");
+        };
+        assert_eq!(alternatives[0].terms, ["suspicious"]);
+        assert!(alternatives[0].filters.is_empty());
+
+        let explicit_collision_query = "status contains suspicious";
+        let explicit_collision_context =
+            LlmContext::from_table(&conn, &raw_columns(), explicit_collision_query).unwrap();
+        let explicit_collision = r#"{"intent":"rawEvidenceSearch","alternatives":[{"terms":[],"filters":[{"column":"status","op":"contains","value":"suspicious"}]}]}"#;
+        let result = parse_and_validate(
+            explicit_collision,
+            explicit_collision_query,
+            &explicit_collision_context,
+        );
+        let GuidedIntent::RawEvidenceSearch { alternatives, .. } = result.intent else {
+            panic!("explicit status filter must remain scoped");
+        };
+        assert_eq!(alternatives[0].filters.len(), 1);
+
+        let unsafe_inference = r#"{"intent":"rawEvidenceSearch","alternatives":[{"terms":[],"filters":[{"column":"account","op":"notContains","value":"credentials"}]}]}"#;
+        assert_eq!(
+            parse_and_validate(
+                unsafe_inference,
+                query,
+                &LlmContext::from_table(&conn, &raw_columns(), query).unwrap()
+            )
+            .status,
+            "rejected_by_validator"
+        );
+    }
+
+    #[test]
+    fn echoed_request_sentence_keeps_its_trailing_punctuation_out_of_the_plan() {
+        let mut conn = raw_db("2026-07-17T01:02:03Z");
+        time::normalize_timestamp_column_with_options(&mut conn, &raw_columns(), None, None)
+            .unwrap();
+        let query = "Show a timeline of rows where the Status column equals failed and the Account column equals alice.";
+        let context = LlmContext::from_table(&conn, &raw_columns(), query).unwrap();
+        let echoed = r#"{"intent":"rawEvidenceSearch","alternatives":[{"terms":["Show a timeline of rows where the Status column equals failed and the Account column equals alice."],"filters":[{"column":"status","op":"equals","value":"failed"},{"column":"account","op":"equals","value":"alice"}]}]}"#;
+        let result = parse_and_validate(echoed, query, &context);
+        assert_eq!(result.status, "validated", "{:?}", result.detail);
+        let GuidedIntent::RawEvidenceSearch { alternatives, .. } = &result.intent else {
+            panic!("expected a raw evidence search");
+        };
+        assert!(
+            alternatives[0].terms.is_empty(),
+            "an echoed request sentence with trailing punctuation is query syntax, not evidence text: {:?}",
+            alternatives[0].terms
+        );
+        assert_eq!(alternatives[0].filters.len(), 2);
+        let spec = crate::intel::parser::query_spec_from_raw_intent(&result.intent, None, Some(10))
+            .unwrap();
+        assert_eq!(
+            crate::query::query_rows(&conn, &raw_columns(), &spec)
+                .unwrap()
+                .rows
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn explicit_filters_bind_column_operator_and_value_to_one_examiner_clause() {
+        let conn = raw_db("2026-07-17T01:02:03Z");
+        let query = "status equals failed and account equals alice";
+        let context = LlmContext::from_table(&conn, &raw_columns(), query).unwrap();
+        let valid = r#"{"intent":"rawEvidenceSearch","alternatives":[{"terms":["status equals failed and account equals alice"],"filters":[{"column":"status","op":"equals","value":"failed"},{"column":"account","op":"equals","value":"alice"}]}]}"#;
+        let result = parse_and_validate(valid, query, &context);
+        assert_eq!(result.status, "validated", "{:?}", result.detail);
+        let GuidedIntent::RawEvidenceSearch { alternatives, .. } = &result.intent else {
+            panic!("expected a raw evidence search");
+        };
+        assert!(
+            alternatives[0].terms.is_empty(),
+            "whole request is not evidence text"
+        );
+        assert_eq!(alternatives[0].filters.len(), 2);
+        let spec = crate::intel::parser::query_spec_from_raw_intent(&result.intent, None, Some(10))
+            .unwrap();
+        assert_eq!(
+            crate::query::query_rows(&conn, &raw_columns(), &spec)
+                .unwrap()
+                .rows
+                .len(),
+            1
+        );
+
+        for invalid in [
+            r#"{"intent":"rawEvidenceSearch","alternatives":[{"terms":[],"filters":[{"column":"account","op":"notEquals","value":"alice"}]}]}"#,
+            r#"{"intent":"rawEvidenceSearch","alternatives":[{"terms":[],"filters":[{"column":"account","op":"equals","value":"failed"},{"column":"status","op":"equals","value":"alice"}]}]}"#,
+        ] {
+            assert_eq!(
+                parse_and_validate(invalid, query, &context).status,
+                "rejected_by_validator",
+                "invalid clause binding: {invalid}"
+            );
+        }
+
+        for explicit_query in ["account is alice", "account=alice"] {
+            let context = LlmContext::from_table(&conn, &raw_columns(), explicit_query).unwrap();
+            let raw = r#"{"intent":"rawEvidenceSearch","alternatives":[{"terms":[],"filters":[{"column":"account","op":"equals","value":"alice"}]}]}"#;
+            assert_eq!(
+                parse_and_validate(raw, explicit_query, &context).status,
+                "validated",
+                "explicit syntax: {explicit_query}"
+            );
+        }
+
+        let not_equal_query = "account is not alice";
+        let context = LlmContext::from_table(&conn, &raw_columns(), not_equal_query).unwrap();
+        let not_equal = r#"{"intent":"rawEvidenceSearch","alternatives":[{"terms":[],"filters":[{"column":"account","op":"notEquals","value":"alice"}]}]}"#;
+        assert_eq!(
+            parse_and_validate(not_equal, not_equal_query, &context).status,
+            "validated"
+        );
+        let inverted = r#"{"intent":"rawEvidenceSearch","alternatives":[{"terms":[],"filters":[{"column":"account","op":"equals","value":"alice"}]}]}"#;
+        assert_eq!(
+            parse_and_validate(inverted, not_equal_query, &context).status,
+            "rejected_by_validator"
+        );
+
+        let negative_query = "account does not contain service";
+        let context = LlmContext::from_table(&conn, &raw_columns(), negative_query).unwrap();
+        let negative = r#"{"intent":"rawEvidenceSearch","alternatives":[{"terms":[],"filters":[{"column":"account","op":"notContains","value":"service"}]}]}"#;
+        assert_eq!(
+            parse_and_validate(negative, negative_query, &context).status,
+            "validated"
+        );
+
+        let email_query = "account equals alice@example.com";
+        let context = LlmContext::from_table(&conn, &raw_columns(), email_query).unwrap();
+        let complete_email = r#"{"intent":"rawEvidenceSearch","alternatives":[{"terms":[],"filters":[{"column":"account","op":"equals","value":"alice@example.com"}]}]}"#;
+        assert_eq!(
+            parse_and_validate(complete_email, email_query, &context).status,
+            "validated"
+        );
+        let truncated_email = r#"{"intent":"rawEvidenceSearch","alternatives":[{"terms":[],"filters":[{"column":"account","op":"equals","value":"alice"}]}]}"#;
+        assert_eq!(
+            parse_and_validate(truncated_email, email_query, &context).status,
+            "rejected_by_validator"
+        );
+
+        for separator in [",", ";"] {
+            let query = format!("status equals failed{separator} account equals alice");
+            let context = LlmContext::from_table(&conn, &raw_columns(), &query).unwrap();
+            let correct = r#"{"intent":"rawEvidenceSearch","alternatives":[{"terms":[],"filters":[{"column":"status","op":"equals","value":"failed"},{"column":"account","op":"equals","value":"alice"}]}]}"#;
+            assert_eq!(
+                parse_and_validate(correct, &query, &context).status,
+                "validated",
+                "separator: {separator}"
+            );
+            let crossed = r#"{"intent":"rawEvidenceSearch","alternatives":[{"terms":[],"filters":[{"column":"status","op":"equals","value":"alice"},{"column":"account","op":"equals","value":"failed"}]}]}"#;
+            assert_eq!(
+                parse_and_validate(crossed, &query, &context).status,
+                "rejected_by_validator",
+                "separator: {separator}"
+            );
+        }
+
+        let or_query = "status equals failed or account equals alice";
+        let context = LlmContext::from_table(&conn, &raw_columns(), or_query).unwrap();
+        let correct_or = r#"{"intent":"rawEvidenceSearch","alternatives":[{"terms":[],"filters":[{"column":"status","op":"equals","value":"failed"}]},{"terms":[],"filters":[{"column":"account","op":"equals","value":"alice"}]}]}"#;
+        assert_eq!(
+            parse_and_validate(correct_or, or_query, &context).status,
+            "validated"
+        );
+        let omitted_or = r#"{"intent":"rawEvidenceSearch","alternatives":[{"terms":[],"filters":[{"column":"status","op":"equals","value":"failed"}]}]}"#;
+        let anded_or = r#"{"intent":"rawEvidenceSearch","alternatives":[{"terms":[],"filters":[{"column":"status","op":"equals","value":"failed"},{"column":"account","op":"equals","value":"alice"}]}]}"#;
+        for invalid in [omitted_or, anded_or] {
+            assert_eq!(
+                parse_and_validate(invalid, or_query, &context).status,
+                "rejected_by_validator",
+                "invalid Boolean structure: {invalid}"
+            );
+        }
+
+        let clause_term = r#"{"intent":"rawEvidenceSearch","alternatives":[{"terms":["status equals failed"],"filters":[{"column":"status","op":"equals","value":"failed"},{"column":"account","op":"equals","value":"alice"}]}]}"#;
+        let context = LlmContext::from_table(&conn, &raw_columns(), query).unwrap();
+        let result = parse_and_validate(clause_term, query, &context);
+        assert_eq!(result.status, "validated", "{:?}", result.detail);
+        let GuidedIntent::RawEvidenceSearch { alternatives, .. } = result.intent else {
+            panic!("expected a raw evidence search");
+        };
+        assert!(alternatives[0].terms.is_empty());
+
+        let syntax_token_term = r#"{"intent":"rawEvidenceSearch","alternatives":[{"terms":["status"],"filters":[{"column":"status","op":"equals","value":"failed"},{"column":"account","op":"equals","value":"alice"}]}]}"#;
+        let result = parse_and_validate(syntax_token_term, query, &context);
+        assert_eq!(result.status, "validated", "{:?}", result.detail);
+        let GuidedIntent::RawEvidenceSearch { alternatives, .. } = result.intent else {
+            panic!("expected a raw evidence search");
+        };
+        assert!(alternatives[0].terms.is_empty());
+
+        let single_query = "status equals failed";
+        let context = LlmContext::from_table(&conn, &raw_columns(), single_query).unwrap();
+        let broadened = r#"{"intent":"rawEvidenceSearch","alternatives":[{"terms":[],"filters":[{"column":"status","op":"equals","value":"failed"}]},{"terms":["failed"],"filters":[]}]}"#;
+        assert_eq!(
+            parse_and_validate(broadened, single_query, &context).status,
+            "rejected_by_validator"
+        );
+
+        let and_three_query =
+            "status equals failed and account equals alice and message contains logon";
+        let context = LlmContext::from_table(&conn, &raw_columns(), and_three_query).unwrap();
+        let overlapping_and = r#"{"intent":"rawEvidenceSearch","alternatives":[{"terms":[],"filters":[{"column":"status","op":"equals","value":"failed"},{"column":"account","op":"equals","value":"alice"}]},{"terms":[],"filters":[{"column":"account","op":"equals","value":"alice"},{"column":"message","op":"contains","value":"logon"}]}]}"#;
+        assert_eq!(
+            parse_and_validate(overlapping_and, and_three_query, &context).status,
+            "rejected_by_validator"
+        );
+
+        let or_three_query =
+            "status equals failed or account equals alice or message contains logon";
+        let context = LlmContext::from_table(&conn, &raw_columns(), or_three_query).unwrap();
+        let crossed_or = r#"{"intent":"rawEvidenceSearch","alternatives":[{"terms":[],"filters":[{"column":"status","op":"equals","value":"failed"},{"column":"message","op":"contains","value":"logon"}]},{"terms":[],"filters":[{"column":"account","op":"equals","value":"alice"}]}]}"#;
+        assert_eq!(
+            parse_and_validate(crossed_or, or_three_query, &context).status,
+            "rejected_by_validator"
+        );
+
+        let mut timeline_conn = raw_db("2026-07-17T01:02:03Z");
+        time::normalize_timestamp_column_with_options(
+            &mut timeline_conn,
+            &raw_columns(),
+            None,
+            None,
+        )
+        .unwrap();
+        for (timeline_query, raw) in [
+            (
+                "account equals alice chronologically",
+                r#"{"intent":"rawEvidenceSearch","alternatives":[{"terms":[],"filters":[{"column":"account","op":"equals","value":"alice"}]}]}"#,
+            ),
+            (
+                r#"account equals "alice" chronologically"#,
+                r#"{"intent":"rawEvidenceSearch","alternatives":[{"terms":[],"filters":[{"column":"account","op":"equals","value":"alice"}]}]}"#,
+            ),
+            (
+                "status equals failed sorted by time",
+                r#"{"intent":"rawEvidenceSearch","alternatives":[{"terms":[],"filters":[{"column":"status","op":"equals","value":"failed"}]}]}"#,
+            ),
+            (
+                "account is empty chronologically",
+                r#"{"intent":"rawEvidenceSearch","alternatives":[{"terms":[],"filters":[{"column":"account","op":"isEmpty","value":""}]}]}"#,
+            ),
+            (
+                "account equals alice latest",
+                r#"{"intent":"rawEvidenceSearch","alternatives":[{"terms":[],"filters":[{"column":"account","op":"equals","value":"alice"}]}]}"#,
+            ),
+        ] {
+            let context =
+                LlmContext::from_table(&timeline_conn, &raw_columns(), timeline_query).unwrap();
+            let result = parse_and_validate(raw, timeline_query, &context);
+            assert_eq!(
+                result.status, "validated",
+                "timeline suffix: {timeline_query}; detail: {:?}", result.detail
+            );
+        }
+
+        for (unsupported_query, raw) in [
+            (
+                "account <> alice",
+                r#"{"intent":"rawEvidenceSearch","alternatives":[{"terms":[],"filters":[{"column":"account","op":"notEquals","value":"alice"}]}]}"#,
+            ),
+            (
+                "account == alice",
+                r#"{"intent":"rawEvidenceSearch","alternatives":[{"terms":[],"filters":[{"column":"account","op":"equals","value":"alice"}]}]}"#,
+            ),
+            (
+                "account is empty alice",
+                r#"{"intent":"rawEvidenceSearch","alternatives":[{"terms":[],"filters":[{"column":"account","op":"isEmpty","value":""}]}]}"#,
+            ),
+            (
+                "(status equals failed)",
+                r#"{"intent":"rawEvidenceSearch","alternatives":[{"terms":[],"filters":[{"column":"status","op":"equals","value":"failed)"}]}]}"#,
+            ),
+        ] {
+            let context =
+                LlmContext::from_table(&conn, &raw_columns(), unsupported_query).unwrap();
+            assert_eq!(
+                parse_and_validate(raw, unsupported_query, &context).status,
+                "rejected_by_validator",
+                "unsupported syntax: {unsupported_query}"
+            );
+        }
+    }
+
+    #[test]
     fn raw_table_plan_rejects_unknown_columns_extra_fields_and_unbounded_shapes() {
         let conn = raw_db("2026-07-17T01:02:03Z");
         let context = LlmContext::from_table(&conn, &raw_columns(), "failed").unwrap();
@@ -2990,7 +4309,9 @@ mod tests {
         // `unmentioned_payload` is deliberately outside the model's bounded column catalog. A
         // generic term still compiles to the any-column FTS expression and finds its raw value.
         let generic_term = r#"{"intent":"rawEvidenceSearch","alternatives":[{"terms":["deepmarkerxyz"],"filters":[]}]}"#;
-        let validated = parse_and_validate(generic_term, query, &context);
+        let generic_query = r#"find "deepmarkerxyz""#;
+        let generic_context = LlmContext::from_table(&conn, &columns, generic_query).unwrap();
+        let validated = parse_and_validate(generic_term, generic_query, &generic_context);
         assert_eq!(validated.status, "validated", "{:?}", validated.detail);
         let spec =
             crate::intel::parser::query_spec_from_raw_intent(&validated.intent, None, Some(10))
@@ -3274,6 +4595,19 @@ mod tests {
             }));
         }
 
+        let query = r#"filter "Opaque Header" contains alpha"#;
+        let conn = wide_db(&columns);
+        let context = LlmContext::from_table(&conn, &columns, query).unwrap();
+        let raw = r#"{"intent":"rawEvidenceSearch","alternatives":[{"terms":[],"filters":[{"column":"late_sql_only","op":"contains","value":"alpha"}]}]}"#;
+        let result = parse_and_validate(raw, query, &context);
+        assert_eq!(result.status, "validated", "{:?}", result.detail);
+        let GuidedIntent::RawEvidenceSearch { alternatives, .. } = result.intent else {
+            panic!("expected quoted explicit column filter");
+        };
+        assert!(alternatives[0].terms.is_empty());
+        assert_eq!(alternatives[0].filters.len(), 1);
+        assert_eq!(alternatives[0].filters[0].column, "late_sql_only");
+
         // A quoted evidence literal that happens to equal a column name is not identifier syntax
         // and therefore cannot consume a required slot in a bounded catalog.
         let pasted = select_prompt_columns(
@@ -3407,6 +4741,68 @@ mod tests {
                 inferred_type: "text".into(),
             }),
             (0, false)
+        );
+    }
+
+    #[test]
+    fn duplicate_display_headers_require_the_exact_sanitized_sql_identifier() {
+        let columns = vec![
+            ColumnMeta {
+                sql_name: "duplicate_header".into(),
+                original_name: "Duplicate Header".into(),
+                col_index: 0,
+                inferred_type: "text".into(),
+            },
+            ColumnMeta {
+                sql_name: "duplicate_header_2".into(),
+                original_name: "Duplicate Header".into(),
+                col_index: 1,
+                inferred_type: "text".into(),
+            },
+        ];
+        let ambiguous =
+            select_prompt_columns(&columns, "filter Duplicate Header equals alpha", &[], None)
+                .unwrap();
+        assert!(ambiguous.iter().all(|column| !column.required_for_prompt));
+
+        let exact = select_prompt_columns(
+            &columns,
+            "filter duplicate_header_2 equals alpha",
+            &[],
+            None,
+        )
+        .unwrap();
+        assert!(exact.iter().any(|column| {
+            column.column.sql_name == "duplicate_header_2" && column.required_for_prompt
+        }));
+
+        assert_eq!(
+            unique_explicit_timeline_column("sort by Duplicate Header", &columns),
+            None
+        );
+        assert_eq!(
+            unique_explicit_timeline_column("sort by duplicate_header_2", &columns),
+            Some(1)
+        );
+
+        let conn = Connection::open_in_memory().unwrap();
+        db::create_schema(&conn, &columns).unwrap();
+        conn.execute(
+            "INSERT INTO rows(row_num, duplicate_header, duplicate_header_2) VALUES (1, 'alpha', 'beta')",
+            [],
+        )
+        .unwrap();
+        let mixed_query = "duplicate_header_2 equals beta and Duplicate Header equals alpha";
+        let context = LlmContext::from_table(&conn, &columns, mixed_query).unwrap();
+        let exact = r#"{"intent":"rawEvidenceSearch","alternatives":[{"terms":[],"filters":[{"column":"duplicate_header_2","op":"equals","value":"beta"}]}]}"#;
+        assert_eq!(
+            parse_and_validate(exact, mixed_query, &context).status,
+            "validated"
+        );
+        let borrowed_ambiguous_value = r#"{"intent":"rawEvidenceSearch","alternatives":[{"terms":[],"filters":[{"column":"duplicate_header_2","op":"equals","value":"alpha"}]}]}"#;
+        assert_eq!(
+            parse_and_validate(borrowed_ambiguous_value, mixed_query, &context).status,
+            "rejected_by_validator"
         );
     }
 
@@ -3614,5 +5010,18 @@ mod tests {
                 "raw: {raw}"
             );
         }
+
+        let explicit_query = "status equals failed logins";
+        let context = LlmContext::from_table(&conn, &raw_columns(), explicit_query).unwrap();
+        let explicit_variants = r#"{"intent":"rawEvidenceSearch","alternatives":[{"terms":[],"filters":[{"column":"status","op":"equals","value":"failed logins"}]},{"terms":[],"filters":[{"column":"status","op":"equals","value":"failed logons"}]}]}"#;
+        assert_eq!(
+            parse_and_validate(explicit_variants, explicit_query, &context).status,
+            "validated"
+        );
+        let explicit_replacement = r#"{"intent":"rawEvidenceSearch","alternatives":[{"terms":[],"filters":[{"column":"status","op":"equals","value":"failed logons"}]}]}"#;
+        assert_eq!(
+            parse_and_validate(explicit_replacement, explicit_query, &context).status,
+            "rejected_by_validator"
+        );
     }
 }

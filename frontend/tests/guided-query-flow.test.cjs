@@ -253,6 +253,10 @@ const REPLACEMENT_ROW = {
   commandline: "rundll32.exe javascript:replacement",
   __aiMatch: ["CommandLine contains rundll32"],
 };
+const NORMAL_FILTER_ROW = {
+  row_num: 13,
+  commandline: "ordinary table filter result",
+};
 
 function page(rows) {
   return { rows, nextCursor: null, hasMore: false };
@@ -335,6 +339,21 @@ function semanticAppliedPreview() {
       limit: 300,
     },
     matchExplanation: ["Semantic matching was used: similar script-interpreter activity."],
+  });
+}
+
+function semanticPendingMatchNonePreview() {
+  return validAiPreview({
+    semanticStatus: "index_not_ready",
+    querySpec: {
+      search: null,
+      filters: [],
+      expression: { type: "matchNone" },
+      sort: null,
+      cursor: null,
+      limit: 300,
+    },
+    matchExplanation: ["Semantic matching was not used: the index is still preparing."],
   });
 }
 
@@ -854,6 +873,343 @@ test("building semantic search publishes exact rows, then automatically refreshe
   );
 });
 
+test("semantic readiness stays pending during report export and refreshes afterward", async () => {
+  const semanticBuild = deferred();
+  const reportDestination = deferred();
+  let parseCount = 0;
+  const app = bootApp({
+    commandHandlers: {
+      semantic_index_status: async () => ({ ready: false, rowsIndexed: 0 }),
+      build_semantic_index: async () => semanticBuild.promise,
+      parse_guided_query: async () => {
+        parseCount += 1;
+        return parseCount === 1
+          ? validAiPreview({ semanticStatus: "index_not_ready" })
+          : semanticAppliedPreview();
+      },
+      run_guided_query: async ({ auditId }) =>
+        auditId === 7 ? page([EXACT_ROW]) : page([SEMANTIC_ROW]),
+      "plugin:dialog|save": async () => reportDestination.promise,
+      export_report: async ({ destPath }) => ({
+        rowCount: 1,
+        destPath,
+        sheetsWritten: ["General"],
+      }),
+    },
+  });
+  await loadFixture(app);
+
+  await app.debug.searchAiEvidenceForTest("find related script activity");
+  await settleFrontend();
+  assert.equal(parseCount, 1);
+  assert.equal(app.debug.getAiSearchState().rows[0].row_num, EXACT_ROW.row_num);
+
+  app.document.getElementById("report-export-btn").dispatchEvent({ type: "click" });
+  await waitForCommand(app, "plugin:dialog|save");
+  for (const id of [
+    "guided-search-submit",
+    "guided-run-btn",
+    "guided-reject-btn",
+    "guided-reset-btn",
+  ]) {
+    assert.equal(app.document.getElementById(id).disabled, true, `${id} must be report-guarded`);
+  }
+  const blockedPreview = await app.debug.previewAiEvidenceQueryForTest("find related script activity");
+  assert.equal(blockedPreview, null);
+  assert.equal(parseCount, 1);
+
+  semanticBuild.resolve(semanticIndexSummary());
+  await settleFrontend();
+  assert.equal(parseCount, 1, "semantic refresh must remain pending while report export is active");
+
+  reportDestination.resolve("C:\\tmp\\report.xlsx");
+  await waitForCommand(app, "export_report");
+  await settleFrontend();
+  await new Promise((resolve) => setTimeout(resolve, 320));
+  await waitForCommand(app, "parse_guided_query", 2);
+  await waitForCommand(app, "run_guided_query", 2);
+  await settleFrontend();
+
+  assert.equal(parseCount, 2);
+  assert.deepEqual(guidedCommands(app), [
+    "parse_guided_query",
+    "accept_guided_query",
+    "run_guided_query",
+    "parse_guided_query",
+    "accept_guided_query",
+    "run_guided_query",
+  ]);
+  const state = app.debug.getAiSearchState();
+  assert.equal(state.guidedParseResult.semanticStatus, "applied");
+  assert.equal(state.rows.length, 1);
+  assert.equal(state.rows[0].row_num, SEMANTIC_ROW.row_num);
+});
+
+test("readiness during first acceptance executes exact once, then semantic once", async () => {
+  const semanticBuild = deferred();
+  const firstAcceptance = deferred();
+  let parseCount = 0;
+  let acceptanceCount = 0;
+  const app = bootApp({
+    commandHandlers: {
+      semantic_index_status: async () => ({ ready: false, rowsIndexed: 0 }),
+      build_semantic_index: async () => semanticBuild.promise,
+      parse_guided_query: async () => {
+        parseCount += 1;
+        return parseCount === 1
+          ? validAiPreview({ semanticStatus: "index_not_ready" })
+          : semanticAppliedPreview();
+      },
+      accept_guided_query: async () => {
+        acceptanceCount += 1;
+        return acceptanceCount === 1 ? firstAcceptance.promise : null;
+      },
+      run_guided_query: async ({ auditId }) =>
+        auditId === 7 ? page([EXACT_ROW]) : page([SEMANTIC_ROW]),
+    },
+  });
+  await loadFixture(app);
+
+  const search = app.debug.searchAiEvidenceForTest("find related script activity");
+  await waitForCommand(app, "accept_guided_query");
+  semanticBuild.resolve(semanticIndexSummary());
+  await settleFrontend();
+  assert.equal(parseCount, 1, "readiness must wait for the accepted exact execution to finish");
+  assert.equal(
+    app.calls.some((call) => call.command === "set_guided_parse_decision"),
+    false,
+    "an audit already entering execution must not be retired as edited"
+  );
+
+  firstAcceptance.resolve(null);
+  await search;
+  await settleFrontend();
+
+  assert.equal(parseCount, 2);
+  assert.equal(acceptanceCount, 2);
+  assert.deepEqual(guidedCommands(app), [
+    "parse_guided_query",
+    "accept_guided_query",
+    "run_guided_query",
+    "parse_guided_query",
+    "accept_guided_query",
+    "run_guided_query",
+  ]);
+  assert.equal(
+    app.calls.some((call) => call.command === "set_guided_parse_decision"),
+    false
+  );
+  const state = app.debug.getAiSearchState();
+  assert.equal(state.guidedParseResult.semanticStatus, "applied");
+  assert.equal(state.rows.length, 1);
+  assert.equal(state.rows[0].row_num, SEMANTIC_ROW.row_num);
+});
+
+test("a semantic retry that is still not ready stops after two parses", async () => {
+  let parseCount = 0;
+  const app = bootApp({
+    commandHandlers: {
+      parse_guided_query: async () => {
+        parseCount += 1;
+        return validAiPreview({
+          semanticStatus: "index_not_ready",
+          auditId: parseCount === 1 ? 7 : 8,
+          intentToken: parseCount === 1
+            ? '{"intent":"rawEvidenceSearch","attempt":1}'
+            : '{"intent":"rawEvidenceSearch","attempt":2}',
+        });
+      },
+      run_guided_query: async () => page([EXACT_ROW]),
+    },
+  });
+  await loadFixture(app);
+
+  await app.debug.searchAiEvidenceForTest("find related script activity");
+  await settleFrontend(20);
+
+  assert.equal(parseCount, 2, "semantic retry must be bounded to one additional parse");
+  assert.deepEqual(guidedCommands(app), [
+    "parse_guided_query",
+    "parse_guided_query",
+    "accept_guided_query",
+    "run_guided_query",
+  ]);
+  const decisions = app.calls.filter((call) => call.command === "set_guided_parse_decision");
+  assert.equal(decisions.length, 1);
+  assert.equal(decisions[0].args.auditId, 7);
+  assert.equal(decisions[0].args.decision, "edited");
+  const state = app.debug.getAiSearchState();
+  assert.equal(state.guidedParseResult.semanticStatus, "index_not_ready");
+  assert.equal(state.rows.length, 1);
+  assert.equal(state.rows[0].row_num, EXACT_ROW.row_num);
+  assert.doesNotMatch(
+    app.document.getElementById("ai-search-availability").textContent,
+    /refresh automatically/i,
+    "a completed bounded retry must not queue another semantic refresh"
+  );
+});
+
+test("matchNone safely publishes zero rows until semantic results automatically replace it", async () => {
+  const semanticBuild = deferred();
+  let parseCount = 0;
+  const app = bootApp({
+    commandHandlers: {
+      semantic_index_status: async () => ({ ready: false, rowsIndexed: 0 }),
+      build_semantic_index: async () => semanticBuild.promise,
+      parse_guided_query: async () => {
+        parseCount += 1;
+        return parseCount === 1
+          ? semanticPendingMatchNonePreview()
+          : semanticAppliedPreview();
+      },
+      run_guided_query: async ({ auditId }) =>
+        auditId === 7 ? page([]) : page([SEMANTIC_ROW]),
+    },
+  });
+  await loadFixture(app);
+
+  await app.debug.searchAiEvidenceForTest("find the attack path");
+  await settleFrontend();
+
+  let state = app.debug.getAiSearchState();
+  assert.equal(parseCount, 1);
+  assert.equal(state.queryMode, "guided");
+  assert.equal(state.guidedQuerySpec.expression.type, "matchNone");
+  assert.equal(state.rows.length, 0);
+  assert.match(
+    app.document.getElementById("ai-search-availability").textContent,
+    /No exact rows matched yet.*refresh automatically/i
+  );
+
+  semanticBuild.resolve(semanticIndexSummary());
+  await waitForCommand(app, "parse_guided_query", 2);
+  await waitForCommand(app, "run_guided_query", 2);
+  await settleFrontend();
+
+  assert.equal(parseCount, 2);
+  assert.deepEqual(guidedCommands(app), [
+    "parse_guided_query",
+    "accept_guided_query",
+    "run_guided_query",
+    "parse_guided_query",
+    "accept_guided_query",
+    "run_guided_query",
+  ]);
+  state = app.debug.getAiSearchState();
+  assert.equal(state.guidedParseResult.semanticStatus, "applied");
+  assert.equal(state.guidedQuerySpec.expression.type, "semanticSelection");
+  assert.equal(state.rows.length, 1);
+  assert.equal(state.rows[0].row_num, SEMANTIC_ROW.row_num);
+});
+
+test("manual guided reset preserves same-dataset semantic, role, and timestamp work", async () => {
+  const semanticBuild = deferred();
+  const refreshedRoles = deferred();
+  const timestampCheck = deferred();
+  let roleDetectionCount = 0;
+  let attackPathParseCount = 0;
+  const timestampSuggestion = {
+    role: "timestamp",
+    sqlName: "commandline",
+    originalName: "CommandLine",
+    confidence: 0.95,
+    status: "suggested",
+    reasons: ["test timestamp mapping"],
+  };
+  const hostSuggestion = {
+    role: "host",
+    sqlName: "commandline",
+    originalName: "CommandLine",
+    confidence: 0.8,
+    status: "suggested",
+    reasons: ["test host mapping"],
+  };
+  const pendingAttackPath = {
+    ...semanticPendingMatchNonePreview(),
+    auditId: 8,
+    intentToken: '{"intent":"attackPath","attempt":1}',
+  };
+  const semanticAttackPath = {
+    ...semanticAppliedPreview(),
+    auditId: 9,
+    intentToken: '{"intent":"attackPath","attempt":2}',
+  };
+  const app = bootApp({
+    commandHandlers: {
+      semantic_index_status: async () => ({ ready: false, rowsIndexed: 0 }),
+      build_semantic_index: async () => semanticBuild.promise,
+      detect_column_roles: async () => {
+        roleDetectionCount += 1;
+        return roleDetectionCount === 1
+          ? [timestampSuggestion]
+          : refreshedRoles.promise;
+      },
+      analyze_timestamp_column: async () => timestampCheck.promise,
+      parse_guided_query: async ({ queryText }) => {
+        if (queryText === "first evidence search") return validAiPreview();
+        attackPathParseCount += 1;
+        return attackPathParseCount === 1 ? pendingAttackPath : semanticAttackPath;
+      },
+      run_guided_query: async ({ auditId }) => {
+        if (auditId === 7) return page([EVIDENCE_ROW]);
+        if (auditId === 8) return page([]);
+        return page([SEMANTIC_ROW]);
+      },
+    },
+  });
+  await loadFixture(app);
+  await waitForCommand(app, "analyze_timestamp_column");
+
+  await app.debug.searchAiEvidenceForTest("first evidence search");
+  await settleFrontend();
+  const reset = app.document.getElementById("guided-reset-btn");
+  assert.equal(reset.classList.contains("hidden"), false);
+  assert.equal(reset.disabled, false);
+
+  const roleRequest = app.debug.detectRolesForTest();
+  await waitForCommand(app, "detect_column_roles", 2);
+  reset.dispatchEvent({ type: "click" });
+  await waitForCommand(app, "query_rows", 2);
+  await settleFrontend();
+  let state = app.debug.getAiSearchState();
+  assert.equal(state.queryMode, "normal");
+  assert.equal(app.debug.getSemanticIndexState().status, "building");
+  assert.equal(app.debug.getSemanticIndexState().inFlight, true);
+
+  refreshedRoles.resolve([timestampSuggestion, hostSuggestion]);
+  await roleRequest;
+  timestampCheck.resolve({
+    originalName: "CommandLine",
+    needsTimezone: true,
+    needsDateConvention: false,
+    sampleNaiveValues: ["2026-07-17 10:00:00"],
+    sampleAmbiguousDateValues: [],
+  });
+  await settleFrontend();
+  const intelState = app.debug.getIntelState();
+  assert.equal(intelState.columnRoleSuggestions.some((row) => row.role === "host"), true);
+  assert.equal(intelState.timestampAnalysis?.needsTimezone, true);
+
+  await app.debug.searchAiEvidenceForTest("find the attack path");
+  await settleFrontend();
+  state = app.debug.getAiSearchState();
+  assert.equal(state.guidedQuerySpec.expression.type, "matchNone");
+  assert.equal(state.rows.length, 0);
+
+  semanticBuild.resolve(semanticIndexSummary());
+  await waitForCommand(app, "parse_guided_query", 3);
+  await waitForCommand(app, "run_guided_query", 3);
+  await settleFrontend();
+
+  assert.equal(attackPathParseCount, 2);
+  assert.equal(app.debug.getSemanticIndexState().status, "ready");
+  state = app.debug.getAiSearchState();
+  assert.equal(state.guidedParseResult.semanticStatus, "applied");
+  assert.equal(state.guidedQuerySpec.expression.type, "semanticSelection");
+  assert.equal(state.rows.length, 1);
+  assert.equal(state.rows[0].row_num, SEMANTIC_ROW.row_num);
+});
+
 test("text changed during deferred acceptance cannot publish the stale evidence page", async () => {
   const acceptance = deferred();
   const app = bootApp({
@@ -880,4 +1236,111 @@ test("text changed during deferred acceptance cannot publish the stale evidence 
   assert.equal(state.rows[0].row_num, BASELINE_ROW.row_num);
   assert.equal(state.aiMatchColumnVisible, false);
   assert.equal(app.calls.filter((call) => call.command === "count_rows").length, 1);
+});
+
+test("Apply cannot interrupt acceptance or first-page publication", async () => {
+  const firstPage = deferred();
+  const app = bootApp({
+    commandHandlers: {
+      parse_guided_query: async () => validAiPreview(),
+      run_guided_query: async () => firstPage.promise,
+    },
+  });
+  await loadFixture(app);
+
+  const search = app.debug.searchAiEvidenceForTest("find PowerShell evidence");
+  await waitForCommand(app, "run_guided_query");
+
+  const apply = app.document.getElementById("apply-btn");
+  assert.equal(apply.disabled, true, "Apply should be disabled while the first evidence page is pending");
+  for (const id of [
+    "clear-btn",
+    "search-box",
+    "export-csv-btn",
+    "export-xlsx-btn",
+    "report-export-btn",
+    "prev-page-btn",
+    "next-page-btn",
+  ]) {
+    assert.equal(
+      app.document.getElementById(id).disabled,
+      true,
+      `${id} should be disabled while the first evidence page is pending`
+    );
+  }
+  const quickSearch = app.document.getElementById("search-box");
+  quickSearch.value = "must not be cleared by a competing event";
+  app.document.getElementById("clear-btn").dispatchEvent({ type: "click" });
+  assert.equal(quickSearch.value, "must not be cleared by a competing event");
+  apply.dispatchEvent({ type: "click" });
+  await settleFrontend();
+  assert.equal(
+    app.calls.filter((call) => call.command === "query_rows").length,
+    1,
+    "a programmatic Apply event must not bypass the in-flight guard"
+  );
+  assert.equal(app.debug.getAiSearchState().actionInFlight, "run");
+
+  firstPage.resolve(page([EVIDENCE_ROW]));
+  await search;
+  await settleFrontend();
+
+  assert.deepEqual(guidedCommands(app), [
+    "parse_guided_query",
+    "accept_guided_query",
+    "run_guided_query",
+  ]);
+  const state = app.debug.getAiSearchState();
+  assert.equal(state.queryMode, "guided");
+  assert.equal(state.rows.length, 1);
+  assert.equal(state.rows[0].row_num, EVIDENCE_ROW.row_num);
+});
+
+test("an active ordinary page request blocks parsing until its table publication finishes", async () => {
+  const ordinaryPage = deferred();
+  let queryCallCount = 0;
+  const app = bootApp({
+    commandHandlers: {
+      query_rows: async () => {
+        queryCallCount += 1;
+        return queryCallCount === 1 ? page([BASELINE_ROW]) : ordinaryPage.promise;
+      },
+      parse_guided_query: async () => validAiPreview(),
+    },
+  });
+  await loadFixture(app);
+
+  app.document.getElementById("search-box").value = "ordinary filter";
+  app.document.getElementById("apply-btn").dispatchEvent({ type: "click" });
+  await waitForCommand(app, "query_rows", 2);
+  assert.equal(app.debug.getAiSearchState().dataRequestInFlight, true);
+  assert.equal(app.document.getElementById("guided-search-submit").disabled, true);
+
+  const blockedSearch = await app.debug.searchAiEvidenceForTest("find PowerShell evidence");
+  assert.equal(blockedSearch, null);
+  assert.equal(
+    app.calls.filter((call) => call.command === "parse_guided_query").length,
+    0,
+    "AI parsing must not overlap an unpublished ordinary page"
+  );
+
+  ordinaryPage.resolve(page([NORMAL_FILTER_ROW]));
+  await settleFrontend();
+  let state = app.debug.getAiSearchState();
+  assert.equal(state.dataRequestInFlight, false);
+  assert.equal(state.queryMode, "normal");
+  assert.equal(state.rows.length, 1);
+  assert.equal(state.rows[0].row_num, NORMAL_FILTER_ROW.row_num);
+
+  await app.debug.searchAiEvidenceForTest("find PowerShell evidence");
+  await settleFrontend();
+  assert.deepEqual(guidedCommands(app), [
+    "parse_guided_query",
+    "accept_guided_query",
+    "run_guided_query",
+  ]);
+  state = app.debug.getAiSearchState();
+  assert.equal(state.queryMode, "guided");
+  assert.equal(state.rows.length, 1);
+  assert.equal(state.rows[0].row_num, EVIDENCE_ROW.row_num);
 });

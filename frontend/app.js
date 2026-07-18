@@ -244,22 +244,54 @@
     progressWrap.classList.add("hidden");
   }
 
+  function guidedWorkInFlight() {
+    return (
+      guidedActiveParse !== null ||
+      guidedActiveAction !== null ||
+      guidedActiveQuery !== null
+    );
+  }
+
+  function tableTransitionInFlight() {
+    return guidedWorkInFlight() || activeDataRequest !== null;
+  }
+
   function updateGuidedInteractionControls() {
     const parsing = guidedActiveParse !== null;
     const actionInFlight = guidedActiveAction !== null;
     const queryInFlight = guidedActiveQuery !== null;
+    const tableTransition = parsing || actionInFlight || queryInFlight || activeDataRequest !== null;
+    const tableControlsBlocked = !controlsEnabled || sheetLoadInFlight || tableTransition;
     guidedSearchBox.disabled =
       !controlsEnabled ||
       columns.length === 0 ||
       sheetLoadInFlight ||
       parsing ||
       actionInFlight ||
-      queryInFlight;
+      queryInFlight ||
+      activeDataRequest !== null ||
+      activeReportExport !== null;
     guidedSearchSubmit.disabled =
-      !controlsEnabled || columns.length === 0 || sheetLoadInFlight || parsing || actionInFlight || queryInFlight;
-    guidedRunBtn.disabled = actionInFlight || queryInFlight;
-    guidedRejectBtn.disabled = actionInFlight || queryInFlight;
-    guidedResetBtn.disabled = parsing || actionInFlight || queryInFlight;
+      !controlsEnabled ||
+      columns.length === 0 ||
+      sheetLoadInFlight ||
+      parsing ||
+      actionInFlight ||
+      queryInFlight ||
+      activeDataRequest !== null ||
+      activeReportExport !== null;
+    guidedRunBtn.disabled = tableTransition || activeReportExport !== null;
+    guidedRejectBtn.disabled = tableTransition || activeReportExport !== null;
+    guidedResetBtn.disabled = tableTransition || activeReportExport !== null;
+    searchBox.disabled = tableControlsBlocked;
+    exportCsvBtn.disabled = tableControlsBlocked;
+    exportXlsxBtn.disabled = tableControlsBlocked;
+    reportExportBtn.disabled = tableControlsBlocked || activeReportExport !== null;
+    addFilterBtn.disabled = tableControlsBlocked;
+    applyBtn.disabled = tableControlsBlocked;
+    clearBtn.disabled = tableControlsBlocked;
+    prevPageBtn.disabled = tableControlsBlocked || cursorStack.length === 0;
+    nextPageBtn.disabled = tableControlsBlocked || !hasMore;
     // Keep Close available while parsing so it can cancel a slow preview, but do not let it
     // race the decision implicit in Run or an explicit Reject/Edit request.
     guidedPanelClose.disabled = actionInFlight || queryInFlight;
@@ -270,9 +302,9 @@
     guidedActiveParse = null;
   }
 
-  function resetGuidedQueryUi() {
+  function resetGuidedQueryUi({ invalidateDataset = true } = {}) {
     cancelSearchDebounce();
-    invalidateGuidedContext();
+    if (invalidateDataset) invalidateGuidedContext();
     queryMode = "normal";
     activeEvidenceQuery = null;
     guidedParseResult = null;
@@ -380,6 +412,9 @@
     if (
       guidedActiveAction !== null ||
       guidedActiveQuery !== null ||
+      activeDataRequest !== null ||
+      activeReportExport !== null ||
+      sheetLoadInFlight ||
       (!allowDuringParse && guidedActiveParse !== null)
     ) {
       return null;
@@ -769,6 +804,8 @@
         // Row IDs are only accepted by copying a trusted backend-built QuerySpec. They are
         // never derived from the request text or synthesized in the frontend.
         return { type: "rowIds", values: [...expression.values] };
+      case "matchNone":
+        return { type: "matchNone" };
       case "semanticSelection":
         if (
           typeof expression.selectionId !== "string" ||
@@ -833,6 +870,7 @@
 
   function expressionUsesSemanticSelection(expression) {
     if (!expression || typeof expression !== "object") return false;
+    if (expression.type === "matchNone") return false;
     if (expression.type === "semanticSelection") return true;
     if (expression.type === "not") return expressionUsesSemanticSelection(expression.child);
     if (["and", "or"].includes(expression.type) && Array.isArray(expression.children)) {
@@ -1119,6 +1157,9 @@
   }
 
   async function refreshData() {
+    if (guidedActiveParse !== null || guidedActiveAction !== null || activeDataRequest !== null) {
+      return null;
+    }
     // Disabled synchronously (before the first await below) so a rapid double-click on
     // Prev/Next can't fire a second query_rows() while this one is still in flight and read a
     // stale nextCursor — the button is unclickable for the whole round trip either way.
@@ -1146,6 +1187,7 @@
       table,
     };
     activeDataRequest = request;
+    updateGuidedInteractionControls();
     if (isTrackedEvidenceRequest) {
       guidedActiveQuery = request;
       updateGuidedInteractionControls();
@@ -1192,7 +1234,10 @@
       return null;
     } finally {
       const stillCurrent = requestIsCurrent();
-      if (activeDataRequest === request) activeDataRequest = null;
+      if (activeDataRequest === request) {
+        activeDataRequest = null;
+        updateGuidedInteractionControls();
+      }
       if (guidedActiveQuery === request) {
         guidedActiveQuery = null;
         updateGuidedInteractionControls();
@@ -1205,9 +1250,48 @@
     }
   }
 
+  function discardGuidedPlanForTableAction() {
+    const auditId = guidedAuditId;
+    const intentToken = guidedIntentToken;
+    if (
+      auditId !== null &&
+      typeof intentToken === "string" &&
+      guidedReviewStatus === "unreviewed"
+    ) {
+      invoke("set_guided_parse_decision", {
+        auditId,
+        intentToken,
+        decision: "edited",
+      }).catch((err) => console.error("could not retire AI interpretation before table filtering", err));
+    }
+
+    pendingSemanticSearch = null;
+    guidedParseResult = null;
+    guidedIntentToken = null;
+    guidedAuditId = null;
+    guidedReviewStatus = null;
+    guidedQuerySpec = null;
+    guidedMatchExplanation = [];
+    guidedPreviewQueryText = null;
+    guidedSearchBox.value = "";
+    guidedQueryPanel.classList.add("hidden");
+    guidedPreviewText.textContent = "";
+    guidedAiStatus.textContent = "";
+    guidedAiStatus.classList.add("hidden");
+    guidedClarification.textContent = "";
+    guidedClarification.classList.add("hidden");
+    guidedRunBtn.textContent = "Search evidence";
+    guidedRunBtn.classList.add("hidden");
+    guidedRejectBtn.classList.add("hidden");
+    guidedResetBtn.classList.add("hidden");
+    aiSearchAvailability.textContent = "Ready to search every imported row. No enrichment scan is required.";
+    aiSearchAvailability.classList.add("ready");
+  }
+
   function applyControlsAndReload() {
     cancelSearchDebounce();
-    pendingSemanticSearch = null;
+    if (sheetLoadInFlight || tableTransitionInFlight()) return null;
+    discardGuidedPlanForTableAction();
     queryMode = "normal";
     activeEvidenceQuery = null;
     setAiMatchColumnVisible(false);
@@ -1219,8 +1303,9 @@
       : null;
     spec.expression = null;
     resetPagination();
-    refreshData();
+    const page = refreshData();
     refreshCount();
+    return page;
   }
 
   let searchDebounceHandle = null;
@@ -1231,6 +1316,8 @@
 
   function debouncedApply() {
     cancelSearchDebounce();
+    pendingSemanticSearch = null;
+    if (sheetLoadInFlight || tableTransitionInFlight()) return;
     const request = {
       contextRevision: guidedContextRevision,
       path: currentPath,
@@ -1238,7 +1325,12 @@
     };
     searchDebounceHandle = setTimeout(() => {
       searchDebounceHandle = null;
-      if (loadedContextIsCurrent(request) && controlsEnabled && !sheetLoadInFlight) {
+      if (
+        loadedContextIsCurrent(request) &&
+        controlsEnabled &&
+        !sheetLoadInFlight &&
+        !tableTransitionInFlight()
+      ) {
         applyControlsAndReload();
       }
     }, 300);
@@ -1262,7 +1354,10 @@
 
   function updateReportExportButton() {
     reportExportBtn.disabled =
-      !controlsEnabled || sheetLoadInFlight || activeReportExport !== null;
+      !controlsEnabled ||
+      sheetLoadInFlight ||
+      activeReportExport !== null ||
+      tableTransitionInFlight();
   }
 
   function semanticIndexRequestIsCurrent(request) {
@@ -1339,11 +1434,20 @@
   function refreshPendingSemanticSearch() {
     if (semanticIndexState.status !== "ready" || pendingSemanticSearch === null) return;
     const request = pendingSemanticSearch;
+    if (activeReportExport !== null || sheetLoadInFlight) {
+      setTimeout(refreshPendingSemanticSearch, 250);
+      return;
+    }
     if (!pendingSemanticSearchIsCurrent(request)) {
       pendingSemanticSearch = null;
       return;
     }
-    if (guidedActiveParse !== null || guidedActiveAction !== null || guidedActiveQuery !== null) {
+    if (
+      guidedActiveParse !== null ||
+      guidedActiveAction !== null ||
+      guidedActiveQuery !== null ||
+      activeDataRequest !== null
+    ) {
       setTimeout(refreshPendingSemanticSearch, 250);
       return;
     }
@@ -1739,7 +1843,13 @@
   ) {
     const trimmed = queryText.trim();
     if (!trimmed) return null;
-    if (guidedActiveAction !== null || guidedActiveQuery !== null || sheetLoadInFlight) return null;
+    if (
+      guidedActiveAction !== null ||
+      guidedActiveQuery !== null ||
+      activeDataRequest !== null ||
+      activeReportExport !== null ||
+      sheetLoadInFlight
+    ) return null;
     cancelSearchDebounce();
 
     const request = {
@@ -1831,7 +1941,14 @@
   ) {
     const trimmed = queryText.trim();
     if (!trimmed) return null;
-    if (guidedActiveParse !== null || guidedActiveAction !== null || guidedActiveQuery !== null || sheetLoadInFlight) {
+    if (
+      guidedActiveParse !== null ||
+      guidedActiveAction !== null ||
+      guidedActiveQuery !== null ||
+      activeDataRequest !== null ||
+      activeReportExport !== null ||
+      sheetLoadInFlight
+    ) {
       return null;
     }
     pendingSemanticSearch = null;
@@ -2313,7 +2430,7 @@
   // -- export flow --------------------------------------------------------------
 
   async function doExport(format) {
-    if (sheetLoadInFlight || !controlsEnabled) return;
+    if (sheetLoadInFlight || !controlsEnabled || tableTransitionInFlight()) return;
     if (
       format === "csv" &&
       !window.confirm(
@@ -2322,6 +2439,19 @@
     ) {
       return;
     }
+    const tableIdentityBeforeDialog = {
+      contextRevision: guidedContextRevision,
+      path: currentPath,
+      sheet: currentSheet,
+      table,
+      mode: queryMode,
+      evidenceQuery: activeEvidenceQuery,
+      spec: JSON.stringify(
+        queryMode === "querySpec"
+          ? { ...snapshotQuerySpec(), cursor: null }
+          : buildSpecFromControls(true)
+      ),
+    };
     const ext = format === "csv" ? "csv" : "xlsx";
     const destPath = await invoke("plugin:dialog|save", {
       options: {
@@ -2329,7 +2459,22 @@
         defaultPath: `log-parser-export.${ext}`,
       },
     });
-    if (!destPath) return;
+    const currentExportSpec = JSON.stringify(
+      queryMode === "querySpec"
+        ? { ...snapshotQuerySpec(), cursor: null }
+        : buildSpecFromControls(true)
+    );
+    if (
+      !destPath ||
+      tableTransitionInFlight() ||
+      guidedContextRevision !== tableIdentityBeforeDialog.contextRevision ||
+      currentPath !== tableIdentityBeforeDialog.path ||
+      currentSheet !== tableIdentityBeforeDialog.sheet ||
+      table !== tableIdentityBeforeDialog.table ||
+      queryMode !== tableIdentityBeforeDialog.mode ||
+      activeEvidenceQuery !== tableIdentityBeforeDialog.evidenceQuery ||
+      currentExportSpec !== tableIdentityBeforeDialog.spec
+    ) return;
 
     const modeAtStart = queryMode;
     const evidenceQuery = activeEvidenceQuery;
@@ -2337,6 +2482,7 @@
       contextRevision: guidedContextRevision,
       path: currentPath,
       sheet: currentSheet,
+      table,
     };
     const exportSpec =
       modeAtStart === "querySpec"
@@ -2354,7 +2500,9 @@
             })
           : await invoke("export_data", { spec: exportSpec, format, destPath });
       if (
+        tableTransitionInFlight() ||
         !loadedContextIsCurrent(context) ||
+        table !== context.table ||
         queryMode !== modeAtStart ||
         (["guided", "querySpec"].includes(modeAtStart) && activeEvidenceQuery !== evidenceQuery)
       ) return;
@@ -2362,7 +2510,9 @@
       alert(`Exported ${result.rowCount.toLocaleString()} rows to ${result.destPath}`);
     } catch (err) {
       if (
+        tableTransitionInFlight() ||
         !loadedContextIsCurrent(context) ||
+        table !== context.table ||
         queryMode !== modeAtStart ||
         (["guided", "querySpec"].includes(modeAtStart) && activeEvidenceQuery !== evidenceQuery)
       ) return;
@@ -2372,7 +2522,12 @@
   }
 
   async function doReportExport() {
-    if (sheetLoadInFlight || !controlsEnabled || activeReportExport !== null) return;
+    if (
+      sheetLoadInFlight ||
+      !controlsEnabled ||
+      activeReportExport !== null ||
+      tableTransitionInFlight()
+    ) return;
     const request = {
       id: ++reportExportSequence,
       path: currentPath,
@@ -2380,6 +2535,7 @@
     };
     activeReportExport = request;
     updateReportExportButton();
+    updateGuidedInteractionControls();
 
     try {
       const destPath = await invoke("plugin:dialog|save", {
@@ -2388,7 +2544,7 @@
           defaultPath: "log-parser-report.xlsx",
         },
       });
-      if (!destPath || !reportExportIsCurrent(request)) return;
+      if (!destPath || !reportExportIsCurrent(request) || tableTransitionInFlight()) return;
       await generateReport(destPath, request);
     } catch (err) {
       if (!reportExportIsCurrent(request)) return;
@@ -2399,6 +2555,7 @@
         activeReportExport = null;
         if (shouldHideProgress) hideProgress();
         updateReportExportButton();
+        updateGuidedInteractionControls();
       }
     }
   }
@@ -2457,7 +2614,9 @@
     decideGuidedParse("rejected").catch((err) => alert(`Could not record decision: ${err}`));
   });
   guidedResetBtn.addEventListener("click", () => {
-    resetGuidedQueryUi();
+    // This only returns to the ordinary table view. The imported dataset is unchanged, so keep
+    // semantic indexing, role detection, and timestamp analysis bound to their current revision.
+    resetGuidedQueryUi({ invalidateDataset: false });
     aiSearchAvailability.textContent = "Ready to search every imported row. No enrichment scan is required.";
     aiSearchAvailability.classList.add("ready");
     applyControlsAndReload();
@@ -2468,9 +2627,13 @@
     guidedQueryPanel.classList.add("hidden");
   });
 
-  addFilterBtn.addEventListener("click", addFilterRow);
+  addFilterBtn.addEventListener("click", () => {
+    if (sheetLoadInFlight || tableTransitionInFlight()) return;
+    addFilterRow();
+  });
   applyBtn.addEventListener("click", applyControlsAndReload);
   clearBtn.addEventListener("click", () => {
+    if (sheetLoadInFlight || tableTransitionInFlight()) return;
     searchBox.value = "";
     filterList.innerHTML = "";
     sortColumn.value = "";
@@ -2523,6 +2686,7 @@
   exportXlsxBtn.addEventListener("click", () => doExport("xlsx"));
 
   prevPageBtn.addEventListener("click", () => {
+    if (sheetLoadInFlight || tableTransitionInFlight()) return;
     if (cursorStack.length === 0) return;
     spec.cursor = cursorStack.pop();
     pageIndex -= 1;
@@ -2530,6 +2694,7 @@
   });
 
   nextPageBtn.addEventListener("click", () => {
+    if (sheetLoadInFlight || tableTransitionInFlight()) return;
     if (!hasMore) return;
     cursorStack.push(spec.cursor);
     spec.cursor = nextCursor;

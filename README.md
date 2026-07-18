@@ -104,8 +104,8 @@ for semantic retrieval · plain HTML/CSS/vanilla JS frontend
 
 ## Downloads
 
-Pre-built installers for Windows, macOS (Apple Silicon and Intel), and
-Linux are published on the [Releases](../../releases) page.
+Pre-built installers for Windows and macOS (Apple Silicon and Intel) are
+published on the [Releases](../../releases) page.
 
 **macOS note:** these builds are not yet code-signed/notarized with an
 Apple Developer ID, so Gatekeeper will refuse to open them with a
