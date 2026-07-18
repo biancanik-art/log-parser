@@ -138,6 +138,13 @@ pub struct LlmContext {
     matched_query_terms: Vec<String>,
     pub has_normalized_time: bool,
     pub library_hash: String,
+    /// Whether the optional deterministic threat-enrichment scan has produced matches for this
+    /// import. Used only to route bare DFIR-mapping requests; execution re-validates scan
+    /// freshness against the current library and evidence-role hashes.
+    intel_scan_ready: bool,
+    /// Whether normalized UTC row times exist for this import, independent of whether the
+    /// current request names a timeline column.
+    row_time_populated: bool,
 }
 
 impl LlmContext {
@@ -213,6 +220,8 @@ impl LlmContext {
             matched_query_terms: Vec::new(),
             has_normalized_time,
             library_hash: library.library_hash.clone(),
+            intel_scan_ready: false,
+            row_time_populated: has_normalized_time,
         }
     }
 
@@ -318,6 +327,13 @@ impl LlmContext {
         }
 
         let dataset_identity = Some(dataset_identity(conn, columns)?);
+        let intel_scan_ready = table_exists(conn, "_intel_match")?;
+        let row_time_populated = table_exists(conn, "_row_time")?
+            && conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM _row_time LIMIT 1)",
+                [],
+                |row| row.get::<_, i64>(0),
+            )? != 0;
 
         Ok(Self {
             techniques: Vec::new(),
@@ -334,6 +350,8 @@ impl LlmContext {
             matched_query_terms: Vec::new(),
             has_normalized_time: normalized_time_available,
             library_hash: String::new(),
+            intel_scan_ready,
+            row_time_populated,
         })
     }
 
@@ -1534,6 +1552,129 @@ fn query_is_bare_attack_path_request(query_text: &str) -> bool {
         .all(|token| request_words.contains(token.as_str()))
 }
 
+/// A bare DFIR-mapping request asks for the dataset's suspicious activity or MITRE-style phase
+/// view without naming any concrete evidence value ("find DFIR phases", "show suspicious
+/// activity", "map events to MITRE"). Investigative vocabulary must never become a literal
+/// search string; these requests route to the deterministic threat-enrichment scan instead.
+fn query_is_bare_dfir_mapping_request(query_text: &str) -> bool {
+    if !quoted_literal_ranges(query_text).is_empty() {
+        return false;
+    }
+    let tokens = normalized_unquoted_tokens(query_text);
+    if tokens.is_empty() {
+        return false;
+    }
+    let contains_concept = tokens.iter().any(|token| {
+        matches!(
+            token.as_str(),
+            "dfir" | "mitre" | "ttps" | "badness" | "suspicious" | "malicious" | "ioc" | "iocs"
+        )
+    }) || tokens.windows(2).any(|window| {
+        matches!(
+            window,
+            [first, second]
+                if (first == "kill" && second == "chain")
+                    || (first == "attack"
+                        && matches!(second.as_str(), "phase" | "phases" | "stage" | "stages"))
+                    || (first == "threat"
+                        && matches!(second.as_str(), "matches" | "techniques" | "activity"))
+        )
+    });
+    if !contains_concept {
+        return false;
+    }
+    let request_words = [
+        "a",
+        "activity",
+        "all",
+        "an",
+        "and",
+        "any",
+        "anything",
+        "attack",
+        "bad",
+        "badness",
+        "build",
+        "categories",
+        "chain",
+        "chronological",
+        "chronologically",
+        "create",
+        "data",
+        "dataset",
+        "detect",
+        "dfir",
+        "earliest",
+        "entries",
+        "events",
+        "everything",
+        "evidence",
+        "find",
+        "flag",
+        "for",
+        "get",
+        "give",
+        "highlight",
+        "identify",
+        "import",
+        "imported",
+        "in",
+        "indicators",
+        "ioc",
+        "iocs",
+        "kill",
+        "latest",
+        "likely",
+        "list",
+        "log",
+        "logs",
+        "malicious",
+        "manner",
+        "map",
+        "mapped",
+        "mapping",
+        "matched",
+        "matches",
+        "me",
+        "mitre",
+        "of",
+        "on",
+        "phase",
+        "phases",
+        "please",
+        "possible",
+        "potential",
+        "records",
+        "rows",
+        "scan",
+        "show",
+        "stage",
+        "stages",
+        "style",
+        "suspicious",
+        "table",
+        "tactic",
+        "tactics",
+        "technique",
+        "techniques",
+        "the",
+        "this",
+        "threat",
+        "threats",
+        "timeline",
+        "to",
+        "ttps",
+        "view",
+        "way",
+        "with",
+    ]
+    .into_iter()
+    .collect::<HashSet<_>>();
+    tokens
+        .iter()
+        .all(|token| request_words.contains(token.as_str()))
+}
+
 pub fn query_requests_timeline(query_text: &str) -> bool {
     let normalized = normalize_grounding_term(query_text);
     [
@@ -1916,6 +2057,9 @@ fn deterministic_preclassification(
     let unsupported_phrases: &[&[&str]] = &[
         &["explain"],
         &["explanation"],
+        &["meaning"],
+        &["interpret"],
+        &["interpretation"],
         &["root", "cause"],
         &["why", "did"],
         &["why", "this", "happened"],
@@ -1944,6 +2088,35 @@ fn deterministic_preclassification(
                 ));
             }
         }
+    }
+
+    // Investigative concept vocabulary ("DFIR phases", "suspicious activity", "MITRE") is not
+    // evidence text; a literal search for it can only return zero rows. Route these requests to
+    // the deterministic technique scan, whose matches are traceable to library keywords.
+    if query_is_bare_dfir_mapping_request(query_text) {
+        if !context.intel_scan_ready {
+            return Some(preclassified_unknown(
+                "Mapping events to DFIR/MITRE phases uses the offline technique library, and that enrichment scan has not run for this import.",
+                "Run threat enrichment, then repeat this request. The Threat Report export also contains the full phase-mapped timeline.",
+                "bare DFIR-mapping request routed to threat enrichment, which has not been run",
+            ));
+        }
+        let sort = if context.row_time_populated {
+            GuidedSort::ChronologicalAsc
+        } else {
+            GuidedSort::RowNumAsc
+        };
+        return Some(ValidationResult {
+            intent: GuidedIntent::SuspiciousScan {
+                tactic_ids: Vec::new(),
+                technique_ids: Vec::new(),
+                sort,
+            },
+            status: "validated",
+            detail: Some(
+                "bare DFIR-mapping request routed to the deterministic technique scan".to_string(),
+            ),
+        });
     }
 
     if query_requests_timeline(query_text) {
@@ -3976,6 +4149,81 @@ mod tests {
             .status,
             "rejected_by_validator"
         );
+    }
+
+    #[test]
+    fn bare_dfir_mapping_requests_route_to_the_technique_scan_not_literal_search() {
+        let mut conn = raw_db("2026-07-17T01:02:03Z");
+        let mapping_queries = [
+            "find DFIR phases",
+            "map the events in a DFIR manner",
+            "identify badness",
+            "show suspicious activity",
+            "map everything to MITRE tactics",
+        ];
+        for query in mapping_queries {
+            let context = LlmContext::from_table(&conn, &raw_columns(), query).unwrap();
+            let result = deterministic_preclassification(query, &context)
+                .unwrap_or_else(|| panic!("expected preclassification for: {query}"));
+            assert_eq!(result.status, "preclassified_unknown", "{query}");
+            let GuidedIntent::Unknown { message, .. } = &result.intent else {
+                panic!("expected enrichment guidance before a scan exists: {query}");
+            };
+            assert!(message.contains("enrichment"), "{query}: {message}");
+        }
+
+        conn.execute_batch("CREATE TABLE _intel_match (row_num INTEGER)")
+            .unwrap();
+        for query in mapping_queries {
+            let context = LlmContext::from_table(&conn, &raw_columns(), query).unwrap();
+            let result = deterministic_preclassification(query, &context)
+                .unwrap_or_else(|| panic!("expected preclassification for: {query}"));
+            assert_eq!(result.status, "validated", "{query}");
+            let GuidedIntent::SuspiciousScan {
+                tactic_ids,
+                technique_ids,
+                sort,
+            } = &result.intent
+            else {
+                panic!("expected a suspicious-activity scan intent: {query}");
+            };
+            assert!(tactic_ids.is_empty() && technique_ids.is_empty());
+            assert_eq!(*sort, GuidedSort::RowNumAsc, "{query}");
+        }
+
+        time::normalize_timestamp_column_with_options(&mut conn, &raw_columns(), None, None)
+            .unwrap();
+        let query = "find DFIR phases";
+        let context = LlmContext::from_table(&conn, &raw_columns(), query).unwrap();
+        let result = deterministic_preclassification(query, &context).unwrap();
+        let GuidedIntent::SuspiciousScan { sort, .. } = &result.intent else {
+            panic!("expected a suspicious-activity scan intent");
+        };
+        assert_eq!(*sort, GuidedSort::ChronologicalAsc);
+
+        // Concept vocabulary combined with concrete evidence words is not a bare mapping
+        // request; it stays on the ordinary grounded-search path.
+        for grounded in ["suspicious powershell for alice", "malicious logons for bob"] {
+            let context = LlmContext::from_table(&conn, &raw_columns(), grounded).unwrap();
+            assert!(
+                deterministic_preclassification(grounded, &context).is_none(),
+                "{grounded}"
+            );
+        }
+    }
+
+    #[test]
+    fn meaning_and_interpretation_requests_get_an_honest_refusal() {
+        let conn = raw_db("2026-07-17T01:02:03Z");
+        for query in [
+            "identify the meaning of logs",
+            "interpret these events for me",
+        ] {
+            let context = LlmContext::from_table(&conn, &raw_columns(), query).unwrap();
+            let result = deterministic_preclassification(query, &context)
+                .unwrap_or_else(|| panic!("expected preclassification for: {query}"));
+            assert_eq!(result.status, "preclassified_unknown", "{query}");
+        }
     }
 
     #[test]

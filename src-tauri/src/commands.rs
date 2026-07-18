@@ -1349,7 +1349,8 @@ pub async fn export_guided_data(
             guided_parser::GuidedIntent::RawEvidenceSearch { .. }
         ) {
             return Err(
-                "AI result export is available only for audited raw evidence searches".to_string(),
+                "AI result export is available only for audited raw evidence searches. For the MITRE-mapped view, use the Threat Report export."
+                    .to_string(),
             );
         }
         let spec = guided_parser::query_spec_from_raw_intent(&intent, None, None)

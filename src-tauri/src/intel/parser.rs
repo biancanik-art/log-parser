@@ -3599,5 +3599,22 @@ mod tests {
             intent_from_token(&injected.intent_token).unwrap(),
             GuidedIntent::RawEvidenceSearch { .. } | GuidedIntent::Unknown { .. }
         ));
+
+        // A bare DFIR-mapping request resolves deterministically before inference: with no
+        // enrichment scan in this database it must steer to threat enrichment, not produce a
+        // literal search for investigative vocabulary.
+        let mapping = parse_guided_query_with_llm(&conn, &columns, "find DFIR phases", &mut model)
+            .unwrap();
+        assert!(mapping.ai_assisted);
+        assert!(mapping.needs_clarification, "{}", mapping.preview_text);
+        assert!(
+            mapping
+                .clarification_message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("enrichment"),
+            "{:?}",
+            mapping.clarification_message
+        );
     }
 }

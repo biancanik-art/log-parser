@@ -473,12 +473,14 @@
   }
 
   function guidedPlanIsReadyToRun() {
-    if (!guidedParseResult || guidedParseResult.needsClarification || guidedQuerySpec === null) {
+    if (!guidedParseResult || guidedParseResult.needsClarification) {
       return false;
     }
     if (!guidedParseResult.aiAssisted) {
-      return guidedAuditId === null;
+      return guidedQuerySpec !== null && guidedAuditId === null;
     }
+    // A validated MITRE-mapping plan carries no querySpec: the audited intent token is the
+    // backend-validated authority and executes through run_guided_query.
     return (
       guidedIntentToken !== null &&
       guidedAuditId !== null &&
@@ -2013,7 +2015,7 @@
       const shown = Array.isArray(page.rows) ? page.rows.length : 0;
       const resultMessage =
         shown === 0
-          ? "Search complete. No evidence rows matched this request."
+          ? 'Search complete. No evidence rows matched this request. Use "Clear AI search" to return to the full table.'
           : `Showing ${shown.toLocaleString()} AI evidence row${shown === 1 ? "" : "s"}${page.hasMore ? " on this page" : ""}.`;
       if (missedSemanticIndex && semanticIndexState.status === "ready" && !semanticRetry) {
         return searchGuidedQuery(trimmed, { semanticRetry: true });

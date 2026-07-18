@@ -487,6 +487,38 @@ test("one AI search call accepts and executes a valid plan, then shows its rows"
   assert.equal(state.rows[0].commandline, EVIDENCE_ROW.commandline);
 });
 
+test("a validated MITRE-mapping plan without a querySpec accepts and runs by intent token", async () => {
+  const app = bootApp({
+    commandHandlers: {
+      parse_guided_query: async () =>
+        validAiPreview({
+          intentToken:
+            '{"intent":"suspiciousScan","tacticIds":[],"techniqueIds":[],"sort":"chronological_asc"}',
+          previewText:
+            "Suspicious activity scan across all MITRE ATT&CK-style matches; sorted by normalized UTC timestamp.",
+          querySpec: null,
+          matchExplanation: [],
+        }),
+    },
+  });
+  await loadFixture(app);
+
+  await app.debug.searchAiEvidenceForTest("find DFIR phases");
+  await settleFrontend();
+
+  assert.deepEqual(guidedCommands(app), [
+    "parse_guided_query",
+    "accept_guided_query",
+    "run_guided_query",
+  ]);
+  const state = app.debug.getAiSearchState();
+  assert.equal(state.queryMode, "guided");
+  assert.equal(state.guidedReviewStatus, "accepted");
+  assert.equal(state.guidedQuerySpec, null);
+  assert.equal(state.rows.length, 1);
+  assert.equal(state.rows[0].row_num, EVIDENCE_ROW.row_num);
+});
+
 test("a clarification response never accepts or executes a plan", async () => {
   const app = bootApp({
     commandHandlers: {
