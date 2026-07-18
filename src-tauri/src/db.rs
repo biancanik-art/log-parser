@@ -684,6 +684,21 @@ pub fn create_intel_schema(conn: &Connection) -> rusqlite::Result<()> {
             library_hash TEXT NOT NULL,
             role_hash TEXT NOT NULL,
             completed_at TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS _intel_chain (
+            chain_id INTEGER NOT NULL,
+            host TEXT,
+            start_epoch_ms INTEGER,
+            end_epoch_ms INTEGER,
+            first_row INTEGER NOT NULL,
+            last_row INTEGER NOT NULL,
+            tactic_count INTEGER NOT NULL,
+            event_count INTEGER NOT NULL,
+            row_count INTEGER NOT NULL,
+            score INTEGER NOT NULL,
+            tactic_names TEXT NOT NULL,
+            technique_names TEXT NOT NULL,
+            sample_rows TEXT NOT NULL
          );",
     )
 }

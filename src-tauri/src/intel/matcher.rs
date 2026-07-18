@@ -1,5 +1,7 @@
 use crate::db;
-use crate::intel::library::{self, LoadedLibrary, MatchKind, Tactic};
+use crate::intel::library::{
+    self, BehaviorRule, ConditionOp, LoadedLibrary, MatchKind, Tactic, RULE_CONDITION_ROLES,
+};
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder};
 use anyhow::{anyhow, Result};
 use rusqlite::{Connection, OptionalExtension};
@@ -25,6 +27,7 @@ pub struct IntelScanSummary {
     pub custom_library_error: Option<String>,
     pub tactics: Vec<IntelCountSummary>,
     pub techniques: Vec<IntelCountSummary>,
+    pub chains: Vec<crate::intel::chains::IntelChainSummary>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -57,8 +60,31 @@ struct PatternMeta {
 struct CompiledLibrary {
     automaton: AhoCorasick,
     patterns: Vec<PatternMeta>,
+    rules: Vec<CompiledRule>,
     library_hash: String,
     custom_library_error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct CompiledRule {
+    rule: BehaviorRule,
+    technique_name: String,
+    tactics: Vec<Tactic>,
+}
+
+/// One behavior rule bound to this dataset's actual columns. `column_indices` index into the
+/// combined per-row value vector (evidence columns first, extra rule columns appended).
+#[derive(Debug, Clone)]
+struct ResolvedCondition {
+    column_indices: Vec<usize>,
+    op: ConditionOp,
+    values_lower: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedRule {
+    compiled_idx: usize,
+    conditions: Vec<ResolvedCondition>,
 }
 
 pub fn scan_connection(
@@ -136,6 +162,31 @@ fn compile_library(library: LoadedLibrary) -> Result<CompiledLibrary> {
     let mut pattern_strings = Vec::new();
     let mut patterns = Vec::new();
 
+    let technique_lookup: HashMap<&str, (&str, &[Tactic])> = library
+        .techniques
+        .iter()
+        .map(|technique| {
+            (
+                technique.technique_id.as_str(),
+                (technique.name.as_str(), technique.tactics.as_slice()),
+            )
+        })
+        .collect();
+    let mut rules = Vec::with_capacity(library.behavior_rules.len());
+    for rule in &library.behavior_rules {
+        let Some((technique_name, tactics)) = technique_lookup.get(rule.technique_id.as_str())
+        else {
+            // Merged custom rules are validated against their own file; a rule referencing a
+            // technique this merge does not contain is skipped rather than failing the scan.
+            continue;
+        };
+        rules.push(CompiledRule {
+            rule: rule.clone(),
+            technique_name: technique_name.to_string(),
+            tactics: tactics.to_vec(),
+        });
+    }
+
     for technique in library.techniques {
         for keyword in technique.keywords {
             pattern_strings.push(keyword.pattern.clone());
@@ -162,9 +213,162 @@ fn compile_library(library: LoadedLibrary) -> Result<CompiledLibrary> {
     Ok(CompiledLibrary {
         automaton,
         patterns,
+        rules,
         library_hash: library.library_hash,
         custom_library_error: library.custom_library_error,
     })
+}
+
+/// Binds each behavior rule to this dataset. Role conditions use non-rejected data mappings
+/// (consistent with the optional-enrichment philosophy); header conditions match the normalized
+/// original header or SQL name. Rules with any unresolvable condition are skipped for this
+/// dataset — a condition that cannot see its column must not silently pass.
+fn resolve_behavior_rules(
+    conn: &Connection,
+    rules: &[CompiledRule],
+    scan_columns: &[String],
+) -> Result<(Vec<String>, Vec<ResolvedRule>)> {
+    if rules.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let all_columns = db::load_columns(conn)?;
+    let roles_exist: i64 = conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '_column_roles'
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    let mut role_columns: HashMap<String, Vec<String>> = HashMap::new();
+    if roles_exist != 0 {
+        let mut stmt = conn.prepare(
+            "SELECT role, sql_name FROM _column_roles
+             WHERE status IN ('suggested', 'confirmed')
+             ORDER BY sql_name",
+        )?;
+        let mut query = stmt.query([])?;
+        while let Some(row) = query.next()? {
+            let role: String = row.get(0)?;
+            let sql_name: String = row.get(1)?;
+            if RULE_CONDITION_ROLES.contains(&role.as_str()) {
+                role_columns.entry(role).or_default().push(sql_name);
+            }
+        }
+    }
+
+    let mut combined: Vec<String> = scan_columns.to_vec();
+    let mut combined_index: HashMap<String, usize> = combined
+        .iter()
+        .enumerate()
+        .map(|(index, name)| (name.clone(), index))
+        .collect();
+    let mut resolved_rules = Vec::new();
+    for (compiled_idx, compiled) in rules.iter().enumerate() {
+        let mut conditions = Vec::with_capacity(compiled.rule.conditions.len());
+        let mut resolvable = true;
+        for condition in &compiled.rule.conditions {
+            let target_columns: Vec<String> = if let Some(role) = &condition.role {
+                role_columns.get(role).cloned().unwrap_or_default()
+            } else {
+                let wanted: HashSet<String> = condition
+                    .header_any_of
+                    .iter()
+                    .map(|candidate| library::normalize_header_token(candidate))
+                    .collect();
+                all_columns
+                    .iter()
+                    .filter(|column| {
+                        wanted.contains(&library::normalize_header_token(&column.original_name))
+                            || wanted.contains(&library::normalize_header_token(&column.sql_name))
+                    })
+                    .map(|column| column.sql_name.clone())
+                    .collect()
+            };
+            if target_columns.is_empty() {
+                resolvable = false;
+                break;
+            }
+            let column_indices = target_columns
+                .iter()
+                .map(|name| {
+                    *combined_index.entry(name.clone()).or_insert_with(|| {
+                        combined.push(name.clone());
+                        combined.len() - 1
+                    })
+                })
+                .collect();
+            conditions.push(ResolvedCondition {
+                column_indices,
+                op: condition.op,
+                values_lower: condition
+                    .values
+                    .iter()
+                    .map(|value| value.trim().to_lowercase())
+                    .collect(),
+            });
+        }
+        if resolvable {
+            resolved_rules.push(ResolvedRule {
+                compiled_idx,
+                conditions,
+            });
+        }
+    }
+    let extra = combined.split_off(scan_columns.len());
+    Ok((extra, resolved_rules))
+}
+
+/// Returns the first (column index, cell value) satisfying the condition on this row.
+fn condition_match<'row>(
+    condition: &ResolvedCondition,
+    values: &'row [Option<String>],
+) -> Option<(usize, &'row str)> {
+    for &column_idx in &condition.column_indices {
+        let Some(value) = values.get(column_idx).and_then(|value| value.as_deref()) else {
+            continue;
+        };
+        let cell = value.trim();
+        if cell.is_empty() {
+            continue;
+        }
+        let cell_lower = cell.to_lowercase();
+        let satisfied = match condition.op {
+            ConditionOp::EqualsAny => condition
+                .values_lower
+                .iter()
+                .any(|wanted| cell_lower == *wanted),
+            ConditionOp::ContainsAny => condition
+                .values_lower
+                .iter()
+                .any(|wanted| cell_lower.contains(wanted.as_str())),
+            ConditionOp::EndsWithAny => condition
+                .values_lower
+                .iter()
+                .any(|wanted| cell_lower.ends_with(wanted.as_str())),
+        };
+        if satisfied {
+            return Some((column_idx, cell));
+        }
+    }
+    None
+}
+
+fn bounded_match_value(value: &str) -> String {
+    const MAX_MATCH_VALUE_CHARS: usize = 48;
+    if value.chars().count() <= MAX_MATCH_VALUE_CHARS {
+        value.to_string()
+    } else {
+        let bounded: String = value.chars().take(MAX_MATCH_VALUE_CHARS).collect();
+        format!("{bounded}…")
+    }
+}
+
+struct PendingRuleMatch {
+    row_num: i64,
+    resolved_idx: usize,
+    tactic_idx: usize,
+    column_idx: usize,
+    matched_value: String,
 }
 
 fn scan_with_compiled_library(
@@ -175,6 +379,10 @@ fn scan_with_compiled_library(
     mut on_progress: impl FnMut(i64, i64, &str),
 ) -> Result<IntelScanSummary> {
     let scan_columns = validate_evidence_columns(conn, evidence_columns)?;
+    let (extra_rule_columns, resolved_rules) =
+        resolve_behavior_rules(conn, &compiled.rules, &scan_columns)?;
+    let mut combined_columns = scan_columns.clone();
+    combined_columns.extend(extra_rule_columns);
     let total_rows = count_rows(conn)?;
 
     db::create_intel_schema(conn)?;
@@ -182,7 +390,7 @@ fn scan_with_compiled_library(
     let scan_token = begin_scan(conn)?;
     on_progress(0, total_rows, "scanning");
 
-    let select_idents: Vec<String> = scan_columns
+    let select_idents: Vec<String> = combined_columns
         .iter()
         .map(|column| db::quote_ident(column))
         .collect();
@@ -202,7 +410,7 @@ fn scan_with_compiled_library(
     let mut last_row_num = i64::MIN;
     let mut next_progress_at = PROGRESS_INTERVAL_ROWS;
 
-    let scan_result = (|| -> Result<()> {
+    let scan_result = (|| -> Result<Vec<crate::intel::chains::IntelChainSummary>> {
         loop {
             // Materialize one keyset page and release its read statement before matching.
             // No main-database lock is held during the CPU-heavy Aho-Corasick pass.
@@ -213,8 +421,8 @@ fn scan_with_compiled_library(
                 let mut batch = Vec::new();
                 while let Some(row) = rows.next()? {
                     let row_num: i64 = row.get(0)?;
-                    let mut values = Vec::with_capacity(scan_columns.len());
-                    for column_idx in 0..scan_columns.len() {
+                    let mut values = Vec::with_capacity(combined_columns.len());
+                    for column_idx in 0..combined_columns.len() {
                         values.push(row.get::<_, Option<String>>(column_idx + 1)?);
                     }
                     batch.push((row_num, values));
@@ -227,11 +435,14 @@ fn scan_with_compiled_library(
             }
 
             let mut pending_matches = Vec::new();
+            let mut pending_rule_matches = Vec::new();
             for (row_num, values) in &batch {
                 last_row_num = *row_num;
                 rows_scanned += 1;
 
-                for (column_idx, value) in values.iter().enumerate() {
+                // Only evidence columns feed the keyword automaton; trailing rule-only
+                // columns are fetched solely for behavior-rule conditions.
+                for (column_idx, value) in values.iter().take(scan_columns.len()).enumerate() {
                     let Some(value) = value.as_deref().filter(|value| !value.is_empty()) else {
                         continue;
                     };
@@ -267,6 +478,50 @@ fn scan_with_compiled_library(
                         }
                     }
                 }
+
+                for (resolved_idx, resolved) in resolved_rules.iter().enumerate() {
+                    let mut first_hit: Option<(usize, String)> = None;
+                    let mut all_hold = true;
+                    for condition in &resolved.conditions {
+                        match condition_match(condition, values) {
+                            Some((column_idx, value)) => {
+                                if first_hit.is_none() {
+                                    first_hit = Some((column_idx, bounded_match_value(value)));
+                                }
+                            }
+                            None => {
+                                all_hold = false;
+                                break;
+                            }
+                        }
+                    }
+                    if !all_hold {
+                        continue;
+                    }
+                    let Some((column_idx, matched_value)) = first_hit else {
+                        continue;
+                    };
+                    let compiled_rule = &compiled.rules[resolved.compiled_idx];
+                    matched_rows.insert(*row_num);
+                    increment_count(
+                        &mut technique_counts,
+                        &compiled_rule.rule.technique_id,
+                        &compiled_rule.technique_name,
+                        *row_num,
+                    );
+                    for tactic_idx in 0..compiled_rule.tactics.len() {
+                        pending_rule_matches.push(PendingRuleMatch {
+                            row_num: *row_num,
+                            resolved_idx,
+                            tactic_idx,
+                            column_idx,
+                            matched_value: matched_value.clone(),
+                        });
+                        inserted_match_rows += 1;
+                        let tactic = &compiled_rule.tactics[tactic_idx];
+                        increment_count(&mut tactic_counts, &tactic.id, &tactic.name, *row_num);
+                    }
+                }
             }
 
             // TEMP staging is private to this connection. Each transaction is bounded to one
@@ -294,6 +549,22 @@ fn scan_with_compiled_library(
                         pattern.score
                     ])?;
                 }
+                for pending in pending_rule_matches {
+                    let resolved = &resolved_rules[pending.resolved_idx];
+                    let compiled_rule = &compiled.rules[resolved.compiled_idx];
+                    let tactic = &compiled_rule.tactics[pending.tactic_idx];
+                    insert_stmt.execute(rusqlite::params![
+                        pending.row_num,
+                        tactic.id,
+                        tactic.name,
+                        compiled_rule.rule.technique_id,
+                        compiled_rule.technique_name,
+                        compiled_rule.rule.id,
+                        pending.matched_value,
+                        combined_columns[pending.column_idx],
+                        compiled_rule.rule.score
+                    ])?;
+                }
             }
             tx.commit()?;
 
@@ -304,6 +575,10 @@ fn scan_with_compiled_library(
                 }
             }
         }
+
+        // Chains are computed from this scan's private staging rows so the publication
+        // transaction below can install matches and chains as one atomic result.
+        let chains = crate::intel::chains::compute_chains(conn, STAGING_TABLE)?;
 
         // The generation check and replacement share one transaction. Readers see either the
         // previous complete scan or this complete scan, never staged/partial rows.
@@ -343,24 +618,28 @@ fn scan_with_compiled_library(
                 chrono::Utc::now().to_rfc3339()
             ],
         )?;
+        crate::intel::chains::publish_chains(&tx, &chains)?;
         tx.execute(
             "DELETE FROM _intel_scan_build WHERE singleton = 1 AND token = ?1",
             [&scan_token],
         )?;
         tx.commit()?;
-        Ok(())
+        Ok(chains)
     })();
 
-    if let Err(error) = scan_result {
-        // Conditional cleanup cannot cancel a newer scan. A later upsert also makes restart
-        // safe if cleanup itself is interrupted or the process exits here.
-        let _ = conn.execute(
-            "DELETE FROM _intel_scan_build WHERE singleton = 1 AND token = ?1",
-            [&scan_token],
-        );
-        let _ = conn.execute_batch(&format!("DROP TABLE IF EXISTS {STAGING_TABLE}"));
-        return Err(error);
-    }
+    let chains = match scan_result {
+        Ok(chains) => chains,
+        Err(error) => {
+            // Conditional cleanup cannot cancel a newer scan. A later upsert also makes restart
+            // safe if cleanup itself is interrupted or the process exits here.
+            let _ = conn.execute(
+                "DELETE FROM _intel_scan_build WHERE singleton = 1 AND token = ?1",
+                [&scan_token],
+            );
+            let _ = conn.execute_batch(&format!("DROP TABLE IF EXISTS {STAGING_TABLE}"));
+            return Err(error);
+        }
+    };
 
     let _ = conn.execute_batch(&format!("DROP TABLE IF EXISTS {STAGING_TABLE}"));
 
@@ -375,6 +654,7 @@ fn scan_with_compiled_library(
         custom_library_error: compiled.custom_library_error.clone(),
         tactics: finalize_counts(tactic_counts),
         techniques: finalize_counts(technique_counts),
+        chains,
     })
 }
 
@@ -521,7 +801,7 @@ fn is_short_ascii_alphanumeric_pattern(pattern: &str) -> bool {
 mod tests {
     use super::*;
     use crate::db::ColumnMeta;
-    use crate::intel::library::{Keyword, LoadedLibrary, MatchKind, Technique};
+    use crate::intel::library::{Keyword, LoadedLibrary, MatchKind, RuleCondition, Technique};
     use std::path::{Path, PathBuf};
     use std::sync::mpsc;
     use std::thread;
@@ -570,6 +850,7 @@ mod tests {
     fn keyword_library(pattern: &str, match_kind: MatchKind, hash: &str) -> LoadedLibrary {
         LoadedLibrary {
             library_ids: vec!["test".into()],
+            behavior_rules: vec![],
             techniques: vec![Technique {
                 technique_id: "T9999".into(),
                 name: "Boundary Test Technique".into(),
@@ -673,6 +954,179 @@ mod tests {
         assert_eq!(hit.0, "TA0002");
         assert_eq!(hit.1, "T1059.001");
         assert_eq!(hit.2, "t1059_001_powershell_enc");
+    }
+
+    #[test]
+    fn chains_group_multi_tactic_matches_by_host() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        let columns = vec![
+            ColumnMeta {
+                sql_name: "commandline".into(),
+                original_name: "CommandLine".into(),
+                col_index: 0,
+                inferred_type: "text".into(),
+            },
+            ColumnMeta {
+                sql_name: "hostname".into(),
+                original_name: "Computer".into(),
+                col_index: 1,
+                inferred_type: "text".into(),
+            },
+        ];
+        db::create_schema(&conn, &columns).unwrap();
+        db::create_column_roles_table(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO _column_roles (role, sql_name, confidence, status, reasons_json)
+             VALUES ('host', 'hostname', 0.9, 'suggested', '[]')",
+            [],
+        )
+        .unwrap();
+        for (row_num, command, host) in [
+            (1i64, "alphaindicator ran", "SRV-A"),
+            (2, "betaindicator ran", "SRV-A"),
+            (3, "gammaindicator ran", "SRV-A"),
+            (4, "alphaindicator ran", "SRV-B"),
+        ] {
+            conn.execute(
+                "INSERT INTO rows (row_num, commandline, hostname) VALUES (?1, ?2, ?3)",
+                rusqlite::params![row_num, command, host],
+            )
+            .unwrap();
+        }
+
+        let technique = |tid: &str, taid: &str, keyword: &str| Technique {
+            technique_id: tid.into(),
+            name: format!("Tech {tid}"),
+            tactics: vec![Tactic {
+                id: taid.into(),
+                name: format!("Tactic {taid}"),
+            }],
+            aliases: vec![],
+            keywords: vec![Keyword {
+                id: format!("kw_{tid}"),
+                pattern: keyword.into(),
+                match_kind: MatchKind::Substring,
+                columns: vec![],
+                score: 60,
+            }],
+        };
+        let library = LoadedLibrary {
+            library_ids: vec!["test".into()],
+            behavior_rules: vec![],
+            techniques: vec![
+                technique("T0001", "TA0001", "alphaindicator"),
+                technique("T0002", "TA0002", "betaindicator"),
+                technique("T0003", "TA0003", "gammaindicator"),
+            ],
+            library_hash: "chainhash".into(),
+            custom_library_error: None,
+        };
+
+        let evidence_columns = vec!["commandline".to_string()];
+        let summary =
+            scan_connection_with_library(&mut conn, &evidence_columns, library, |_, _, _| {})
+                .unwrap();
+
+        assert_eq!(summary.chains.len(), 1, "only SRV-A spans three tactics");
+        let chain = &summary.chains[0];
+        assert_eq!(chain.host.as_deref(), Some("SRV-A"));
+        assert_eq!(chain.tactic_count, 3);
+        assert_eq!(chain.row_count, 3);
+        assert_eq!(chain.sample_rows, vec![1, 2, 3]);
+        assert_eq!(chain.start_epoch_ms, None);
+
+        let published: i64 = conn
+            .query_row("SELECT COUNT(*) FROM _intel_chain", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(published, 1);
+    }
+
+    #[test]
+    fn behavior_rule_matches_only_rows_satisfying_all_conditions() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        let columns = vec![
+            ColumnMeta {
+                sql_name: "processname".into(),
+                original_name: "ProcessName".into(),
+                col_index: 0,
+                inferred_type: "text".into(),
+            },
+            ColumnMeta {
+                sql_name: "dstport".into(),
+                original_name: "DstPort".into(),
+                col_index: 1,
+                inferred_type: "text".into(),
+            },
+        ];
+        db::create_schema(&conn, &columns).unwrap();
+        for (row_num, process, port) in [
+            (1i64, "C:\\Program Files\\Google\\Chrome\\chrome.exe", "445"),
+            (2, "C:\\Program Files\\Google\\Chrome\\chrome.exe", "443"),
+            (3, "C:\\Windows\\System32\\svchost.exe", "445"),
+        ] {
+            conn.execute(
+                "INSERT INTO rows (row_num, processname, dstport) VALUES (?1, ?2, ?3)",
+                rusqlite::params![row_num, process, port],
+            )
+            .unwrap();
+        }
+
+        let mut library = single_keyword_library("zz_no_keyword_hit_zz", MatchKind::Substring);
+        library.behavior_rules = vec![BehaviorRule {
+            id: "rule_browser_smb".into(),
+            name: "Browser process to SMB port".into(),
+            technique_id: "T9999".into(),
+            score: 80,
+            conditions: vec![
+                RuleCondition {
+                    role: None,
+                    header_any_of: vec!["ProcessName".into()],
+                    op: ConditionOp::EndsWithAny,
+                    values: vec!["chrome.exe".into()],
+                },
+                RuleCondition {
+                    role: None,
+                    header_any_of: vec!["DstPort".into()],
+                    op: ConditionOp::EqualsAny,
+                    values: vec!["445".into()],
+                },
+            ],
+        }];
+
+        // dstport is intentionally not an evidence column: it must be fetched and evaluated
+        // as a rule-only extra column without entering the keyword automaton.
+        let evidence_columns = vec!["processname".to_string()];
+        let summary =
+            scan_connection_with_library(&mut conn, &evidence_columns, library, |_, _, _| {})
+                .unwrap();
+
+        assert_eq!(summary.rows_scanned, 3);
+        assert_eq!(summary.matched_rows, 1);
+        assert!(summary
+            .techniques
+            .iter()
+            .any(|t| t.id == "T9999" && t.row_count == 1));
+
+        let hit: (i64, String, String, String, i64) = conn
+            .query_row(
+                "SELECT row_num, pattern_id, keyword, column_name, score FROM _intel_match",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(hit.0, 1);
+        assert_eq!(hit.1, "rule_browser_smb");
+        assert_eq!(hit.2, "C:\\Program Files\\Google\\Chrome\\chrome.exe");
+        assert_eq!(hit.3, "processname");
+        assert_eq!(hit.4, 80);
     }
 
     #[test]

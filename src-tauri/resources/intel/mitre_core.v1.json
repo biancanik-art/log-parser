@@ -4724,5 +4724,620 @@
         }
       ]
     }
+  ],
+  "behaviorRules": [
+    {
+      "id": "rule_browser_process_smb_port",
+      "name": "Web browser connecting to SMB port",
+      "techniqueId": "T1021.002",
+      "score": 85,
+      "conditions": [
+        {
+          "role": "process_name",
+          "op": "ends_with_any",
+          "values": [
+            "chrome.exe",
+            "msedge.exe",
+            "firefox.exe",
+            "brave.exe",
+            "opera.exe",
+            "vivaldi.exe",
+            "iexplore.exe",
+            "librewolf.exe",
+            "waterfox.exe"
+          ]
+        },
+        {
+          "headerAnyOf": ["dstport", "destinationport", "destport", "remoteport", "targetport"],
+          "op": "equals_any",
+          "values": ["445", "139"]
+        }
+      ]
+    },
+    {
+      "id": "rule_office_parent_spawns_shell",
+      "name": "Office application spawning shell or script host",
+      "techniqueId": "T1204.002",
+      "score": 90,
+      "conditions": [
+        {
+          "headerAnyOf": ["parentprocessname", "parentimage", "parentprocess", "parentname"],
+          "op": "ends_with_any",
+          "values": [
+            "winword.exe",
+            "excel.exe",
+            "powerpnt.exe",
+            "outlook.exe",
+            "msaccess.exe",
+            "onenote.exe",
+            "mspub.exe"
+          ]
+        },
+        {
+          "role": "process_name",
+          "op": "ends_with_any",
+          "values": [
+            "cmd.exe",
+            "powershell.exe",
+            "pwsh.exe",
+            "wscript.exe",
+            "cscript.exe",
+            "mshta.exe",
+            "rundll32.exe",
+            "regsvr32.exe",
+            "certutil.exe",
+            "bitsadmin.exe"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "rule_hidden_admin_share_access",
+      "name": "Access to hidden administrative share",
+      "techniqueId": "T1021.002",
+      "score": 70,
+      "conditions": [
+        {
+          "headerAnyOf": ["sharename", "share"],
+          "op": "ends_with_any",
+          "values": ["admin$", "c$", "ipc$"]
+        }
+      ]
+    },
+    {
+      "id": "rule_lsass_dump_commandline",
+      "name": "LSASS memory dump via command line",
+      "techniqueId": "T1003.001",
+      "score": 95,
+      "conditions": [
+        {
+          "role": "command_line",
+          "op": "contains_any",
+          "values": ["lsass"]
+        },
+        {
+          "role": "command_line",
+          "op": "contains_any",
+          "values": [
+            "procdump",
+            "comsvcs",
+            "minidump",
+            ".dmp",
+            "-ma",
+            "sqldumper",
+            "createdump",
+            "rdrleakdiag"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "rule_lsass_dump_file_artifact",
+      "name": "LSASS dump file artifact",
+      "techniqueId": "T1003.001",
+      "score": 90,
+      "conditions": [
+        {
+          "role": "file_name",
+          "op": "contains_any",
+          "values": ["lsass"]
+        },
+        {
+          "role": "file_name",
+          "op": "ends_with_any",
+          "values": [".dmp"]
+        }
+      ]
+    },
+    {
+      "id": "rule_schtasks_privileged_persistence",
+      "name": "Scheduled task created with elevated run level or boot trigger",
+      "techniqueId": "T1053.005",
+      "score": 85,
+      "conditions": [
+        {
+          "role": "command_line",
+          "op": "contains_any",
+          "values": ["schtasks"]
+        },
+        {
+          "role": "command_line",
+          "op": "contains_any",
+          "values": ["/create"]
+        },
+        {
+          "role": "command_line",
+          "op": "contains_any",
+          "values": [
+            "/ru system",
+            "nt authority\\system",
+            "/rl highest",
+            "/sc onstart",
+            "/sc onlogon"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "rule_powershell_encoded_stealth",
+      "name": "Encoded PowerShell with stealth execution flags",
+      "techniqueId": "T1059.001",
+      "score": 88,
+      "conditions": [
+        {
+          "role": "command_line",
+          "op": "contains_any",
+          "values": ["powershell", "pwsh"]
+        },
+        {
+          "role": "command_line",
+          "op": "contains_any",
+          "values": ["-enc", "encodedcommand", "frombase64string"]
+        },
+        {
+          "role": "command_line",
+          "op": "contains_any",
+          "values": [
+            "bypass",
+            "hidden",
+            "-nop",
+            "noprofile",
+            "noninteractive",
+            "-w h"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "rule_certutil_url_download",
+      "name": "Certutil used to download from a URL",
+      "techniqueId": "T1105",
+      "score": 92,
+      "conditions": [
+        {
+          "role": "command_line",
+          "op": "contains_any",
+          "values": ["certutil"]
+        },
+        {
+          "role": "command_line",
+          "op": "contains_any",
+          "values": ["urlcache", "http://", "https://", "-split"]
+        }
+      ]
+    },
+    {
+      "id": "rule_bitsadmin_transfer",
+      "name": "BITS job used to transfer a remote file",
+      "techniqueId": "T1105",
+      "score": 88,
+      "conditions": [
+        {
+          "role": "command_line",
+          "op": "contains_any",
+          "values": ["bitsadmin", "start-bitstransfer"]
+        },
+        {
+          "role": "command_line",
+          "op": "contains_any",
+          "values": ["http://", "https://", "/transfer", "/addfile"]
+        }
+      ]
+    },
+    {
+      "id": "rule_powershell_web_download",
+      "name": "PowerShell web download primitive",
+      "techniqueId": "T1059.001",
+      "score": 85,
+      "conditions": [
+        {
+          "role": "command_line",
+          "op": "contains_any",
+          "values": ["powershell", "pwsh"]
+        },
+        {
+          "role": "command_line",
+          "op": "contains_any",
+          "values": [
+            "downloadstring",
+            "downloadfile",
+            "invoke-webrequest",
+            "invoke-restmethod",
+            "net.webclient",
+            "start-bitstransfer"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "rule_mshta_remote_script",
+      "name": "Mshta executing remote or inline script",
+      "techniqueId": "T1218.005",
+      "score": 90,
+      "conditions": [
+        {
+          "role": "command_line",
+          "op": "contains_any",
+          "values": ["mshta"]
+        },
+        {
+          "role": "command_line",
+          "op": "contains_any",
+          "values": ["http://", "https://", "javascript:", "vbscript:"]
+        }
+      ]
+    },
+    {
+      "id": "rule_regsvr32_scriptlet",
+      "name": "Regsvr32 loading remote or scriptlet payload",
+      "techniqueId": "T1218.010",
+      "score": 90,
+      "conditions": [
+        {
+          "role": "command_line",
+          "op": "contains_any",
+          "values": ["regsvr32"]
+        },
+        {
+          "role": "command_line",
+          "op": "contains_any",
+          "values": ["http://", "https://", "scrobj", "/i:"]
+        }
+      ]
+    },
+    {
+      "id": "rule_rundll32_suspicious_load",
+      "name": "Rundll32 with scriptlet or user-writable payload path",
+      "techniqueId": "T1218.011",
+      "score": 85,
+      "conditions": [
+        {
+          "role": "command_line",
+          "op": "contains_any",
+          "values": ["rundll32"]
+        },
+        {
+          "role": "command_line",
+          "op": "contains_any",
+          "values": [
+            "javascript:",
+            "comsvcs",
+            "\\users\\public",
+            "\\appdata\\",
+            "\\windows\\temp\\"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "rule_wmic_remote_exec",
+      "name": "WMI command-line process execution",
+      "techniqueId": "T1047",
+      "score": 88,
+      "conditions": [
+        {
+          "role": "command_line",
+          "op": "contains_any",
+          "values": ["wmic"]
+        },
+        {
+          "role": "command_line",
+          "op": "contains_any",
+          "values": ["process call create", "/node:"]
+        }
+      ]
+    },
+    {
+      "id": "rule_shadow_copy_deletion",
+      "name": "Volume shadow copy deletion",
+      "techniqueId": "T1490",
+      "score": 95,
+      "conditions": [
+        {
+          "role": "command_line",
+          "op": "contains_any",
+          "values": ["vssadmin", "wbadmin", "shadowcopy"]
+        },
+        {
+          "role": "command_line",
+          "op": "contains_any",
+          "values": ["delete"]
+        }
+      ]
+    },
+    {
+      "id": "rule_boot_recovery_tamper",
+      "name": "Boot recovery settings tampering",
+      "techniqueId": "T1490",
+      "score": 92,
+      "conditions": [
+        {
+          "role": "command_line",
+          "op": "contains_any",
+          "values": ["bcdedit"]
+        },
+        {
+          "role": "command_line",
+          "op": "contains_any",
+          "values": ["recoveryenabled", "bootstatuspolicy"]
+        }
+      ]
+    },
+    {
+      "id": "rule_eventlog_clear",
+      "name": "Windows event log cleared from command line",
+      "techniqueId": "T1070.001",
+      "score": 90,
+      "conditions": [
+        {
+          "role": "command_line",
+          "op": "contains_any",
+          "values": ["wevtutil", "clear-eventlog"]
+        },
+        {
+          "role": "command_line",
+          "op": "contains_any",
+          "values": ["cl", "clear-log", "security", "system", "application"]
+        }
+      ]
+    },
+    {
+      "id": "rule_defender_tamper",
+      "name": "Microsoft Defender preference tampering",
+      "techniqueId": "T1562.001",
+      "score": 92,
+      "conditions": [
+        {
+          "role": "command_line",
+          "op": "contains_any",
+          "values": ["mppreference"]
+        },
+        {
+          "role": "command_line",
+          "op": "contains_any",
+          "values": ["disable", "exclusion"]
+        }
+      ]
+    },
+    {
+      "id": "rule_firewall_disable",
+      "name": "Windows Firewall disabled from command line",
+      "techniqueId": "T1562.001",
+      "score": 85,
+      "conditions": [
+        {
+          "role": "command_line",
+          "op": "contains_any",
+          "values": ["netsh"]
+        },
+        {
+          "role": "command_line",
+          "op": "contains_any",
+          "values": ["advfirewall", "firewall"]
+        },
+        {
+          "role": "command_line",
+          "op": "contains_any",
+          "values": ["off", "disable"]
+        }
+      ]
+    },
+    {
+      "id": "rule_runkey_persistence",
+      "name": "Run-key registry persistence",
+      "techniqueId": "T1547.001",
+      "score": 88,
+      "conditions": [
+        {
+          "role": "command_line",
+          "op": "contains_any",
+          "values": ["reg add", "set-itemproperty", "new-itemproperty"]
+        },
+        {
+          "role": "command_line",
+          "op": "contains_any",
+          "values": ["currentversion\\run"]
+        }
+      ]
+    },
+    {
+      "id": "rule_registry_hive_export",
+      "name": "Credential registry hive export",
+      "techniqueId": "T1003.002",
+      "score": 92,
+      "conditions": [
+        {
+          "role": "command_line",
+          "op": "contains_any",
+          "values": ["reg save", "reg export", "reg.exe save"]
+        },
+        {
+          "role": "command_line",
+          "op": "contains_any",
+          "values": ["hklm\\sam", "hklm\\security", "hklm\\system"]
+        }
+      ]
+    },
+    {
+      "id": "rule_ntds_extraction",
+      "name": "NTDS.dit extraction activity",
+      "techniqueId": "T1003.003",
+      "score": 95,
+      "conditions": [
+        {
+          "role": "command_line",
+          "op": "contains_any",
+          "values": ["ntds"]
+        },
+        {
+          "role": "command_line",
+          "op": "contains_any",
+          "values": ["ntdsutil", "ifm", "esentutl", "vssadmin", "copy"]
+        }
+      ]
+    },
+    {
+      "id": "rule_net_use_hidden_share",
+      "name": "Net use mapping to hidden share",
+      "techniqueId": "T1021.002",
+      "score": 82,
+      "conditions": [
+        {
+          "role": "command_line",
+          "op": "contains_any",
+          "values": ["net use", "net.exe use", "new-smbmapping"]
+        },
+        {
+          "role": "command_line",
+          "op": "contains_any",
+          "values": ["c$", "admin$", "ipc$"]
+        }
+      ]
+    },
+    {
+      "id": "rule_psexec_style_tool",
+      "name": "PsExec-style remote execution tool",
+      "techniqueId": "T1569.002",
+      "score": 85,
+      "conditions": [
+        {
+          "role": "process_name",
+          "op": "ends_with_any",
+          "values": [
+            "psexec.exe",
+            "psexec64.exe",
+            "psexesvc.exe",
+            "paexec.exe",
+            "remcom.exe",
+            "csexec.exe"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "rule_tunneling_tool",
+      "name": "Tunneling or port-forwarding tool",
+      "techniqueId": "T1572",
+      "score": 80,
+      "conditions": [
+        {
+          "role": "command_line",
+          "op": "contains_any",
+          "values": ["plink", "ngrok", "chisel", "frpc", "socat"]
+        }
+      ]
+    },
+    {
+      "id": "rule_rclone_cloud_exfil",
+      "name": "Rclone transfer to cloud storage",
+      "techniqueId": "T1567.002",
+      "score": 88,
+      "conditions": [
+        {
+          "role": "command_line",
+          "op": "contains_any",
+          "values": ["rclone"]
+        },
+        {
+          "role": "command_line",
+          "op": "contains_any",
+          "values": ["copy", "sync", "move", "config"]
+        }
+      ]
+    },
+    {
+      "id": "rule_archive_with_password",
+      "name": "Password-protected archive creation",
+      "techniqueId": "T1560.001",
+      "score": 75,
+      "conditions": [
+        {
+          "role": "command_line",
+          "op": "contains_any",
+          "values": ["7z", "winrar", "rar.exe"]
+        },
+        {
+          "role": "command_line",
+          "op": "contains_any",
+          "values": ["-hp", "-p"]
+        }
+      ]
+    },
+    {
+      "id": "rule_browser_credential_store_access",
+      "name": "Browser credential store referenced on command line",
+      "techniqueId": "T1555.003",
+      "score": 82,
+      "conditions": [
+        {
+          "role": "command_line",
+          "op": "contains_any",
+          "values": [
+            "login data",
+            "key4.db",
+            "logins.json",
+            "cookies.sqlite",
+            "web data"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "rule_process_in_public_writable_dir",
+      "name": "Process running from public writable directory",
+      "techniqueId": "T1204.002",
+      "score": 70,
+      "conditions": [
+        {
+          "role": "process_name",
+          "op": "contains_any",
+          "values": [
+            "\\users\\public\\",
+            "\\windows\\temp\\",
+            "\\perflogs\\",
+            "$recycle.bin"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "rule_rmm_tool_process",
+      "name": "Remote monitoring and management tool process",
+      "techniqueId": "T1021",
+      "score": 60,
+      "conditions": [
+        {
+          "role": "process_name",
+          "op": "ends_with_any",
+          "values": [
+            "anydesk.exe",
+            "teamviewer.exe",
+            "rustdesk.exe",
+            "screenconnect.clientservice.exe",
+            "ateraagent.exe"
+          ]
+        }
+      ]
+    }
   ]
 }

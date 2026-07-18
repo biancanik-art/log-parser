@@ -7,7 +7,7 @@ use std::sync::OnceLock;
 
 static BUILTIN_LIBRARY_PATH: OnceLock<PathBuf> = OnceLock::new();
 const BUILTIN_LIBRARY_SHA256: &str =
-    "b5a56e35aa9033b246742460a91a0af6ce58f286c4fbf02e8c93e585aacab33c";
+    "e74d164f95e9d4d9d7f95dba820223a2c81d0ffc88c47c717da9224096e3bb58";
 
 /// Configures the immutable intelligence-library resource bundled with the app.
 ///
@@ -35,6 +35,10 @@ pub struct LibraryFile {
     pub schema_version: u32,
     pub library_id: String,
     pub techniques: Vec<Technique>,
+    /// Multi-column behavioral detections ("browser process AND SMB port"). Optional so
+    /// existing schemaVersion-1 custom libraries stay valid.
+    #[serde(default)]
+    pub behavior_rules: Vec<BehaviorRule>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -71,10 +75,70 @@ pub enum MatchKind {
     Word,
 }
 
+/// A per-row behavioral detection: every condition must hold on the same row. Conditions are
+/// deliberately bounded (no regex, no aggregation, no cross-row state) so a rule pass stays a
+/// linear scan and every match is explainable from one row's cell values.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BehaviorRule {
+    pub id: String,
+    pub name: String,
+    pub technique_id: String,
+    pub score: i64,
+    pub conditions: Vec<RuleCondition>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuleCondition {
+    /// Resolve target columns through a detected data-mapping role
+    /// (`command_line`, `process_name`, `file_name`, `host`, `text_evidence`, `user`, `ip`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    /// Resolve target columns by normalized header name (lowercase alphanumerics of the
+    /// original header or SQL name must equal one candidate, e.g. `dstport`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub header_any_of: Vec<String>,
+    pub op: ConditionOp,
+    pub values: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConditionOp {
+    /// Cell equals one of the values (case-insensitive, trimmed).
+    EqualsAny,
+    /// Cell contains one of the values (case-insensitive).
+    ContainsAny,
+    /// Cell ends with one of the values (case-insensitive) — path-safe process/file names.
+    EndsWithAny,
+}
+
+pub const RULE_CONDITION_ROLES: [&str; 7] = [
+    "command_line",
+    "process_name",
+    "file_name",
+    "host",
+    "text_evidence",
+    "user",
+    "ip",
+];
+const MAX_RULE_CONDITIONS: usize = 8;
+const MAX_RULE_VALUES: usize = 64;
+
+pub fn normalize_header_token(value: &str) -> String {
+    value
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .flat_map(|character| character.to_lowercase())
+        .collect()
+}
+
 #[derive(Debug, Clone)]
 pub struct LoadedLibrary {
     pub library_ids: Vec<String>,
     pub techniques: Vec<Technique>,
+    pub behavior_rules: Vec<BehaviorRule>,
     pub library_hash: String,
     pub custom_library_error: Option<String>,
 }
@@ -96,6 +160,7 @@ pub fn load_builtin_library() -> Result<LoadedLibrary> {
     Ok(LoadedLibrary {
         library_ids: vec![builtin.library_id],
         techniques: builtin.techniques,
+        behavior_rules: builtin.behavior_rules,
         library_hash,
         custom_library_error: None,
     })
@@ -106,6 +171,7 @@ pub fn load_merged_library() -> Result<LoadedLibrary> {
     let builtin = parse_library("built-in MITRE core", builtin_raw.as_ref())?;
     let mut library_ids = vec![builtin.library_id];
     let mut techniques = builtin.techniques;
+    let mut behavior_rules = builtin.behavior_rules;
     let mut hash_sources = vec![builtin_raw.into_owned()];
     let mut custom_library_error = None;
 
@@ -121,6 +187,7 @@ pub fn load_merged_library() -> Result<LoadedLibrary> {
             Ok((raw, custom)) => {
                 library_ids.push(custom.library_id);
                 techniques.extend(custom.techniques);
+                behavior_rules.extend(custom.behavior_rules);
                 hash_sources.push(raw);
             }
             Err(err) => {
@@ -138,6 +205,7 @@ pub fn load_merged_library() -> Result<LoadedLibrary> {
     Ok(LoadedLibrary {
         library_ids,
         techniques,
+        behavior_rules,
         library_hash: hash_library_sources(&hash_refs),
         custom_library_error,
     })
@@ -262,6 +330,79 @@ fn validate_library(label: &str, library: &LibraryFile) -> Result<()> {
         .is_none()
     {
         return Err(anyhow!("{label} has no keyword indicators"));
+    }
+
+    let known_techniques: std::collections::HashSet<&str> = library
+        .techniques
+        .iter()
+        .map(|technique| technique.technique_id.as_str())
+        .collect();
+    let mut seen_rule_ids = std::collections::HashSet::new();
+    for rule in &library.behavior_rules {
+        let rule_label = if rule.id.trim().is_empty() {
+            "<empty rule id>"
+        } else {
+            rule.id.as_str()
+        };
+        if rule.id.trim().is_empty() {
+            bail!("{label} has a behavior rule with an empty id");
+        }
+        if !seen_rule_ids.insert(rule.id.as_str()) {
+            bail!("{label} has a duplicate behavior rule id: {rule_label}");
+        }
+        if rule.name.trim().is_empty() {
+            bail!("{label} behavior rule {rule_label} has an empty name");
+        }
+        if !known_techniques.contains(rule.technique_id.as_str()) {
+            bail!(
+                "{label} behavior rule {rule_label} references unknown techniqueId {}",
+                rule.technique_id
+            );
+        }
+        if !(0..=100).contains(&rule.score) {
+            bail!(
+                "{label} behavior rule {rule_label} has score {} outside 0..=100",
+                rule.score
+            );
+        }
+        if rule.conditions.is_empty() || rule.conditions.len() > MAX_RULE_CONDITIONS {
+            bail!(
+                "{label} behavior rule {rule_label} needs 1..={MAX_RULE_CONDITIONS} conditions"
+            );
+        }
+        for condition in &rule.conditions {
+            match (&condition.role, condition.header_any_of.is_empty()) {
+                (Some(role), true) => {
+                    if !RULE_CONDITION_ROLES.contains(&role.as_str()) {
+                        bail!(
+                            "{label} behavior rule {rule_label} uses unsupported role '{role}'"
+                        );
+                    }
+                }
+                (None, false) => {
+                    if condition
+                        .header_any_of
+                        .iter()
+                        .any(|candidate| normalize_header_token(candidate).is_empty())
+                    {
+                        bail!(
+                            "{label} behavior rule {rule_label} has an empty header candidate"
+                        );
+                    }
+                }
+                _ => bail!(
+                    "{label} behavior rule {rule_label} conditions need exactly one of role or headerAnyOf"
+                ),
+            }
+            if condition.values.is_empty()
+                || condition.values.len() > MAX_RULE_VALUES
+                || condition.values.iter().any(|value| value.trim().is_empty())
+            {
+                bail!(
+                    "{label} behavior rule {rule_label} needs 1..={MAX_RULE_VALUES} non-empty condition values"
+                );
+            }
+        }
     }
 
     Ok(())

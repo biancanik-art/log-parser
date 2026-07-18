@@ -1,3 +1,4 @@
+pub mod chains;
 pub mod library;
 pub mod llm_parser;
 pub mod matcher;

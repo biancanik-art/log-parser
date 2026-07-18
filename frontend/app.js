@@ -745,6 +745,26 @@
       row.append(name, count);
       intelScanSummary.appendChild(row);
     });
+
+    const chains = summary.chains || [];
+    if (chains.length > 0) {
+      const chainHeader = document.createElement("div");
+      chainHeader.className = "sidebar-note";
+      chainHeader.textContent = `${chains.length.toLocaleString()} attack chain${chains.length === 1 ? "" : "s"} (multi-tactic sequences)`;
+      intelScanSummary.appendChild(chainHeader);
+      chains.slice(0, 5).forEach((chain) => {
+        const row = document.createElement("div");
+        row.className = "scan-summary-row";
+        const name = document.createElement("span");
+        name.textContent = `${chain.host || "all rows"} — ${chain.tacticCount} tactics`;
+        name.title = `${(chain.tacticNames || []).join(" → ")}\nTechniques: ${(chain.techniqueNames || []).join(", ")}\nRows ${chain.firstRow}–${chain.lastRow}`;
+        const count = document.createElement("span");
+        count.className = "scan-summary-count";
+        count.textContent = `${chain.rowCount.toLocaleString()} rows, score ${chain.score}`;
+        row.append(name, count);
+        intelScanSummary.appendChild(row);
+      });
+    }
   }
 
   function normalizeQueryExpression(expression, depth = 0, state = { nodes: 0 }) {
