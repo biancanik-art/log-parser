@@ -421,11 +421,18 @@ where
     let sheet_name = "AI Audit".to_string();
     let worksheet = state.workbook.add_worksheet_with_constant_memory();
     worksheet.set_name(&sheet_name)?;
+    // Human-first order: what the examiner asked, what was decided, and what the model
+    // returned come before the reproducibility hashes and parameters.
     let headers = [
         "audit_id",
         "created_at",
+        "examiner_query",
         "examiner_decision",
         "decided_at",
+        "validation_status",
+        "validation_detail",
+        "raw_model_output",
+        "trusted_intent_json",
         "provider",
         "model_name",
         "model_version",
@@ -436,31 +443,30 @@ where
         "input_sha256",
         "dataset_schema_sha256",
         "dataset_import_sha256",
-        "validation_status",
-        "validation_detail",
         "generation_parameters_json",
         "artifact_ids_json",
-        "raw_model_output",
-        "trusted_intent_json",
         "model_load_ms",
         "inference_latency_ms",
     ];
     write_headers(worksheet, &headers)?;
     for column in 0..headers.len() as u16 {
-        worksheet.set_column_width(column, if column >= 16 { 60 } else { 24 })?;
+        let wide = matches!(column, 2 | 7 | 8 | 19 | 20);
+        worksheet.set_column_width(column, if wide { 60 } else { 24 })?;
     }
 
     let audit_columns = table_column_names(conn, "_llm_parse_audit")?;
     let dataset_schema = optional_text_column_expression(&audit_columns, "dataset_schema_sha256");
     let dataset_import = optional_text_column_expression(&audit_columns, "dataset_import_sha256");
+    let input_text = optional_text_column_expression(&audit_columns, "input_text");
     let sql = format!(
-        "SELECT id, created_at, examiner_decision, COALESCE(decided_at, ''),
+        "SELECT id, created_at, {input_text}, examiner_decision, COALESCE(decided_at, ''),
+                validation_status, COALESCE(validation_detail, ''),
+                raw_output, trusted_intent_json,
                 provider, model_name, model_version, model_sha256, tokenizer_sha256,
                 prompt_template_version, correlation_engine_version, input_sha256,
                 {dataset_schema}, {dataset_import},
-                validation_status, COALESCE(validation_detail, ''),
-                generation_parameters_json, artifact_ids_json, raw_output,
-                trusted_intent_json, load_time_ms, inference_latency_ms
+                generation_parameters_json, artifact_ids_json,
+                load_time_ms, inference_latency_ms
          FROM _llm_parse_audit ORDER BY id"
     );
     let mut stmt = conn.prepare(&sql)?;
@@ -468,12 +474,12 @@ where
     let mut excel_row = 1u32;
     while let Some(row) = rows.next()? {
         worksheet.write_number(excel_row, 0, row.get::<_, i64>(0)? as f64)?;
-        for column in 1..20usize {
+        for column in 1..21usize {
             let value: String = row.get(column)?;
             write_cell_string(worksheet, excel_row, column as u16, &value)?;
         }
-        worksheet.write_number(excel_row, 20, row.get::<_, i64>(20)? as f64)?;
         worksheet.write_number(excel_row, 21, row.get::<_, i64>(21)? as f64)?;
+        worksheet.write_number(excel_row, 22, row.get::<_, i64>(22)? as f64)?;
         excel_row += 1;
         *state.total_rows_written += 1;
     }
@@ -3397,18 +3403,21 @@ mod tests {
         let rows: Vec<_> = audit.rows().collect();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0][0].to_string(), "audit_id");
-        assert_eq!(rows[0][12].to_string(), "dataset_schema_sha256");
-        assert_eq!(rows[0][13].to_string(), "dataset_import_sha256");
-        assert_eq!(rows[0][21].to_string(), "inference_latency_ms");
+        assert_eq!(rows[0][2].to_string(), "examiner_query");
+        assert_eq!(rows[0][17].to_string(), "dataset_schema_sha256");
+        assert_eq!(rows[0][18].to_string(), "dataset_import_sha256");
+        assert_eq!(rows[0][22].to_string(), "inference_latency_ms");
         assert_eq!(cell_to_i64(&rows[1][0]), 42);
-        assert_eq!(rows[1][2].to_string(), "accepted");
-        assert_eq!(rows[1][4].to_string(), "local-candle");
-        assert_eq!(rows[1][5].to_string(), "Qwen2.5-1.5B-Instruct");
-        assert_eq!(rows[1][12].to_string(), "dataset-schema-hash");
-        assert_eq!(rows[1][13].to_string(), "dataset-import-hash");
-        assert_eq!(rows[1][18].to_string(), "=untrusted model text");
-        assert_eq!(cell_to_i64(&rows[1][20]), 2945);
-        assert_eq!(cell_to_i64(&rows[1][21]), 13182);
+        // Legacy audit table without input_text: query cell stays empty, never errors.
+        assert_eq!(rows[1][2].to_string(), "");
+        assert_eq!(rows[1][3].to_string(), "accepted");
+        assert_eq!(rows[1][9].to_string(), "local-candle");
+        assert_eq!(rows[1][10].to_string(), "Qwen2.5-1.5B-Instruct");
+        assert_eq!(rows[1][17].to_string(), "dataset-schema-hash");
+        assert_eq!(rows[1][18].to_string(), "dataset-import-hash");
+        assert_eq!(rows[1][7].to_string(), "=untrusted model text");
+        assert_eq!(cell_to_i64(&rows[1][21]), 2945);
+        assert_eq!(cell_to_i64(&rows[1][22]), 13182);
 
         let semantic = workbook.worksheet_range("Semantic Audit").unwrap();
         let semantic_rows: Vec<_> = semantic.rows().collect();
@@ -3618,13 +3627,39 @@ mod tests {
         let audit = workbook.worksheet_range("AI Audit").unwrap();
         let rows: Vec<_> = audit.rows().collect();
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0][12].to_string(), "dataset_schema_sha256");
-        assert_eq!(rows[0][13].to_string(), "dataset_import_sha256");
-        assert_eq!(rows[1][12].to_string(), "");
-        assert_eq!(rows[1][13].to_string(), "");
-        assert_eq!(rows[1][18].to_string(), "=untrusted model text");
-        assert_eq!(cell_to_i64(&rows[1][20]), 2945);
-        assert_eq!(cell_to_i64(&rows[1][21]), 13182);
+        assert_eq!(rows[0][17].to_string(), "dataset_schema_sha256");
+        assert_eq!(rows[0][18].to_string(), "dataset_import_sha256");
+        assert_eq!(rows[1][17].to_string(), "");
+        assert_eq!(rows[1][18].to_string(), "");
+        assert_eq!(rows[1][7].to_string(), "=untrusted model text");
+        assert_eq!(cell_to_i64(&rows[1][21]), 2945);
+        assert_eq!(cell_to_i64(&rows[1][22]), 13182);
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn ai_audit_sheet_shows_examiner_query_text_when_recorded() {
+        let (mut conn, columns) = setup_report_fixture(false);
+        create_llm_audit_fixture(&conn, false);
+        conn.execute_batch("ALTER TABLE _llm_parse_audit ADD COLUMN input_text TEXT")
+            .unwrap();
+        conn.execute(
+            "UPDATE _llm_parse_audit SET input_text = 'show credential access for alice'",
+            [],
+        )
+        .unwrap();
+        let path = temp_report_path("audit-query-text");
+
+        export_report(&mut conn, &columns, &path, |_, _| {}).unwrap();
+        let mut workbook = calamine::open_workbook_auto(&path).unwrap();
+        let audit = workbook.worksheet_range("AI Audit").unwrap();
+        let rows: Vec<_> = audit.rows().collect();
+        assert_eq!(rows[0][2].to_string(), "examiner_query");
+        assert_eq!(
+            rows[1][2].to_string(),
+            "show credential access for alice"
+        );
 
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }

@@ -7,7 +7,7 @@ use std::sync::OnceLock;
 
 static BUILTIN_LIBRARY_PATH: OnceLock<PathBuf> = OnceLock::new();
 const BUILTIN_LIBRARY_SHA256: &str =
-    "e74d164f95e9d4d9d7f95dba820223a2c81d0ffc88c47c717da9224096e3bb58";
+    "3a2164e918aa61f0bacfe3ed909ac153198b3c04761454cf9caf004a91cde7e4";
 
 /// Configures the immutable intelligence-library resource bundled with the app.
 ///

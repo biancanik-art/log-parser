@@ -1382,6 +1382,9 @@ fn create_llm_audit_table(conn: &Connection) -> rusqlite::Result<()> {
     // columns in place without invalidating old MITRE audit history.
     ensure_audit_column(conn, "dataset_schema_sha256")?;
     ensure_audit_column(conn, "dataset_import_sha256")?;
+    // The examiner's own query text: input_sha256 alone proves integrity but a human reading
+    // the audit sheet needs to see what was actually asked.
+    ensure_audit_column(conn, "input_text")?;
     Ok(())
 }
 
@@ -1431,13 +1434,13 @@ fn record_llm_audit(
         "INSERT INTO _llm_parse_audit (
             provider, model_name, model_version, model_sha256, tokenizer_sha256,
             prompt_template_version, correlation_engine_version, artifact_ids_json,
-            input_sha256, generation_parameters_json, created_at, load_time_ms,
+            input_sha256, input_text, generation_parameters_json, created_at, load_time_ms,
             inference_latency_ms, raw_output, validation_status, validation_detail,
             trusted_intent_json, dataset_schema_sha256, dataset_import_sha256,
             examiner_decision
          ) VALUES (
             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-            ?15, ?16, ?17, ?18, ?19, 'unreviewed'
+            ?15, ?16, ?17, ?18, ?19, ?20, 'unreviewed'
          )",
         params![
             result.metadata.provider,
@@ -1449,6 +1452,7 @@ fn record_llm_audit(
             correlation_engine,
             artifacts,
             llm_parser::sha256_text(query_text),
+            query_text,
             llm_parser::generation_parameters_json(),
             chrono::Utc::now().to_rfc3339(),
             result.metadata.load_time_ms.min(i64::MAX as u128) as i64,
@@ -2597,6 +2601,46 @@ mod tests {
         )
         .unwrap();
         conn.last_insert_rowid()
+    }
+
+    #[test]
+    fn audit_table_gains_input_text_column_on_legacy_databases() {
+        let conn = Connection::open_in_memory().unwrap();
+        // Legacy shape: the audit table as shipped before input_text existed.
+        conn.execute_batch(
+            "CREATE TABLE _llm_parse_audit (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                provider TEXT NOT NULL,
+                model_name TEXT NOT NULL,
+                model_version TEXT NOT NULL,
+                model_sha256 TEXT NOT NULL,
+                tokenizer_sha256 TEXT NOT NULL,
+                prompt_template_version TEXT NOT NULL,
+                correlation_engine_version TEXT NOT NULL,
+                artifact_ids_json TEXT NOT NULL,
+                input_sha256 TEXT NOT NULL,
+                generation_parameters_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                load_time_ms INTEGER NOT NULL,
+                inference_latency_ms INTEGER NOT NULL,
+                raw_output TEXT NOT NULL,
+                validation_status TEXT NOT NULL,
+                validation_detail TEXT,
+                trusted_intent_json TEXT NOT NULL,
+                examiner_decision TEXT NOT NULL,
+                decided_at TEXT
+             );",
+        )
+        .unwrap();
+        create_llm_audit_table(&conn).unwrap();
+        let mut stmt = conn.prepare("PRAGMA table_info(_llm_parse_audit)").unwrap();
+        let names: Vec<String> = stmt
+            .query_map([], |row| row.get(1))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert!(names.iter().any(|name| name == "input_text"), "{names:?}");
+        assert!(names.iter().any(|name| name == "dataset_schema_sha256"));
     }
 
     #[test]

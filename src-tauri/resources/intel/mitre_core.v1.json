@@ -2615,18 +2615,6 @@
           "score": 50
         },
         {
-          "id": "t1567_002_onedrive_exe",
-          "pattern": "onedrive.exe",
-          "match": "word",
-          "columns": [
-            "command_line",
-            "process_name",
-            "file_name",
-            "text_evidence"
-          ],
-          "score": 45
-        },
-        {
           "id": "t1567_002_googledrivefs_exe",
           "pattern": "googledrivefs.exe",
           "match": "word",
