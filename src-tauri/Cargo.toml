@@ -34,3 +34,11 @@ sha2 = "0.10"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem"] }
+
+# Apple's Accelerate framework backs candle's BLAS on macOS; without it MiniLM inference runs on
+# candle's portable CPU kernels and semantic indexing of large imports takes hours instead of
+# minutes.
+[target.'cfg(target_os = "macos")'.dependencies]
+candle-core = { version = "0.11.0", features = ["accelerate"] }
+candle-nn = { version = "0.11.0", features = ["accelerate"] }
+candle-transformers = { version = "0.11.0", features = ["accelerate"] }

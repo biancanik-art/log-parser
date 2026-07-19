@@ -3,7 +3,7 @@ use anyhow::{bail, Context, Result};
 use candle_core::{Device, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::bert::{BertModel, Config, DTYPE};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::cmp::{Ordering, Reverse};
@@ -29,7 +29,7 @@ pub const V2_INDEX_VERSION: &str = "semantic-document-v3";
 pub const V2_NORMALIZER_VERSION: &str = "dfir-cell-normalizer-v3";
 const V2_LEGACY_UNRECORDED_IDENTITY: &str = "legacy-unrecorded";
 pub const V2_SOURCE_BATCH_ROWS: usize = 256;
-pub const V2_EMBED_BATCH_DOCUMENTS: usize = 16;
+pub const V2_EMBED_BATCH_DOCUMENTS: usize = 64;
 pub const V2_DEFAULT_DOCUMENT_CANDIDATES: usize = 256;
 pub const V2_MAX_DOCUMENT_CANDIDATES: usize = 1_024;
 pub const V2_DEFAULT_MINIMUM_SCORE: f32 = 0.38;
@@ -223,6 +223,9 @@ struct NormalizedDocument {
 }
 
 const V2_COLUMN_SAMPLE_ROWS: usize = 4_096;
+/// Rows sampled to estimate whether a build will exceed its document/mapping limits. Datasets at
+/// or under this size are counted exactly; larger ones are extrapolated from this prefix.
+const V2_RESOURCE_ESTIMATE_SAMPLE_ROWS: i64 = 4_096;
 const V2_PRIMARY_CHUNK_WORDS: usize = 72;
 const V2_CHUNK_OVERLAP_WORDS: usize = 12;
 const V2_MAX_CHUNKS_PER_CELL: usize = 4;
@@ -818,16 +821,22 @@ fn budget_documents_v2(
         documents_seen += candidates.len() as i64;
 
         let row_position = rows_before + offset as i64 + 1;
+        // The over-limit flags come from a sampled estimate, so the remaining hard capacity is
+        // enforced unconditionally: an estimate that never engaged proportional budgeting still
+        // cannot push the build past its absolute limits.
+        let hard_mapping_remaining = limits
+            .mappings
+            .max(0)
+            .saturating_sub(mappings_before + mappings_retained);
         let mapping_allowance = if policy.mappings_over_limit {
-            let mapping_target =
-                cumulative_balanced_budget(row_position, rows_total, limits.mappings.max(0));
-            mapping_target
+            cumulative_balanced_budget(row_position, rows_total, limits.mappings.max(0))
                 .saturating_sub(mappings_before + mappings_retained)
-                .min(candidates.len() as i64)
-                .max(0) as usize
         } else {
-            candidates.len()
-        };
+            candidates.len() as i64
+        }
+        .min(hard_mapping_remaining)
+        .min(candidates.len() as i64)
+        .max(0) as usize;
         let mapping_indices = balanced_indices(candidates.len(), mapping_allowance);
         mappings_skipped += candidates.len().saturating_sub(mapping_indices.len()) as i64;
 
@@ -839,23 +848,23 @@ fn budget_documents_v2(
                     && !newly_known.contains(&candidates[*index].0)
             })
             .collect::<Vec<_>>();
-        let admitted_unknown = if policy.documents_over_limit {
-            let document_target = cumulative_balanced_budget(
-                row_position,
-                rows_total,
-                limits.mapped_documents.max(0),
-            );
-            let document_allowance = document_target
+        let hard_document_remaining = limits
+            .mapped_documents
+            .max(0)
+            .saturating_sub(mapped_documents_before + documents_mapped);
+        let document_allowance = if policy.documents_over_limit {
+            cumulative_balanced_budget(row_position, rows_total, limits.mapped_documents.max(0))
                 .saturating_sub(mapped_documents_before + documents_mapped)
-                .min(unknown_indices.len() as i64)
-                .max(0) as usize;
-            balanced_indices(unknown_indices.len(), document_allowance)
-                .into_iter()
-                .map(|index| unknown_indices[index])
-                .collect::<HashSet<_>>()
         } else {
-            unknown_indices.iter().copied().collect::<HashSet<_>>()
-        };
+            unknown_indices.len() as i64
+        }
+        .min(hard_document_remaining)
+        .min(unknown_indices.len() as i64)
+        .max(0) as usize;
+        let admitted_unknown = balanced_indices(unknown_indices.len(), document_allowance)
+            .into_iter()
+            .map(|index| unknown_indices[index])
+            .collect::<HashSet<_>>();
 
         for index in mapping_indices {
             let (hash, kind, column_key, text) = &candidates[index];
@@ -884,13 +893,13 @@ fn budget_documents_v2(
     }
 
     debug_assert!(
-        !policy.documents_over_limit
-            || mapped_documents_before + documents_mapped <= limits.mapped_documents.max(0)
+        documents_mapped
+            <= limits
+                .mapped_documents
+                .max(0)
+                .saturating_sub(mapped_documents_before)
     );
-    debug_assert!(
-        !policy.mappings_over_limit
-            || mappings_before + mappings_retained <= limits.mappings.max(0)
-    );
+    debug_assert!(mappings_retained <= limits.mappings.max(0).saturating_sub(mappings_before));
     BudgetedDocuments {
         documents: retained,
         documents_seen,
@@ -992,8 +1001,18 @@ where
         }
     }
 
+    // Counting every candidate exactly would cost a full extra pass over the dataset before any
+    // indexing starts — on wide files that pass alone takes longer than users will wait. The
+    // decision only needs to know whether balanced budgeting must throttle, so it samples a
+    // bounded prefix and extrapolates linearly to the full row count. Deduplicated document
+    // counts grow sub-linearly, so linear extrapolation can only engage throttling early, never
+    // late; `budget_documents_v2` separately enforces both limits as hard caps, so even a sample
+    // that underestimates cannot let a build overrun its resource limits.
     let source_expressions = source_select_expressions(columns);
+    let rows_total: i64 = conn.query_row("SELECT COUNT(*) FROM rows", [], |row| row.get(0))?;
     let mut cursor = 0i64;
+    let mut sampled_rows = 0i64;
+    let mut scanned_all_rows = false;
     let mut distinct_documents = HashSet::<String>::new();
     let mut document_count = 0i64;
     let mut mapping_count = 0i64;
@@ -1005,10 +1024,12 @@ where
         }
         let batch = load_bounded_source_batch(conn, columns, &source_expressions, cursor)?;
         if batch.rows.is_empty() {
+            scanned_all_rows = true;
             break;
         }
         for (row_num, values) in &batch.rows {
             cursor = *row_num;
+            sampled_rows += 1;
             let mut row_hashes = HashSet::<String>::new();
             for (kind, column_key, text) in row_documents_v2(plans, values) {
                 let hash = text_sha256(kind, &column_key, &text);
@@ -1026,10 +1047,22 @@ where
         if document_count >= document_sentinel && mapping_count >= mapping_sentinel {
             break;
         }
+        if sampled_rows >= V2_RESOURCE_ESTIMATE_SAMPLE_ROWS {
+            break;
+        }
     }
     if is_cancelled() {
         return Ok(None);
     }
+    let extrapolate = |count: i64| -> i64 {
+        if scanned_all_rows || sampled_rows <= 0 || rows_total <= sampled_rows {
+            return count;
+        }
+        ((count as i128 * rows_total as i128 + sampled_rows as i128 - 1) / sampled_rows as i128)
+            .min(i64::MAX as i128) as i64
+    };
+    let estimated_documents = extrapolate(document_count);
+    let estimated_mappings = extrapolate(mapping_count);
     conn.execute(
         "UPDATE _semantic_v2_build SET candidate_documents = ?2, candidate_mappings = ?3,
                 candidate_document_limit = ?4, candidate_mapping_limit = ?5,
@@ -1037,16 +1070,16 @@ where
          WHERE build_id = ?1",
         params![
             build_id,
-            document_count,
-            mapping_count,
+            estimated_documents,
+            estimated_mappings,
             limits.mapped_documents,
             limits.mappings,
             chrono::Utc::now().to_rfc3339(),
         ],
     )?;
     Ok(Some(SemanticResourcePolicy {
-        documents_over_limit: document_count > limits.mapped_documents.max(0),
-        mappings_over_limit: mapping_count > limits.mappings.max(0),
+        documents_over_limit: estimated_documents > limits.mapped_documents.max(0),
+        mappings_over_limit: estimated_mappings > limits.mappings.max(0),
     }))
 }
 
@@ -3681,7 +3714,7 @@ fn prepare_required_semantic_audit_archive(conn: &Connection) -> Result<bool> {
 fn advance_required_semantic_audit_archive_transaction(
     conn: &mut Connection,
 ) -> Result<SemanticAuditArchiveProgress> {
-    let tx = conn.transaction()?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let advanced = advance_required_audit_snapshot(&tx)?;
     let pending = pending_audit_snapshot_selection(&tx)?.is_some();
     let progress = SemanticAuditArchiveProgress {
@@ -3783,7 +3816,7 @@ fn prune_stale_semantic_artifacts_pass(conn: &mut Connection) -> Result<usize> {
     if !has_v2 && !has_v1_index && !has_v1_info {
         return Ok(0);
     }
-    let tx = conn.transaction()?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let mut removed = 0usize;
 
     if has_v1_index {
@@ -4112,7 +4145,7 @@ fn prepare_v2_build(
 
     let plans = classify_columns(conn, columns)?;
     let now = chrono::Utc::now().to_rfc3339();
-    let tx = conn.transaction()?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let inserted = tx.execute(
         "INSERT OR IGNORE INTO _semantic_v2_build (
             dataset_hash, schema_hash, index_version, normalizer_version, model_name,
@@ -4305,8 +4338,30 @@ where
 {
     let started = Instant::now();
     conn.busy_timeout(std::time::Duration::from_secs(3))?;
-    create_semantic_v2_schema(conn)?;
+    {
+        // Immediate, not deferred: schema creation mixes catalog reads with DDL writes, and a
+        // deferred transaction that upgrades mid-flight while an overlapping builder commits
+        // gets a handler-free SQLITE_BUSY instead of waiting out the busy timeout.
+        let schema_tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        create_semantic_v2_schema(&schema_tx)?;
+        schema_tx.commit()?;
+    }
     let rows_total: i64 = conn.query_row("SELECT COUNT(*) FROM rows", [], |row| row.get(0))?;
+    let empty_progress = |phase: &str, build_id: i64| SemanticBuildProgress {
+        build_id,
+        phase: phase.to_string(),
+        rows_scanned: 0,
+        rows_total,
+        documents_embedded: 0,
+        mappings_written: 0,
+        documents_skipped: 0,
+        mappings_skipped: 0,
+        cells_truncated: 0,
+        columns_omitted: 0,
+        chunks_omitted: 0,
+        resumed_from_row: 0,
+    };
+    on_progress(empty_progress("preparing", 0));
     let dataset_hash = semantic_dataset_hash(conn, columns)?;
     let schema_hash = semantic_schema_hash(columns);
     if let Some((build_id, _, _, _)) = active_v2_build(conn, &dataset_hash, &schema_hash)? {
@@ -4373,6 +4428,7 @@ where
         } => (build_id, cursor, plans, resumed),
     };
     let resumed_from_row = cursor;
+    on_progress(empty_progress("estimating", build_id));
     let resource_policy = match determine_semantic_resource_policy(
         conn,
         columns,
@@ -4419,6 +4475,25 @@ where
             build_doc_ids.len()
         );
     }
+    {
+        // Report the resumed counters before the first batch so the status is never stuck on a
+        // stale phase while the loop warms up.
+        let snapshot = build_summary(conn, build_id, started, false, resumed, false)?;
+        on_progress(SemanticBuildProgress {
+            build_id,
+            phase: "indexing".to_string(),
+            rows_scanned: snapshot.rows_indexed,
+            rows_total,
+            documents_embedded: snapshot.documents_indexed,
+            mappings_written: snapshot.mappings_written,
+            documents_skipped: snapshot.documents_skipped,
+            mappings_skipped: snapshot.mappings_skipped,
+            cells_truncated: snapshot.cells_truncated,
+            columns_omitted: snapshot.columns_omitted,
+            chunks_omitted: snapshot.chunks_omitted,
+            resumed_from_row,
+        });
+    }
 
     let result = (|| -> Result<SemanticIndexSummary> {
         loop {
@@ -4437,7 +4512,7 @@ where
                     continue;
                 }
                 let now = chrono::Utc::now().to_rfc3339();
-                let tx = conn.transaction()?;
+                let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
                 let published = tx.execute(
                     "UPDATE _semantic_v2_build
                  SET status = 'ready', updated_at = ?3, completed_at = ?3, worker_token = NULL
@@ -4531,11 +4606,14 @@ where
                 }
             }
 
-            let unknown = documents
+            let mut unknown = documents
                 .iter()
                 .filter(|(hash, _)| !existing.contains_key(*hash))
                 .map(|(hash, document)| (hash.clone(), document.text.clone()))
                 .collect::<Vec<_>>();
+            // The tokenizer pads every batch to its longest member, so grouping similar lengths
+            // together avoids padding short documents up to the batch's one long outlier.
+            unknown.sort_by_key(|(_, text)| text.len());
             let mut embeddings = HashMap::<String, Vec<u8>>::new();
             for chunk in unknown.chunks(V2_EMBED_BATCH_DOCUMENTS) {
                 if is_cancelled() {
@@ -4569,7 +4647,7 @@ where
             }
 
             let last_row = source_rows.last().map(|row| row.0).unwrap_or(cursor);
-            let tx = conn.transaction()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let claimed = tx.execute(
                 "UPDATE _semantic_v2_build SET
                 cursor_row_num = ?2,
@@ -5195,7 +5273,7 @@ pub fn create_semantic_selection<E: SemanticEmbedder + ?Sized>(
     let (documents, above_threshold) =
         rank_semantic_documents(conn, embedder, build_id, query, policy)?;
     let truncated = above_threshold > documents.len();
-    let tx = conn.transaction()?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let inserted = tx.execute(
         "INSERT INTO _semantic_v2_selection (
             selection_id, build_id, dataset_hash, query_sha256, policy_version,
@@ -7971,8 +8049,11 @@ mod tests {
         let mut conn = Connection::open_in_memory().unwrap();
         let columns = message_columns();
         populate_messages(&mut conn, &columns, 300, true);
+        // The first source batch (256 rows) takes ceil(256 / V2_EMBED_BATCH_DOCUMENTS) embed
+        // calls; failing on the next call interrupts the second source batch after the first
+        // one has already committed.
         let failing = FakeEmbedder {
-            fail_on_call: Some(17),
+            fail_on_call: Some(V2_SOURCE_BATCH_ROWS.div_ceil(V2_EMBED_BATCH_DOCUMENTS) + 1),
             ..Default::default()
         };
         let error =
@@ -8101,6 +8182,11 @@ mod tests {
         let columns = message_columns();
         {
             let mut conn = Connection::open(&path).unwrap();
+            // Production connections run WAL (see `db::open`); the rollback journal would let
+            // the two deliberately overlapping writers hit SQLite's handler-free
+            // SHARED→RESERVED deadlock case instead of the busy handler.
+            conn.query_row("PRAGMA journal_mode = WAL", [], |_| Ok(()))
+                .unwrap();
             populate_messages(&mut conn, &columns, 520, true);
         }
         let barrier = Arc::new(Barrier::new(2));

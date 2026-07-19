@@ -689,8 +689,12 @@ fn with_current_loaded_generation<T>(
 }
 
 #[tauri::command]
-pub fn list_sheets(path: String) -> Result<Vec<String>, String> {
-    tabular_import::list_sheet_names(std::path::Path::new(&path)).map_err(|e| e.to_string())
+pub async fn list_sheets(path: String) -> Result<Vec<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        tabular_import::list_sheet_names(std::path::Path::new(&path)).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("sheet listing task join error: {e}"))?
 }
 
 #[tauri::command]
@@ -877,39 +881,55 @@ async fn import_sheet_locked(
 }
 
 #[tauri::command]
-pub fn query_rows(state: State<'_, AppState>, spec: QuerySpec) -> Result<QueryPage, String> {
+pub async fn query_rows(state: State<'_, AppState>, spec: QuerySpec) -> Result<QueryPage, String> {
+    // Row queries must never run as sync commands: those serialize on the main thread, so a
+    // slow page fetch during background indexing would freeze the whole UI behind it.
     let (db_path, columns, _) = state_snapshot(&state)?;
-    let conn = db::open(&db_path).map_err(|e| e.to_string())?;
-    query::query_rows(&conn, &columns, &spec).map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-pub fn count_rows(state: State<'_, AppState>, spec: QuerySpec) -> Result<i64, String> {
-    let (db_path, columns, _) = state_snapshot(&state)?;
-    let conn = db::open(&db_path).map_err(|e| e.to_string())?;
-    query::count_rows(&conn, &columns, &spec).map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-pub fn semantic_index_status(state: State<'_, AppState>) -> Result<SemanticIndexStatus, String> {
-    let (db_path, columns, _) = state_snapshot(&state)?;
-    let conn = db::open(&db_path).map_err(|error| error.to_string())?;
-    let ready =
-        semantic::semantic_index_ready(&conn, &columns).map_err(|error| error.to_string())?;
-    let rows_indexed =
-        semantic::semantic_indexed_rows(&conn, &columns).map_err(|error| error.to_string())?;
-    let coverage = semantic::semantic_index_coverage(&conn, &columns)
-        .map_err(|error| error.to_string())?
-        .unwrap_or_default();
-    Ok(SemanticIndexStatus {
-        ready,
-        rows_indexed,
-        documents_skipped: coverage.documents_skipped,
-        mappings_skipped: coverage.mappings_skipped,
-        cells_truncated: coverage.cells_truncated,
-        columns_omitted: coverage.columns_omitted,
-        chunks_omitted: coverage.chunks_omitted,
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = db::open(&db_path).map_err(|e| e.to_string())?;
+        query::query_rows(&conn, &columns, &spec).map_err(|e| e.to_string())
     })
+    .await
+    .map_err(|e| format!("row query task join error: {e}"))?
+}
+
+#[tauri::command]
+pub async fn count_rows(state: State<'_, AppState>, spec: QuerySpec) -> Result<i64, String> {
+    let (db_path, columns, _) = state_snapshot(&state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = db::open(&db_path).map_err(|e| e.to_string())?;
+        query::count_rows(&conn, &columns, &spec).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("row count task join error: {e}"))?
+}
+
+#[tauri::command]
+pub async fn semantic_index_status(
+    state: State<'_, AppState>,
+) -> Result<SemanticIndexStatus, String> {
+    let (db_path, columns, _) = state_snapshot(&state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = db::open(&db_path).map_err(|error| error.to_string())?;
+        let ready =
+            semantic::semantic_index_ready(&conn, &columns).map_err(|error| error.to_string())?;
+        let rows_indexed =
+            semantic::semantic_indexed_rows(&conn, &columns).map_err(|error| error.to_string())?;
+        let coverage = semantic::semantic_index_coverage(&conn, &columns)
+            .map_err(|error| error.to_string())?
+            .unwrap_or_default();
+        Ok(SemanticIndexStatus {
+            ready,
+            rows_indexed,
+            documents_skipped: coverage.documents_skipped,
+            mappings_skipped: coverage.mappings_skipped,
+            cells_truncated: coverage.cells_truncated,
+            columns_omitted: coverage.columns_omitted,
+            chunks_omitted: coverage.chunks_omitted,
+        })
+    })
+    .await
+    .map_err(|e| format!("semantic status task join error: {e}"))?
 }
 
 #[tauri::command]
@@ -1150,18 +1170,22 @@ pub async fn parse_guided_query(
 }
 
 #[tauri::command]
-pub fn accept_guided_query(
+pub async fn accept_guided_query(
     state: State<'_, AppState>,
     intent_token: String,
     audit_id: i64,
 ) -> Result<(), String> {
     let (db_path, _, _) = state_snapshot(&state)?;
-    let mut conn = db::open(&db_path).map_err(|error| error.to_string())?;
-    accept_and_advance_semantic_archive(&mut conn, audit_id, &intent_token)
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut conn = db::open(&db_path).map_err(|error| error.to_string())?;
+        accept_and_advance_semantic_archive(&mut conn, audit_id, &intent_token)
+    })
+    .await
+    .map_err(|e| format!("guided accept task join error: {e}"))?
 }
 
 #[tauri::command]
-pub fn run_guided_query(
+pub async fn run_guided_query(
     state: State<'_, AppState>,
     intent_token: String,
     audit_id: i64,
@@ -1169,23 +1193,31 @@ pub fn run_guided_query(
     limit: Option<u32>,
 ) -> Result<QueryPage, String> {
     let (db_path, columns, _) = state_snapshot(&state)?;
-    let mut conn = db::open(&db_path).map_err(|e| e.to_string())?;
-    accept_and_advance_semantic_archive(&mut conn, audit_id, &intent_token)?;
-    guided_query::run_guided_query(&conn, &columns, &intent_token, cursor, limit)
-        .map_err(|error| error.to_string())
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut conn = db::open(&db_path).map_err(|e| e.to_string())?;
+        accept_and_advance_semantic_archive(&mut conn, audit_id, &intent_token)?;
+        guided_query::run_guided_query(&conn, &columns, &intent_token, cursor, limit)
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|e| format!("guided query task join error: {e}"))?
 }
 
 #[tauri::command]
-pub fn set_guided_parse_decision(
+pub async fn set_guided_parse_decision(
     state: State<'_, AppState>,
     audit_id: i64,
     intent_token: String,
     decision: guided_parser::ExaminerDecision,
 ) -> Result<(), String> {
     let (db_path, _, _) = state_snapshot(&state)?;
-    let conn = db::open(&db_path).map_err(|error| error.to_string())?;
-    guided_parser::set_llm_audit_decision(&conn, audit_id, &intent_token, decision)
-        .map_err(|error| error.to_string())
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = db::open(&db_path).map_err(|error| error.to_string())?;
+        guided_parser::set_llm_audit_decision(&conn, audit_id, &intent_token, decision)
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|e| format!("parse decision task join error: {e}"))?
 }
 
 #[tauri::command]
@@ -1215,25 +1247,33 @@ fn resolve_llm_resource(app: &AppHandle, relative_path: &str) -> Result<PathBuf,
 }
 
 #[tauri::command]
-pub fn detect_column_roles(
+pub async fn detect_column_roles(
     state: State<'_, AppState>,
 ) -> Result<Vec<roles::ColumnRoleSuggestion>, String> {
     let (db_path, columns, _) = state_snapshot(&state)?;
-    let conn = db::open(&db_path).map_err(|e| e.to_string())?;
-    roles::detect_column_roles(&conn, &columns).map_err(|e| e.to_string())
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = db::open(&db_path).map_err(|e| e.to_string())?;
+        roles::detect_column_roles(&conn, &columns).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("column role detection task join error: {e}"))?
 }
 
 #[tauri::command]
-pub fn set_column_role_status(
+pub async fn set_column_role_status(
     state: State<'_, AppState>,
     role: String,
     sql_name: String,
     status: roles::RoleDecisionStatus,
 ) -> Result<roles::ColumnRoleSuggestion, String> {
     let (db_path, columns, _) = state_snapshot(&state)?;
-    let conn = db::open(&db_path).map_err(|e| e.to_string())?;
-    roles::set_column_role_status(&conn, &columns, &role, &sql_name, status)
-        .map_err(|e| e.to_string())
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = db::open(&db_path).map_err(|e| e.to_string())?;
+        roles::set_column_role_status(&conn, &columns, &role, &sql_name, status)
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("column role update task join error: {e}"))?
 }
 
 #[tauri::command]

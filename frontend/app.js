@@ -1425,6 +1425,10 @@
     } else if (semanticIndexState.status === "building") {
       if (semanticIndexState.phase === "loadingModel") {
         semanticIndexStatus.textContent = "Loading the local semantic model. Exact and structured AI search are ready now.";
+      } else if (semanticIndexState.phase === "preparing") {
+        semanticIndexStatus.textContent = "Preparing the semantic index. Exact and structured AI search are ready now.";
+      } else if (semanticIndexState.phase === "estimating") {
+        semanticIndexStatus.textContent = "Estimating semantic index size from a sample of rows. Exact and structured AI search are ready now.";
       } else {
         const progressParts = [];
         if (semanticIndexState.rowsIndexed) {

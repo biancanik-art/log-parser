@@ -393,6 +393,15 @@ fn scavenge_abandoned_row_time_objects_with_hooks(
 pub fn open(db_path: &Path) -> rusqlite::Result<Connection> {
     let mut conn = Connection::open(db_path)?;
     conn.busy_timeout(CACHE_BUSY_TIMEOUT)?;
+    // WAL lets the background writers (semantic indexing, enrichment) commit without ever
+    // blocking readers, so the table stays responsive while an index builds. In the DELETE
+    // journal mode every batch commit takes an exclusive lock that starves page queries.
+    // Best-effort on purpose: the DELETE→WAL conversion briefly needs an exclusive lock, so a
+    // contended open keeps the current mode instead of failing — WAL is persistent in the file,
+    // so the first uncontended open converts it once and every later open is a no-op. (The
+    // pragma returns a result row, so it must run as a query, not execute.)
+    let _ = conn.query_row("PRAGMA journal_mode = WAL", [], |_| Ok(()));
+    conn.execute_batch("PRAGMA synchronous = NORMAL;")?;
     scavenge_abandoned_row_time_objects(&mut conn)?;
     Ok(conn)
 }
