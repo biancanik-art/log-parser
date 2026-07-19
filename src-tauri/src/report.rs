@@ -348,6 +348,17 @@ fn write_report_workbook(
             used_sheet_names.insert("timeline".to_string());
         }
 
+        if has_intel_matches && table_has_rows(conn, "_intel_chain")? {
+            sheets_written.push(write_attack_story_sheet(conn, columns, &mut write_state)?);
+            used_sheet_names.insert("attack story".to_string());
+        }
+        // Reserved ahead of the tactic loop so a name collision renames the tactic sheet,
+        // not the fixed sheet written afterwards.
+        let write_anomalies = table_has_rows(conn, "_anomaly")?;
+        if write_anomalies {
+            used_sheet_names.insert("anomalies".to_string());
+        }
+
         for tactic in tactics {
             let sheet_name = unique_sheet_name(&tactic.tactic_name, &mut used_sheet_names);
             write_tactic_sheet(
@@ -359,6 +370,10 @@ fn write_report_workbook(
                 &mut write_state,
             )?;
             sheets_written.push(sheet_name);
+        }
+
+        if write_anomalies {
+            sheets_written.push(write_anomaly_sheet(conn, columns, &mut write_state)?);
         }
     }
 
@@ -1663,6 +1678,306 @@ where
         }
         let refs: Vec<&str> = values.iter().map(String::as_str).collect();
         writer.write_cells(row_num, &refs)?;
+    }
+
+    writer.finish_sheet();
+    Ok(sheet_name)
+}
+
+#[derive(Debug)]
+struct StoryChain {
+    chain_id: i64,
+    host: Option<String>,
+    start_epoch_ms: Option<i64>,
+    end_epoch_ms: Option<i64>,
+    first_row: i64,
+    last_row: i64,
+    tactic_count: i64,
+    row_count: i64,
+    score: i64,
+    tactic_names: Vec<String>,
+}
+
+const MAX_STORY_EVENTS_PER_CHAIN: i64 = 500;
+
+fn story_utc_text(epoch_ms: i64) -> String {
+    chrono::DateTime::from_timestamp_millis(epoch_ms)
+        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+        .unwrap_or_default()
+}
+
+/// A plain-language chronological incident narrative rebuilt from the published chain data.
+/// Each chain contributes one summary line followed by its events in time order; every line
+/// carries the original source row number, so the narrative stays fully pivotable.
+fn write_attack_story_sheet<F>(
+    conn: &Connection,
+    columns: &[ColumnMeta],
+    state: &mut ReportWriteState<'_, F>,
+) -> Result<String>
+where
+    F: FnMut(i64, &str),
+{
+    let sheet_name = "Attack Story".to_string();
+    let worksheet = state.workbook.add_worksheet_with_constant_memory();
+    worksheet.set_name(&sheet_name)?;
+    write_headers(
+        worksheet,
+        &[
+            "row_num",
+            "chain",
+            "entry_type",
+            "utc_timestamp",
+            "host",
+            "tactic",
+            "technique",
+            "narrative",
+            "evidence",
+        ],
+    )?;
+    worksheet.set_column_width(0, 11)?;
+    worksheet.set_column_width(1, 8)?;
+    worksheet.set_column_width(2, 14)?;
+    worksheet.set_column_width(3, 24)?;
+    worksheet.set_column_width(4, 20)?;
+    worksheet.set_column_width(5, 22)?;
+    worksheet.set_column_width(6, 36)?;
+    worksheet.set_column_width(7, 110)?;
+    worksheet.set_column_width(8, 80)?;
+
+    let chains = {
+        let mut stmt = conn.prepare(
+            "SELECT chain_id, host, start_epoch_ms, end_epoch_ms, first_row, last_row,
+                    tactic_count, row_count, score, tactic_names
+             FROM _intel_chain
+             ORDER BY chain_id ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let tactic_names_json: String = row.get(9)?;
+            Ok(StoryChain {
+                chain_id: row.get(0)?,
+                host: row.get(1)?,
+                start_epoch_ms: row.get(2)?,
+                end_epoch_ms: row.get(3)?,
+                first_row: row.get(4)?,
+                last_row: row.get(5)?,
+                tactic_count: row.get(6)?,
+                row_count: row.get(7)?,
+                score: row.get(8)?,
+                tactic_names: serde_json::from_str(&tactic_names_json).unwrap_or_default(),
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+
+    let host_column = crate::intel::chains::detect_host_column(conn)?;
+    let has_row_time = table_exists(conn, "_row_time")?;
+    let evidence_expr = evidence_case_expression(columns);
+
+    let mut writer = RowWriter::new(
+        worksheet,
+        &sheet_name,
+        state.source_rows,
+        state.total_rows_written,
+        state.on_progress,
+    );
+
+    for chain in &chains {
+        let where_host = chain.host.as_deref().and_then(|_| host_column.as_deref());
+        let host_label = chain.host.as_deref().unwrap_or("(no host mapping)");
+        let window_text = match (chain.start_epoch_ms, chain.end_epoch_ms) {
+            (Some(start), Some(end)) => format!(
+                " between {} and {}",
+                story_utc_text(start),
+                story_utc_text(end)
+            ),
+            _ => String::new(),
+        };
+        let summary = format!(
+            "Chain {} on {}: {} tactics ({}) across {} rows{} (score {}).",
+            chain.chain_id,
+            host_label,
+            chain.tactic_count,
+            chain.tactic_names.join(" → "),
+            chain.row_count,
+            window_text,
+            chain.score
+        );
+        writer.write_cells(
+            chain.first_row,
+            &[
+                &chain.chain_id.to_string(),
+                "chain summary",
+                "",
+                host_label,
+                "",
+                "",
+                &summary,
+                "",
+            ],
+        )?;
+
+        // Chain membership is reconstructed with the same host/time semantics the chains
+        // were computed under: the host column that grouped them and the published window
+        // (row-number range when the dataset has no normalized time).
+        let (time_select, time_join, time_order) = if has_row_time {
+            (
+                "COALESCE(rt.utc_text, '')",
+                "LEFT JOIN _row_time rt ON rt.row_num = m.row_num",
+                "rt.epoch_ms ASC, ",
+            )
+        } else {
+            ("''", "", "")
+        };
+        let mut predicates = Vec::new();
+        let mut params_vec: Vec<rusqlite::types::Value> = Vec::new();
+        match (chain.start_epoch_ms, chain.end_epoch_ms) {
+            // Chains with a temporal claim were built from time-windowed events; row numbers
+            // are not time-ordered, so membership must use the same epoch window.
+            (Some(start), Some(end)) if has_row_time => {
+                predicates.push("rt.epoch_ms BETWEEN ? AND ?".to_string());
+                params_vec.push(start.into());
+                params_vec.push(end.into());
+            }
+            _ => {
+                predicates.push("m.row_num BETWEEN ? AND ?".to_string());
+                params_vec.push(chain.first_row.into());
+                params_vec.push(chain.last_row.into());
+            }
+        }
+        if let (Some(host_col), Some(host_value)) = (where_host, chain.host.as_deref()) {
+            predicates.push(format!("r.{} = ?", db::quote_ident(host_col)));
+            params_vec.push(host_value.to_string().into());
+        }
+        let sql = format!(
+            "SELECT m.row_num, {time_select}, m.tactic_name, m.technique_name,
+                    m.keyword, m.column_name, MAX(m.score), {evidence_expr}
+             FROM _intel_match m
+             JOIN rows r ON r.row_num = m.row_num
+             {time_join}
+             WHERE {}
+             GROUP BY m.row_num, m.tactic_id, m.technique_id
+             ORDER BY {time_order}m.row_num ASC
+             LIMIT {MAX_STORY_EVENTS_PER_CHAIN}",
+            predicates.join(" AND ")
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let mut rows = stmt.query(rusqlite::params_from_iter(params_vec))?;
+        while let Some(row) = rows.next()? {
+            let row_num: i64 = row.get(0)?;
+            let utc_text: String = row.get(1)?;
+            let tactic_name: String = row.get(2)?;
+            let technique_name: String = row.get(3)?;
+            let keyword: String = row.get(4)?;
+            let column_name: String = row.get(5)?;
+            let evidence: String = row.get(7)?;
+            let when_text = if utc_text.is_empty() {
+                format!("Row {row_num}")
+            } else {
+                format!("At {utc_text}")
+            };
+            let narrative = format!(
+                "{when_text}: {tactic_name} activity ({technique_name}) — '{keyword}' seen in column '{column_name}'."
+            );
+            writer.write_cells(
+                row_num,
+                &[
+                    &chain.chain_id.to_string(),
+                    "event",
+                    utc_text.as_str(),
+                    host_label,
+                    tactic_name.as_str(),
+                    technique_name.as_str(),
+                    &narrative,
+                    evidence.as_str(),
+                ],
+            )?;
+        }
+    }
+
+    writer.finish_sheet();
+    Ok(sheet_name)
+}
+
+/// Wide-net heuristic findings. Deliberately labeled as tolerant of false positives so the
+/// sheet reads as a review queue, not as verdicts.
+fn write_anomaly_sheet<F>(
+    conn: &Connection,
+    columns: &[ColumnMeta],
+    state: &mut ReportWriteState<'_, F>,
+) -> Result<String>
+where
+    F: FnMut(i64, &str),
+{
+    let sheet_name = "Anomalies".to_string();
+    let worksheet = state.workbook.add_worksheet_with_constant_memory();
+    worksheet.set_name(&sheet_name)?;
+    write_headers(
+        worksheet,
+        &[
+            "row_num",
+            "utc_timestamp",
+            "category",
+            "score",
+            "reason",
+            "matched_column",
+            "evidence",
+        ],
+    )?;
+    worksheet.set_column_width(0, 11)?;
+    worksheet.set_column_width(1, 24)?;
+    worksheet.set_column_width(2, 26)?;
+    worksheet.set_column_width(3, 8)?;
+    worksheet.set_column_width(4, 90)?;
+    worksheet.set_column_width(5, 24)?;
+    worksheet.set_column_width(6, 80)?;
+
+    let has_row_time = table_exists(conn, "_row_time")?;
+    let (time_select, time_join) = if has_row_time {
+        (
+            "COALESCE(rt.utc_text, '')",
+            "LEFT JOIN _row_time rt ON rt.row_num = m.row_num",
+        )
+    } else {
+        ("''", "")
+    };
+    let evidence_expr = evidence_case_expression(columns);
+    let sql = format!(
+        "SELECT m.row_num, {time_select}, m.category, m.score, m.reason, m.column_name,
+                {evidence_expr}
+         FROM _anomaly m
+         JOIN rows r ON r.row_num = m.row_num
+         {time_join}
+         ORDER BY m.score DESC, m.row_num ASC, m.category ASC"
+    );
+
+    let mut writer = RowWriter::new(
+        worksheet,
+        &sheet_name,
+        state.source_rows,
+        state.total_rows_written,
+        state.on_progress,
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let row_num: i64 = row.get(0)?;
+        let utc_text: String = row.get(1)?;
+        let category: String = row.get(2)?;
+        let score: i64 = row.get(3)?;
+        let reason: String = row.get(4)?;
+        let matched_column: String = row.get(5)?;
+        let evidence: String = row.get(6)?;
+        writer.write_cells(
+            row_num,
+            &[
+                utc_text.as_str(),
+                crate::intel::anomaly::category_label(&category),
+                &score.to_string(),
+                reason.as_str(),
+                matched_column.as_str(),
+                evidence.as_str(),
+            ],
+        )?;
     }
 
     writer.finish_sheet();
@@ -3124,6 +3439,66 @@ mod tests {
             .filter(|name| !matches!(name.as_str(), "General" | "Timeline"))
             .count();
         assert_eq!(category_sheets, 0);
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn report_includes_attack_story_and_anomalies_sheets_when_data_exists() {
+        let (mut conn, columns) = setup_report_fixture(true);
+        conn.execute(
+            "INSERT INTO _intel_chain (
+                chain_id, host, start_epoch_ms, end_epoch_ms, first_row, last_row,
+                tactic_count, event_count, row_count, score,
+                tactic_names, technique_names, sample_rows
+             ) VALUES (1, NULL, 1767225660000, 1767225720000, 1, 2, 2, 2, 2, 95,
+                       '[\"Execution\",\"Credential Access\"]',
+                       '[\"PowerShell\",\"OS Credential Dumping\"]', '[1,2]')",
+            [],
+        )
+        .unwrap();
+        db::create_anomaly_schema(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO _anomaly (row_num, category, score, reason, column_name) VALUES
+                (1, 'encoded_blob', 70, 'encoded-command indicator', 'processcommandline'),
+                (3, 'off_hours', 20, 'activity at night', '');",
+        )
+        .unwrap();
+        let path = temp_report_path("story-and-anomalies");
+
+        let summary = export_report(&mut conn, &columns, &path, |_, _| {}).unwrap();
+        assert!(summary.sheets_written.contains(&"Attack Story".to_string()));
+        assert!(summary.sheets_written.contains(&"Anomalies".to_string()));
+
+        let mut workbook = calamine::open_workbook_auto(&path).unwrap();
+        let story = workbook.worksheet_range("Attack Story").unwrap();
+        let story_rows: Vec<Vec<String>> = story
+            .rows()
+            .skip(1)
+            .map(|row| row.iter().map(|cell| cell.to_string()).collect())
+            .collect();
+        assert_eq!(story_rows[0][2], "chain summary");
+        assert!(story_rows[0][7].contains("Execution → Credential Access"));
+        let events: Vec<&Vec<String>> = story_rows
+            .iter()
+            .filter(|row| row[2] == "event")
+            .collect();
+        assert_eq!(events.len(), 2, "{story_rows:?}");
+        assert!(events
+            .iter()
+            .all(|row| row[0] == "1" || row[0] == "2"), "{events:?}");
+        assert!(events[0][7].contains("Execution activity (PowerShell)"));
+
+        let anomalies = workbook.worksheet_range("Anomalies").unwrap();
+        let anomaly_rows: Vec<Vec<String>> = anomalies
+            .rows()
+            .skip(1)
+            .map(|row| row.iter().map(|cell| cell.to_string()).collect())
+            .collect();
+        assert_eq!(anomaly_rows.len(), 2);
+        assert_eq!(anomaly_rows[0][2], "Encoded/obfuscated content");
+        assert!(anomaly_rows[0][6].contains("powershell.exe -nop -enc"));
+        assert_eq!(anomaly_rows[1][2], "Off-hours activity");
 
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }

@@ -20,6 +20,14 @@
   const progressFill = document.getElementById("progress-fill");
   const progressLabel = document.getElementById("progress-label");
 
+  const analystPanel = document.getElementById("analyst-panel");
+  const analystHeadline = document.getElementById("analyst-headline");
+  const analystStatus = document.getElementById("analyst-status");
+  const analystSections = document.getElementById("analyst-sections");
+  const analystSteps = document.getElementById("analyst-steps");
+  const analystReportBtn = document.getElementById("analyst-report-btn");
+  const analystPanelClose = document.getElementById("analyst-panel-close");
+
   const guidedQueryPanel = document.getElementById("guided-query-panel");
   const guidedAiStatus = document.getElementById("guided-ai-status");
   const guidedPreviewText = document.getElementById("guided-preview-text");
@@ -120,6 +128,8 @@
   let reportSummaryResult = null;
   let reportExportSequence = 0;
   let activeReportExport = null;
+  let analystRequestSequence = 0;
+  let activeAnalystRequest = null;
   let roleDetectionInFlight = false;
   let roleDetectionError = null;
   let roleDetectionRequestSequence = 0;
@@ -304,7 +314,11 @@
 
   function resetGuidedQueryUi({ invalidateDataset = true } = {}) {
     cancelSearchDebounce();
-    if (invalidateDataset) invalidateGuidedContext();
+    if (invalidateDataset) {
+      invalidateGuidedContext();
+      activeAnalystRequest = null;
+      hideAnalystPanel();
+    }
     queryMode = "normal";
     activeEvidenceQuery = null;
     guidedParseResult = null;
@@ -2582,6 +2596,166 @@
     }
   }
 
+  // -- AI analyst ----------------------------------------------------------------
+
+  const ANALYST_PHASE_LABELS = {
+    mapping: "Detecting column roles...",
+    timeline: "Normalizing timestamps...",
+    "mitre-scan": "Scanning for MITRE-mapped activity and chains...",
+    "anomaly-scan": "Running the wide-net anomaly scan...",
+    compose: "Writing the answer...",
+  };
+
+  const ANALYST_STEP_LABELS = {
+    data_mapping: "Data mapping",
+    timeline: "Timeline",
+    mitre_scan: "MITRE scan",
+    anomaly_scan: "Anomaly scan",
+  };
+
+  function analystRequestIsCurrent(request) {
+    return (
+      activeAnalystRequest === request &&
+      currentPath === request.path &&
+      currentSheet === request.sheet
+    );
+  }
+
+  function hideAnalystPanel() {
+    analystPanel.classList.add("hidden");
+    analystReportBtn.classList.add("hidden");
+  }
+
+  function scrollGridToRow(rowNum) {
+    if (!table) return false;
+    const target = table
+      .getRows()
+      .find((row) => row.getData().row_num === rowNum);
+    if (!target) return false;
+    table.scrollToRow(target, "center", false);
+    target.getElement().classList.add("analyst-row-flash");
+    setTimeout(() => target.getElement().classList.remove("analyst-row-flash"), 1600);
+    return true;
+  }
+
+  function renderAnalystAnswer(answer) {
+    analystHeadline.textContent = answer.headline || "AI analyst";
+    analystSections.innerHTML = "";
+    (answer.sections || []).forEach((section) => {
+      const heading = document.createElement("h4");
+      heading.className = "analyst-section-heading";
+      heading.textContent = section.heading;
+      analystSections.appendChild(heading);
+      (section.lines || []).forEach((line) => {
+        const paragraph = document.createElement("p");
+        paragraph.className = "analyst-line";
+        paragraph.appendChild(document.createTextNode(line.text + " "));
+        (line.rows || []).forEach((rowNum) => {
+          const chip = document.createElement("button");
+          chip.type = "button";
+          chip.className = "analyst-row-chip";
+          chip.textContent = `row ${rowNum}`;
+          chip.title = "Scroll the grid to this source row (when it is on the current page)";
+          chip.addEventListener("click", () => {
+            if (!scrollGridToRow(rowNum)) {
+              aiSearchAvailability.textContent = `Row ${rowNum} is not on the current grid page. Clear filters or page to it; the row number always refers to the imported sheet.`;
+              aiSearchAvailability.classList.remove("ready");
+            }
+          });
+          paragraph.appendChild(chip);
+        });
+        analystSections.appendChild(paragraph);
+      });
+    });
+
+    const steps = answer.steps || [];
+    if (steps.length > 0) {
+      analystSteps.textContent = `Pipeline: ${steps
+        .map((step) => `${ANALYST_STEP_LABELS[step.step] || step.step} ${step.status} (${step.detail})`)
+        .join(" · ")}`;
+      analystSteps.classList.remove("hidden");
+    } else {
+      analystSteps.classList.add("hidden");
+    }
+
+    analystStatus.classList.add("hidden");
+    analystReportBtn.classList.toggle("hidden", !answer.reportRequested);
+    analystPanel.classList.remove("hidden");
+
+    if (answer.scan) {
+      renderScanSummary(answer.scan);
+    }
+  }
+
+  async function askAnalyst(trimmed) {
+    const request = {
+      id: ++analystRequestSequence,
+      path: currentPath,
+      sheet: currentSheet,
+    };
+    activeAnalystRequest = request;
+    guidedSearchSubmit.disabled = true;
+    analystHeadline.textContent = "AI analyst";
+    analystSections.innerHTML = "";
+    analystSteps.classList.add("hidden");
+    analystReportBtn.classList.add("hidden");
+    analystStatus.textContent = "The analyst is looking at the file...";
+    analystStatus.classList.remove("hidden");
+    analystPanel.classList.remove("hidden");
+    try {
+      const answer = await invoke("ask_analyst", {
+        askText: trimmed,
+        requestId: request.id,
+      });
+      if (!analystRequestIsCurrent(request)) return null;
+      return answer;
+    } finally {
+      if (activeAnalystRequest === request) {
+        activeAnalystRequest = null;
+      }
+      guidedSearchSubmit.disabled = !controlsEnabled;
+      analystStatus.classList.add("hidden");
+    }
+  }
+
+  async function routeAnalystAsk() {
+    const trimmed = guidedSearchBox.value.trim();
+    if (!trimmed) return;
+    if (
+      activeAnalystRequest !== null ||
+      guidedActiveParse !== null ||
+      guidedActiveAction !== null ||
+      guidedActiveQuery !== null ||
+      activeDataRequest !== null ||
+      activeReportExport !== null ||
+      sheetLoadInFlight
+    ) {
+      return;
+    }
+    let answer;
+    try {
+      answer = await askAnalyst(trimmed);
+    } catch (err) {
+      hideAnalystPanel();
+      throw err;
+    }
+    if (!answer) return;
+    if (answer.useGuidedSearch) {
+      // Filter-shaped asks keep the existing audited preview/run search flow.
+      hideAnalystPanel();
+      await searchGuidedQuery();
+      return;
+    }
+    renderAnalystAnswer(answer);
+    // The pipeline may have added role suggestions and a normalized timeline; refresh the
+    // mapping panel so the sidebar reflects what actually ran.
+    if ((answer.steps || []).some((step) => step.step === "data_mapping" && step.status === "ran")) {
+      detectColumnRolesForLoadedFile().catch((err) =>
+        console.error("post-analyst mapping refresh failed", err)
+      );
+    }
+  }
+
   // -- event wiring --------------------------------------------------------------
 
   openFileBtn.addEventListener("click", () => {
@@ -2625,7 +2799,11 @@
   });
   guidedSearchForm.addEventListener("submit", (event) => {
     event.preventDefault();
-    searchGuidedQuery().catch((err) => alert(`Evidence search failed: ${err}`));
+    routeAnalystAsk().catch((err) => alert(`AI analyst failed: ${err}`));
+  });
+  analystPanelClose.addEventListener("click", hideAnalystPanel);
+  analystReportBtn.addEventListener("click", () => {
+    doReportExport();
   });
   guidedRunBtn.addEventListener("click", () => {
     const retrying = guidedRunBtn.textContent === "Retry search";
@@ -2785,6 +2963,16 @@
     renderSemanticIndexState();
   });
 
+  listen("analyst-progress", (event) => {
+    const payload = event?.payload;
+    if (!payload || activeAnalystRequest === null || payload.requestId !== activeAnalystRequest.id) {
+      return;
+    }
+    analystStatus.textContent =
+      ANALYST_PHASE_LABELS[payload.phase] || `Working: ${payload.phase}...`;
+    analystStatus.classList.remove("hidden");
+  });
+
   listen("report-export-progress", (event) => {
     const { requestId, rowsDone, sheet } = event.payload;
     if (
@@ -2832,6 +3020,14 @@
     },
     getState() {
       return { spec, hasMore, pageIndex, totalCount, columns };
+    },
+    async askAnalystForTest(text) {
+      if (!text) {
+        throw new Error("askAnalystForTest(text): text is required");
+      }
+      const answer = await askAnalyst(String(text));
+      if (answer && !answer.useGuidedSearch) renderAnalystAnswer(answer);
+      return answer;
     },
     getIntelState() {
       return {

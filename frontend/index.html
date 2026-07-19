@@ -24,16 +24,16 @@
       <div class="ai-search-heading-row">
         <div>
           <div class="ai-search-title-line">
-            <h1 id="ai-search-heading">AI evidence search (offline)</h1>
+            <h1 id="ai-search-heading">AI analyst (offline)</h1>
             <span class="offline-badge">On-device</span>
           </div>
-          <p>Describe the evidence you need. The local AI searches the imported table directly; threat enrichment is optional.</p>
+          <p>Ask anything: &ldquo;what is in this file&rdquo;, &ldquo;map this to MITRE&rdquo;, &ldquo;find chained activity&rdquo;, &ldquo;make a report&rdquo; &mdash; or describe evidence to filter the table.</p>
         </div>
       </div>
       <form id="guided-search-form" class="guided-search-form">
         <label for="guided-search-box" class="sr-only">Describe evidence to find</label>
-        <input id="guided-search-box" type="search" maxlength="4096" placeholder="Example: failed logons for alice, then show related PowerShell activity chronologically" disabled />
-        <button id="guided-search-submit" class="btn btn-primary" disabled>Search evidence</button>
+        <input id="guided-search-box" type="search" maxlength="4096" placeholder="Example: what is in this file? &mdash; or: failed logons for alice chronologically" disabled />
+        <button id="guided-search-submit" class="btn btn-primary" disabled>Ask</button>
         <button id="guided-reset-btn" type="button" class="btn hidden">Clear AI search</button>
       </form>
       <div id="ai-search-availability" class="ai-search-availability" aria-live="polite">Import a file to search its evidence.</div>
@@ -44,6 +44,19 @@
       <div id="progress-bar"><div id="progress-fill"></div></div>
       <div id="progress-label"></div>
     </div>
+
+    <section id="analyst-panel" class="intel-panel analyst-panel hidden" aria-live="polite">
+      <div class="intel-panel-header">
+        <strong id="analyst-headline">AI analyst</strong>
+        <button id="analyst-panel-close" class="btn btn-small" title="Dismiss analyst answer" aria-label="Dismiss analyst answer">&times;</button>
+      </div>
+      <div id="analyst-status" class="intel-panel-note hidden"></div>
+      <div id="analyst-sections" class="intel-panel-body analyst-sections"></div>
+      <div id="analyst-steps" class="analyst-steps hidden"></div>
+      <div class="intel-panel-actions">
+        <button id="analyst-report-btn" class="btn btn-primary hidden">Generate report&hellip;</button>
+      </div>
+    </section>
 
     <section id="guided-query-panel" class="intel-panel guided-query-panel hidden" aria-live="polite">
       <div class="intel-panel-header">

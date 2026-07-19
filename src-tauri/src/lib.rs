@@ -44,6 +44,7 @@ pub fn run() {
             commands::export_data,
             commands::export_guided_data,
             commands::scan_intel_matches,
+            commands::ask_analyst,
             commands::export_report,
         ])
         .run(tauri::generate_context!())

@@ -661,6 +661,25 @@ pub fn retire_row_time_operation(
     .map(|changed| changed == 1)
 }
 
+pub fn create_anomaly_schema(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS _anomaly (
+            row_num INTEGER NOT NULL,
+            category TEXT NOT NULL,
+            score INTEGER NOT NULL,
+            reason TEXT NOT NULL,
+            column_name TEXT NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS idx_anomaly_row ON _anomaly(row_num);
+         CREATE INDEX IF NOT EXISTS idx_anomaly_category ON _anomaly(category, row_num);
+         CREATE TABLE IF NOT EXISTS _anomaly_info (
+            rows_scanned INTEGER NOT NULL,
+            finding_count INTEGER NOT NULL,
+            completed_at TEXT NOT NULL
+         );",
+    )
+}
+
 pub fn create_intel_schema(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS _intel_match (

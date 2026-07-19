@@ -1,5 +1,6 @@
 use crate::db::{self, ColumnMeta, ImportInfo};
 use crate::export;
+use crate::intel::analyst::{self, AnalystAnswer};
 use crate::intel::matcher::{self, IntelScanSummary};
 use crate::intel::{llm_parser, parser as guided_parser, query as guided_query, roles, time};
 use crate::query::{self, QueryExpression, QueryPage, QuerySpec};
@@ -1474,6 +1475,50 @@ pub async fn scan_intel_matches(
     })
     .await
     .map_err(|e| format!("intel scan task join error: {e}"))?
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AnalystProgressPayload {
+    request_id: u64,
+    phase: String,
+}
+
+#[tauri::command]
+pub async fn ask_analyst(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    ask_text: String,
+    request_id: u64,
+) -> Result<AnalystAnswer, String> {
+    let trimmed = ask_text.trim().to_string();
+    if trimmed.is_empty() {
+        return Err("ask the analyst something first".to_string());
+    }
+    let (db_path, columns, generation) = state_snapshot(&state)?;
+    let answered_db_path = db_path.clone();
+    let app_for_progress = app.clone();
+    let answer = tauri::async_runtime::spawn_blocking(move || -> Result<AnalystAnswer, String> {
+        let mut conn = db::open(&db_path).map_err(|e| e.to_string())?;
+        analyst::ask(&mut conn, &columns, &trimmed, |phase| {
+            let _ = app_for_progress.emit(
+                "analyst-progress",
+                AnalystProgressPayload {
+                    request_id,
+                    phase: phase.to_string(),
+                },
+            );
+        })
+        .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("analyst task join error: {e}"))??;
+    // A long pipeline run must not publish an answer about a file that is no longer loaded.
+    if !loaded_generation_is_current(&state, &answered_db_path, generation)? {
+        return Err("the analyst run was superseded because the loaded file or sheet changed"
+            .to_string());
+    }
+    Ok(answer)
 }
 
 #[tauri::command]

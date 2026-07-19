@@ -480,7 +480,11 @@ mod tests {
             .join("mitre_core.v1.json");
         let raw = std::fs::read_to_string(&path).unwrap();
         verify_builtin_library_checksum(&path, &raw).unwrap();
-        verify_builtin_library_checksum(&path, &raw.replace('\n', "\r\n")).unwrap();
+        // The on-disk file may be LF or CRLF depending on git's autocrlf at checkout time.
+        // Build both variants from the normalized form so the round-trip claim holds either way.
+        let lf = normalize_line_endings(&raw);
+        verify_builtin_library_checksum(&path, &lf).unwrap();
+        verify_builtin_library_checksum(&path, &lf.replace('\n', "\r\n")).unwrap();
 
         let modified = format!("{raw}\n");
         let error = verify_builtin_library_checksum(&path, &modified).unwrap_err();

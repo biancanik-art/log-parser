@@ -224,7 +224,10 @@ pub fn publish_chains(conn: &Connection, chains: &[IntelChainSummary]) -> Result
     Ok(())
 }
 
-fn detect_host_column(conn: &Connection) -> Result<Option<String>> {
+/// The chain grouping host column: the examiner's (or detector's) non-rejected `host`
+/// mapping. Shared with the report's Attack Story sheet so story reconstruction filters by
+/// the same column the chains were grouped on.
+pub fn detect_host_column(conn: &Connection) -> Result<Option<String>> {
     if !table_exists(conn, "_column_roles")? {
         return Ok(None);
     }
