@@ -1,4 +1,5 @@
 use crate::db::{self, ColumnMeta};
+use crate::intel::activity::{self, ActivityScanSummary};
 use crate::intel::anomaly::{self, AnomalyScanSummary};
 use crate::intel::matcher::{self, IntelScanSummary};
 use crate::intel::query as guided_query;
@@ -69,6 +70,7 @@ pub struct AnalystAnswer {
     pub use_guided_search: bool,
     pub scan: Option<IntelScanSummary>,
     pub anomalies: Option<AnomalyScanSummary>,
+    pub activity: Option<ActivityScanSummary>,
 }
 
 /// Classifies a free-text ask. Everything the analyst can answer itself runs the pipeline;
@@ -114,7 +116,19 @@ pub fn classify_ask(text: &str) -> AnalystIntent {
         "tell me about",
         "what happened",
         "what do we have",
+        "row by row",
+        "line by line",
+        "every row",
+        "each row",
+        "what activity",
+        "which activity",
+        "activity is there",
+        "all activity",
+        "all the activity",
     ]) || has_word(&[
+        "parse",
+        "parsed",
+        "parsing",
         "overview",
         "summary",
         "summarize",
@@ -179,6 +193,7 @@ pub fn ask(
             use_guided_search: true,
             scan: None,
             anomalies: None,
+            activity: None,
         });
     }
 
@@ -326,12 +341,37 @@ pub fn ask(
         }),
     }
 
+    // Step 5: per-row activity classification — every row gets a label, so "what activity is
+    // there row by row" can be answered about the whole file, not just the suspicious slice.
+    on_progress("activity");
+    let mut activity_summary = None;
+    match activity::classify_rows(conn, columns, |_, _, _| {}) {
+        Ok(summary) => {
+            steps.push(AnalystStep {
+                step: "activity".to_string(),
+                status: "ran".to_string(),
+                detail: format!(
+                    "classified all {} rows into {} activity types",
+                    summary.rows_classified,
+                    summary.categories.len()
+                ),
+            });
+            activity_summary = Some(summary);
+        }
+        Err(error) => steps.push(AnalystStep {
+            step: "activity".to_string(),
+            status: "failed".to_string(),
+            detail: error.to_string(),
+        }),
+    }
+
     on_progress("compose");
     let sections = compose_sections(
         conn,
         columns,
         scan_summary.as_ref(),
         anomaly_summary.as_ref(),
+        activity_summary.as_ref(),
     )?;
     let headline = compose_headline(scan_summary.as_ref(), anomaly_summary.as_ref());
 
@@ -344,6 +384,7 @@ pub fn ask(
         use_guided_search: false,
         scan: scan_summary,
         anomalies: anomaly_summary,
+        activity: activity_summary,
     })
 }
 
@@ -394,9 +435,50 @@ fn compose_sections(
     columns: &[ColumnMeta],
     scan: Option<&IntelScanSummary>,
     anomalies: Option<&AnomalyScanSummary>,
+    activity: Option<&ActivityScanSummary>,
 ) -> Result<Vec<AnalystSection>> {
     let mut sections = Vec::new();
     sections.push(dataset_section(conn, columns)?);
+
+    if let Some(activity) = activity {
+        let mut lines = Vec::new();
+        lines.push(AnalystLine {
+            text: format!(
+                "All {} rows classified into {} activity types.",
+                activity.rows_classified,
+                activity.categories.len()
+            ),
+            rows: Vec::new(),
+        });
+        for category in &activity.categories {
+            let share = if activity.rows_classified > 0 {
+                (category.row_count as f64 / activity.rows_classified as f64) * 100.0
+            } else {
+                0.0
+            };
+            let top = if category.top_details.is_empty() {
+                String::new()
+            } else {
+                let described: Vec<String> = category
+                    .top_details
+                    .iter()
+                    .map(|detail| format!("'{}' ({} rows)", detail.detail, detail.row_count))
+                    .collect();
+                format!(" Most common: {}.", described.join(", "))
+            };
+            lines.push(AnalystLine {
+                text: format!(
+                    "{}: {} rows ({share:.1}%).{top}",
+                    category.label, category.row_count
+                ),
+                rows: Vec::new(),
+            });
+        }
+        sections.push(AnalystSection {
+            heading: "Activity, row by row".to_string(),
+            lines,
+        });
+    }
 
     if let Some(scan) = scan {
         let mut lines = Vec::new();
@@ -684,6 +766,10 @@ mod tests {
         );
         assert_eq!(classify_ask("what happened here?"), AnalystIntent::Profile);
         assert_eq!(
+            classify_ask("parse this xls and find me row by row what activity is there"),
+            AnalystIntent::Profile
+        );
+        assert_eq!(
             classify_ask("filter me this xls by the attacks of this user"),
             AnalystIntent::Search
         );
@@ -774,6 +860,14 @@ mod tests {
         assert_eq!(step_status.get("timeline"), Some(&"ran"));
         assert_eq!(step_status.get("mitre_scan"), Some(&"ran"));
         assert_eq!(step_status.get("anomaly_scan"), Some(&"ran"));
+        assert_eq!(step_status.get("activity"), Some(&"ran"));
+
+        let activity = answer.activity.as_ref().expect("activity summary");
+        assert_eq!(activity.rows_classified, 6);
+        assert!(answer
+            .sections
+            .iter()
+            .any(|section| section.heading == "Activity, row by row"));
 
         let scan = answer.scan.as_ref().expect("scan summary");
         assert!(scan.match_count > 0, "curated scan should hit planted rows");

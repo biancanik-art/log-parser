@@ -680,6 +680,23 @@ pub fn create_anomaly_schema(conn: &Connection) -> rusqlite::Result<()> {
     )
 }
 
+pub fn create_activity_schema(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS _row_activity (
+            row_num INTEGER PRIMARY KEY,
+            category TEXT NOT NULL,
+            detail TEXT NOT NULL,
+            source_column TEXT NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS idx_row_activity_category
+            ON _row_activity(category, row_num);
+         CREATE TABLE IF NOT EXISTS _row_activity_info (
+            rows_classified INTEGER NOT NULL,
+            completed_at TEXT NOT NULL
+         );",
+    )
+}
+
 pub fn create_intel_schema(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS _intel_match (

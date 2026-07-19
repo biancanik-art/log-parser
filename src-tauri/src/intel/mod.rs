@@ -1,3 +1,4 @@
+pub mod activity;
 pub mod analyst;
 pub mod anomaly;
 pub mod chains;

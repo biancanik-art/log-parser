@@ -2603,6 +2603,7 @@
     timeline: "Normalizing timestamps...",
     "mitre-scan": "Scanning for MITRE-mapped activity and chains...",
     "anomaly-scan": "Running the wide-net anomaly scan...",
+    activity: "Classifying every row's activity...",
     compose: "Writing the answer...",
   };
 
@@ -2611,6 +2612,7 @@
     timeline: "Timeline",
     mitre_scan: "MITRE scan",
     anomaly_scan: "Anomaly scan",
+    activity: "Row-by-row activity",
   };
 
   function analystRequestIsCurrent(request) {

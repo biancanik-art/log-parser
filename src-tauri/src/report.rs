@@ -338,6 +338,12 @@ fn write_report_workbook(
             used_sheet_names.insert("semantic audit".to_string());
         }
 
+        let has_activity = table_has_rows(conn, "_row_activity")?;
+        if has_activity {
+            sheets_written.push(write_activity_summary_sheet(conn, &mut write_state)?);
+            used_sheet_names.insert("activity summary".to_string());
+        }
+
         if has_timeline_data {
             sheets_written.push(write_timeline_sheet(
                 conn,
@@ -353,10 +359,13 @@ fn write_report_workbook(
             used_sheet_names.insert("attack story".to_string());
         }
         // Reserved ahead of the tactic loop so a name collision renames the tactic sheet,
-        // not the fixed sheet written afterwards.
+        // not the fixed sheets written afterwards.
         let write_anomalies = table_has_rows(conn, "_anomaly")?;
         if write_anomalies {
             used_sheet_names.insert("anomalies".to_string());
+        }
+        if has_activity {
+            used_sheet_names.insert("row by row".to_string());
         }
 
         for tactic in tactics {
@@ -374,6 +383,11 @@ fn write_report_workbook(
 
         if write_anomalies {
             sheets_written.push(write_anomaly_sheet(conn, columns, &mut write_state)?);
+        }
+
+        // Written last: at full-file scale this is by far the largest sheet.
+        if has_activity {
+            sheets_written.push(write_row_by_row_sheet(conn, &mut write_state)?);
         }
     }
 
@@ -1984,6 +1998,197 @@ where
     Ok(sheet_name)
 }
 
+/// One line per activity category: how much of the file each activity type is, with the most
+/// common operation values. Anchored to the first source row like the General sheet so the
+/// row_num back-reference invariant holds for summary lines too.
+fn write_activity_summary_sheet<F>(
+    conn: &Connection,
+    state: &mut ReportWriteState<'_, F>,
+) -> Result<String>
+where
+    F: FnMut(i64, &str),
+{
+    let sheet_name = "Activity Summary".to_string();
+    let first_row_num = first_source_row_num(conn)?;
+    let worksheet = state.workbook.add_worksheet_with_constant_memory();
+    worksheet.set_name(&sheet_name)?;
+    write_headers(
+        worksheet,
+        &["row_num", "activity", "rows", "share_pct", "most_common_operations"],
+    )?;
+    worksheet.set_column_width(0, 11)?;
+    worksheet.set_column_width(1, 32)?;
+    worksheet.set_column_width(2, 12)?;
+    worksheet.set_column_width(3, 10)?;
+    worksheet.set_column_width(4, 90)?;
+
+    let total: i64 = conn.query_row("SELECT COUNT(*) FROM _row_activity", [], |row| row.get(0))?;
+    let mut writer = RowWriter::new(
+        worksheet,
+        &sheet_name,
+        state.source_rows,
+        state.total_rows_written,
+        state.on_progress,
+    );
+    let categories: Vec<(String, i64)> = {
+        let mut stmt = conn.prepare(
+            "SELECT category, COUNT(*) FROM _row_activity
+             GROUP BY category ORDER BY COUNT(*) DESC",
+        )?;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
+    for (category, count) in categories {
+        let top_details: Vec<String> = {
+            let mut stmt = conn.prepare_cached(
+                "SELECT detail, COUNT(*) FROM _row_activity
+                 WHERE category = ?1 AND detail != ''
+                 GROUP BY detail ORDER BY COUNT(*) DESC LIMIT 3",
+            )?;
+            let rows = stmt
+                .query_map([&category], |row| {
+                    Ok(format!(
+                        "{} ({} rows)",
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows
+        };
+        let share = if total > 0 {
+            format!("{:.1}", (count as f64 / total as f64) * 100.0)
+        } else {
+            "0.0".to_string()
+        };
+        writer.write_cells(
+            first_row_num,
+            &[
+                crate::intel::activity::category_label(&category),
+                &count.to_string(),
+                &share,
+                &top_details.join("; "),
+            ],
+        )?;
+    }
+    writer.finish_sheet();
+    Ok(sheet_name)
+}
+
+/// Excel's hard per-sheet limit is 1,048,576 rows; anything beyond it is written as a truncation
+/// notice rather than silently dropped.
+const MAX_ROW_BY_ROW_ROWS: i64 = 1_000_000;
+
+/// The full annotated file: every source row with its activity label, plus the MITRE and
+/// anomaly annotations where they exist. Streams in row order through a constant-memory
+/// worksheet so a 500k-row file cannot balloon the report's memory use.
+fn write_row_by_row_sheet<F>(
+    conn: &Connection,
+    state: &mut ReportWriteState<'_, F>,
+) -> Result<String>
+where
+    F: FnMut(i64, &str),
+{
+    let sheet_name = "Row by Row".to_string();
+    let worksheet = state.workbook.add_worksheet_with_constant_memory();
+    worksheet.set_name(&sheet_name)?;
+    write_headers(
+        worksheet,
+        &[
+            "row_num",
+            "utc_timestamp",
+            "activity",
+            "detail",
+            "mitre_techniques",
+            "anomaly_flags",
+        ],
+    )?;
+    worksheet.set_column_width(0, 11)?;
+    worksheet.set_column_width(1, 24)?;
+    worksheet.set_column_width(2, 30)?;
+    worksheet.set_column_width(3, 80)?;
+    worksheet.set_column_width(4, 28)?;
+    worksheet.set_column_width(5, 30)?;
+
+    let time_parts = if table_exists(conn, "_row_time")? {
+        (
+            "COALESCE(rt.utc_text, '')",
+            "LEFT JOIN _row_time rt ON rt.row_num = a.row_num",
+        )
+    } else {
+        ("''", "")
+    };
+    let techniques_select = if table_exists(conn, "_intel_match")? {
+        "COALESCE((SELECT GROUP_CONCAT(DISTINCT technique_id)
+                   FROM _intel_match im WHERE im.row_num = a.row_num), '')"
+    } else {
+        "''"
+    };
+    let anomalies_select = if table_exists(conn, "_anomaly")? {
+        "COALESCE((SELECT GROUP_CONCAT(DISTINCT category)
+                   FROM _anomaly an WHERE an.row_num = a.row_num), '')"
+    } else {
+        "''"
+    };
+    let (time_select, time_join) = time_parts;
+    let sql = format!(
+        "SELECT a.row_num, {time_select}, a.category, a.detail,
+                {techniques_select}, {anomalies_select}
+         FROM _row_activity a
+         {time_join}
+         ORDER BY a.row_num ASC
+         LIMIT {}",
+        MAX_ROW_BY_ROW_ROWS + 1
+    );
+
+    let mut writer = RowWriter::new(
+        worksheet,
+        &sheet_name,
+        state.source_rows,
+        state.total_rows_written,
+        state.on_progress,
+    );
+    let mut written = 0i64;
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let row_num: i64 = row.get(0)?;
+        if written >= MAX_ROW_BY_ROW_ROWS {
+            writer.write_cells(
+                row_num,
+                &[
+                    "",
+                    "TRUNCATED",
+                    "sheet reached Excel's row limit; remaining rows are in the app grid",
+                    "",
+                    "",
+                ],
+            )?;
+            break;
+        }
+        let utc_text: String = row.get(1)?;
+        let category: String = row.get(2)?;
+        let detail: String = row.get(3)?;
+        let techniques: String = row.get(4)?;
+        let anomalies: String = row.get(5)?;
+        writer.write_cells(
+            row_num,
+            &[
+                utc_text.as_str(),
+                crate::intel::activity::category_label(&category),
+                detail.as_str(),
+                techniques.as_str(),
+                anomalies.as_str(),
+            ],
+        )?;
+        written += 1;
+    }
+    writer.finish_sheet();
+    Ok(sheet_name)
+}
+
 fn write_tactic_sheet<F>(
     conn: &Connection,
     columns: &[ColumnMeta],
@@ -3499,6 +3704,55 @@ mod tests {
         assert_eq!(anomaly_rows[0][2], "Encoded/obfuscated content");
         assert!(anomaly_rows[0][6].contains("powershell.exe -nop -enc"));
         assert_eq!(anomaly_rows[1][2], "Off-hours activity");
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn report_includes_activity_summary_and_row_by_row_sheets_when_classified() {
+        let (mut conn, columns) = setup_report_fixture(true);
+        crate::intel::activity::classify_rows(&mut conn, &columns, |_, _, _| {}).unwrap();
+        let path = temp_report_path("activity-sheets");
+
+        let summary = export_report(&mut conn, &columns, &path, |_, _| {}).unwrap();
+        assert!(summary
+            .sheets_written
+            .contains(&"Activity Summary".to_string()));
+        assert_eq!(
+            summary.sheets_written.last().map(String::as_str),
+            Some("Row by Row"),
+            "the full-file sheet must be written last: {:?}",
+            summary.sheets_written
+        );
+
+        let mut workbook = calamine::open_workbook_auto(&path).unwrap();
+        let row_by_row = workbook.worksheet_range("Row by Row").unwrap();
+        let data: Vec<Vec<String>> = row_by_row
+            .rows()
+            .skip(1)
+            .map(|row| row.iter().map(|cell| cell.to_string()).collect())
+            .collect();
+        // Completeness: every source row appears exactly once, in order.
+        let row_nums: Vec<String> = data.iter().map(|row| row[0].clone()).collect();
+        assert_eq!(row_nums, vec!["1", "2", "3"]);
+        // Fixture rows all carry command lines → process activity, with timestamps.
+        assert!(data.iter().all(|row| row[2] == "Process execution"), "{data:?}");
+        assert_eq!(data[0][1], "2026-01-01T00:01:00Z");
+        // MITRE annotations land on the matched rows only.
+        assert!(data[0][4].contains("T1059.001"), "{data:?}");
+        assert!(data[1][4].contains("T1003"), "{data:?}");
+        assert_eq!(data[2][4], "");
+
+        let summary_sheet = workbook.worksheet_range("Activity Summary").unwrap();
+        let summary_rows: Vec<Vec<String>> = summary_sheet
+            .rows()
+            .skip(1)
+            .map(|row| row.iter().map(|cell| cell.to_string()).collect())
+            .collect();
+        assert_eq!(summary_rows.len(), 1, "{summary_rows:?}");
+        assert_eq!(summary_rows[0][1], "Process execution");
+        assert_eq!(summary_rows[0][2], "3");
+        assert_eq!(summary_rows[0][3], "100.0");
 
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
