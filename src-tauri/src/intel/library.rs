@@ -253,10 +253,10 @@ fn verify_builtin_library_checksum(path: &Path, raw: &str) -> Result<()> {
 }
 
 pub fn custom_library_path() -> PathBuf {
-    let base = std::env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir);
-    base.join("log-parser")
+    // User-authored data: must live somewhere the OS never purges (on macOS the previous
+    // LOCALAPPDATA fallback landed in the temp dir, which is cleaned after days of disuse).
+    crate::db::user_data_base_dir()
+        .join("log-parser")
         .join("intel")
         .join("custom_library.v1.json")
 }

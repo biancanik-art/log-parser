@@ -180,6 +180,7 @@ pub struct ImportSummary {
     pub cache_db_path: String,
     pub elapsed_ms: u128,
     pub from_cache: bool,
+    pub released_ai_memory: bool,
 }
 
 #[derive(Serialize, Clone)]
@@ -715,9 +716,30 @@ pub async fn import_sheet(
             return Err(error);
         }
     };
+    // Hand the AI models' memory (the ~1.1 GB guided-search LLM plus the semantic index
+    // model and their inference buffers) back to the OS before the import's own
+    // memory-heavy work starts — on RAM-constrained machines a resident model measurably
+    // slows every later import. Both reload lazily on the next AI use.
+    let released_ai_memory = release_ai_models(&state);
     let result = import_sheet_locked(&app, &state, path, sheet, generation).await;
     state.busy.store(false, Ordering::SeqCst);
-    result
+    result.map(|mut summary| {
+        summary.released_ai_memory = released_ai_memory;
+        summary
+    })
+}
+
+/// Drops any resident AI models. `try_lock` so an in-flight AI operation keeps the model it
+/// is using — skipping the release then is correct, not a failure.
+fn release_ai_models(state: &AppState) -> bool {
+    let mut released = false;
+    if let Ok(mut slot) = state.llm.try_lock() {
+        released |= slot.take().is_some();
+    }
+    if let Ok(mut slot) = state.semantic.try_lock() {
+        released |= slot.take().is_some();
+    }
+    released
 }
 
 /// Does the actual work of `import_sheet`, once the `busy` guard is held. The cache file at
@@ -850,6 +872,7 @@ async fn import_sheet_locked(
         cache_db_path: db_path.display().to_string(),
         elapsed_ms: start.elapsed().as_millis(),
         from_cache,
+        released_ai_memory: false,
     })
 }
 
@@ -1576,6 +1599,17 @@ mod tests {
     use rusqlite::Connection;
 
     const SELECTION_ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    #[test]
+    fn release_ai_models_is_a_no_op_on_empty_state_and_skips_held_locks() {
+        let state = AppState::default();
+        assert!(!release_ai_models(&state), "nothing resident → nothing released");
+
+        // A lock held by an in-flight AI operation must be skipped, not blocked on.
+        let semantic_guard = state.semantic.lock().unwrap();
+        assert!(!release_ai_models(&state));
+        drop(semantic_guard);
+    }
 
     fn test_columns() -> Vec<ColumnMeta> {
         vec![ColumnMeta {

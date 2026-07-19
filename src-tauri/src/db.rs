@@ -81,11 +81,35 @@ pub fn quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
-fn cache_dir() -> Result<PathBuf> {
-    let base = std::env::var_os("LOCALAPPDATA")
+/// Per-user base for regenerable app data. Windows: %LOCALAPPDATA%. macOS:
+/// ~/Library/Caches — NOT the temp dir, which the OS purges after a few days of disuse and
+/// silently forces full re-imports. Anything else falls back to the temp dir.
+pub fn cache_base_dir() -> PathBuf {
+    #[cfg(target_os = "macos")]
+    if let Some(home) = std::env::var_os("HOME") {
+        return PathBuf::from(home).join("Library").join("Caches");
+    }
+    std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir);
-    let dir = base.join("log-parser").join("cache");
+        .unwrap_or_else(std::env::temp_dir)
+}
+
+/// Per-user base for data the user authored (custom libraries): survives cache cleanup.
+/// Windows: %LOCALAPPDATA%. macOS: ~/Library/Application Support.
+pub fn user_data_base_dir() -> PathBuf {
+    #[cfg(target_os = "macos")]
+    if let Some(home) = std::env::var_os("HOME") {
+        return PathBuf::from(home)
+            .join("Library")
+            .join("Application Support");
+    }
+    std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+}
+
+fn cache_dir() -> Result<PathBuf> {
+    let dir = cache_base_dir().join("log-parser").join("cache");
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("creating cache dir {}", dir.display()))?;
     Ok(dir)
