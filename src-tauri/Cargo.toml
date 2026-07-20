@@ -1,6 +1,6 @@
 [package]
 name = "log-parser"
-version = "0.2.4"
+version = "0.2.5"
 description = "Fast generic viewer/filter for large Excel exports (Sentinel, Taegis, Defender, etc.)"
 authors = ["log-parser contributors"]
 edition = "2021"
