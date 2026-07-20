@@ -436,6 +436,53 @@ select { font: inherit; }
 
 .enrichment-intro { margin: -2px 0 9px; }
 
+.ignore-rule-row {
+  grid-template-columns: minmax(140px, 0.8fr) minmax(220px, 1.4fr) auto;
+}
+
+.ignore-rule-condition {
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.role-badge.builtin {
+  border-color: var(--text-muted);
+}
+
+.role-badge.custom {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.role-badge.disabled-rule {
+  border-color: var(--border-strong);
+  color: var(--text-muted);
+  text-decoration: line-through;
+}
+
+.add-ignore-rule-form {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+}
+
+.add-ignore-rule-form input,
+.add-ignore-rule-form select {
+  padding: 5px 8px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg);
+  color: var(--text);
+}
+
+.add-ignore-rule-form input[type="text"] { flex: 1; min-width: 140px; }
+#ignore-rule-values { min-width: 180px; }
+
 .scan-summary { margin-top: 8px; }
 
 .scan-summary-row {

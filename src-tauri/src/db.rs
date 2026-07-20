@@ -730,6 +730,44 @@ pub fn create_activity_schema(conn: &Connection) -> rusqlite::Result<()> {
     )
 }
 
+pub fn create_ignore_rows_schema(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS _ignored_rows (
+            row_num INTEGER PRIMARY KEY,
+            rule_id TEXT NOT NULL,
+            rule_name TEXT NOT NULL,
+            matched_column TEXT NOT NULL,
+            matched_value TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS _ignore_rules_meta (
+            singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+            rules_hash TEXT NOT NULL,
+            rule_count INTEGER NOT NULL,
+            rows_ignored INTEGER NOT NULL,
+            computed_at TEXT NOT NULL
+         );",
+    )
+}
+
+/// Per-file ignore-rule state: which built-in rules this file has toggled away from their
+/// shipped default, and any rules this file's examiner authored themselves. Scoped to this
+/// database like `_column_roles` — a rule enabled/added while working one file never affects
+/// any other file.
+pub fn create_ignore_rule_state_schema(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS _ignore_rule_overrides (
+            rule_id TEXT PRIMARY KEY,
+            enabled INTEGER NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS _custom_ignore_rules (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            enabled INTEGER NOT NULL,
+            conditions_json TEXT NOT NULL
+         );",
+    )
+}
+
 pub fn create_intel_schema(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS _intel_match (

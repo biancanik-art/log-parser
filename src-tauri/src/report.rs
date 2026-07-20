@@ -320,6 +320,11 @@ fn write_report_workbook(
         )?);
         used_sheet_names.insert("general".to_string());
 
+        if table_has_rows(conn, "_ignored_rows")? {
+            sheets_written.push(write_ignored_rows_sheet(conn, &mut write_state)?);
+            used_sheet_names.insert("ignored rows".to_string());
+        }
+
         if table_has_rows(conn, "_llm_parse_audit")? {
             sheets_written.push(write_llm_audit_sheet(conn, &mut write_state)?);
             used_sheet_names.insert("ai audit".to_string());
@@ -1996,6 +2001,82 @@ where
                 reason.as_str(),
                 matched_column.as_str(),
                 evidence.as_str(),
+            ],
+        )?;
+    }
+
+    writer.finish_sheet();
+    Ok(sheet_name)
+}
+
+/// Chain-of-custody visibility for the ignore-rules feature: every row excluded from MITRE
+/// matching, activity classification, anomaly scanning, and semantic indexing, with the rule
+/// and matched cell that caused the exclusion. Suppressed rows must always be traceable by an
+/// examiner reviewing the report, never silently gone — this sheet is that trace.
+fn write_ignored_rows_sheet<F>(
+    conn: &Connection,
+    state: &mut ReportWriteState<'_, F>,
+) -> Result<String>
+where
+    F: FnMut(i64, &str),
+{
+    let sheet_name = "Ignored Rows".to_string();
+    let worksheet = state.workbook.add_worksheet_with_constant_memory();
+    worksheet.set_name(&sheet_name)?;
+    write_headers(
+        worksheet,
+        &[
+            "row_num",
+            "utc_timestamp",
+            "rule_name",
+            "matched_column",
+            "matched_value",
+        ],
+    )?;
+    worksheet.set_column_width(0, 11)?;
+    worksheet.set_column_width(1, 24)?;
+    worksheet.set_column_width(2, 40)?;
+    worksheet.set_column_width(3, 24)?;
+    worksheet.set_column_width(4, 60)?;
+
+    let has_row_time = table_exists(conn, "_row_time")?;
+    let (time_select, time_join) = if has_row_time {
+        (
+            "COALESCE(rt.utc_text, '')",
+            "LEFT JOIN _row_time rt ON rt.row_num = ir.row_num",
+        )
+    } else {
+        ("''", "")
+    };
+    let sql = format!(
+        "SELECT ir.row_num, {time_select}, ir.rule_name, ir.matched_column, ir.matched_value
+         FROM _ignored_rows ir
+         {time_join}
+         ORDER BY ir.row_num ASC"
+    );
+
+    let mut writer = RowWriter::new(
+        worksheet,
+        &sheet_name,
+        state.source_rows,
+        state.total_rows_written,
+        state.on_progress,
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let row_num: i64 = row.get(0)?;
+        let utc_text: String = row.get(1)?;
+        let rule_name: String = row.get(2)?;
+        let matched_column: String = row.get(3)?;
+        let matched_value: String = row.get(4)?;
+        writer.write_cells(
+            row_num,
+            &[
+                utc_text.as_str(),
+                rule_name.as_str(),
+                matched_column.as_str(),
+                matched_value.as_str(),
             ],
         )?;
     }
@@ -3739,6 +3820,49 @@ mod tests {
         assert_eq!(anomaly_rows[0][2], "Encoded/obfuscated content");
         assert!(anomaly_rows[0][6].contains("powershell.exe -nop -enc"));
         assert_eq!(anomaly_rows[1][2], "Off-hours activity");
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn report_includes_ignored_rows_sheet_when_present() {
+        let (mut conn, columns) = setup_report_fixture(true);
+        db::create_ignore_rows_schema(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO _ignored_rows (row_num, rule_id, rule_name, matched_column, matched_value)
+             VALUES (2, 'qualys-agent-activity', 'Qualys Cloud Agent process activity',
+                     'processname', 'QualysAgent.exe')",
+            [],
+        )
+        .unwrap();
+        let path = temp_report_path("ignored-rows-sheet");
+
+        let summary = export_report(&mut conn, &columns, &path, |_, _| {}).unwrap();
+        assert!(summary.sheets_written.contains(&"Ignored Rows".to_string()));
+
+        let mut workbook = calamine::open_workbook_auto(&path).unwrap();
+        let sheet = workbook.worksheet_range("Ignored Rows").unwrap();
+        let rows: Vec<Vec<String>> = sheet
+            .rows()
+            .skip(1)
+            .map(|row| row.iter().map(|cell| cell.to_string()).collect())
+            .collect();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0], "2");
+        assert_eq!(rows[0][2], "Qualys Cloud Agent process activity");
+        assert_eq!(rows[0][3], "processname");
+        assert_eq!(rows[0][4], "QualysAgent.exe");
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn report_omits_ignored_rows_sheet_when_nothing_ignored() {
+        let (mut conn, columns) = setup_report_fixture(true);
+        let path = temp_report_path("no-ignored-rows-sheet");
+
+        let summary = export_report(&mut conn, &columns, &path, |_, _| {}).unwrap();
+        assert!(!summary.sheets_written.contains(&"Ignored Rows".to_string()));
 
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }

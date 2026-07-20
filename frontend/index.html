@@ -87,6 +87,37 @@
       </div>
     </details>
 
+    <details id="ignore-rules-panel" class="mapping-panel hidden">
+      <summary>
+        <span class="mapping-summary-title">Ignore rules</span>
+        <span id="ignore-rules-summary" class="mapping-summary-status">Loading&hellip;</span>
+      </summary>
+      <div class="mapping-panel-content">
+        <p class="mapping-explainer">Rows matching an enabled rule are excluded from MITRE matching, activity classification, anomaly scanning, and AI semantic search &mdash; they stay fully visible in the grid and in plain search. Rules are specific to this file: built-in rules start enabled here by default, and anything you disable, enable, or add only affects this file's database, never any other file you open.</p>
+        <div id="ignore-rule-list" class="role-list"></div>
+        <div id="ignore-rule-panel-status" class="intel-panel-note"></div>
+        <form id="add-ignore-rule-form" class="add-ignore-rule-form">
+          <input id="ignore-rule-name" type="text" placeholder="Rule name, e.g. Backup agent noise" maxlength="120" required />
+          <select id="ignore-rule-target-type" aria-label="Match by">
+            <option value="role">Column role</option>
+            <option value="header">Column header</option>
+          </select>
+          <select id="ignore-rule-role" aria-label="Column role"></select>
+          <input id="ignore-rule-header" type="text" placeholder="Column header, e.g. EventID" class="hidden" aria-label="Column header" />
+          <select id="ignore-rule-op" aria-label="Match operator">
+            <option value="contains_any">contains</option>
+            <option value="equals_any">equals</option>
+            <option value="ends_with_any">ends with</option>
+          </select>
+          <input id="ignore-rule-values" type="text" placeholder="Value(s), comma-separated" required aria-label="Values to match" />
+          <button type="submit" class="btn btn-small">+ Add rule</button>
+        </form>
+        <div class="intel-panel-actions">
+          <button id="ignore-rules-panel-close" class="btn btn-small">Collapse ignore rules</button>
+        </div>
+      </div>
+    </details>
+
     <section id="timezone-panel" class="intel-panel timezone-panel hidden" aria-live="polite">
       <div class="intel-panel-header">
         <strong>Timestamp details needed</strong>
@@ -152,6 +183,12 @@
           <button id="review-roles-btn" class="btn btn-small" disabled>Open data mapping</button>
           <div id="evidence-columns-label" class="sidebar-note">Automatic evidence mapping starts after import.</div>
           <div id="intel-scan-summary" class="scan-summary"></div>
+        </div>
+
+        <div class="sidebar-section">
+          <h3>Ignore rules</h3>
+          <p class="sidebar-note">Suppress noisy rows (security agents, known-benign event IDs, etc.) from MITRE matching, anomaly scanning, activity classification, and AI search &mdash; specific to this file.</p>
+          <button id="manage-ignore-rules-btn" class="btn btn-small" disabled>Manage ignore rules</button>
         </div>
       </aside>
 

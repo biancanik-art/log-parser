@@ -43,6 +43,20 @@
   const rolePanelClose = document.getElementById("role-panel-close");
   const dataMappingSummary = document.getElementById("data-mapping-summary");
 
+  const ignoreRulesPanel = document.getElementById("ignore-rules-panel");
+  const ignoreRulesSummary = document.getElementById("ignore-rules-summary");
+  const ignoreRuleList = document.getElementById("ignore-rule-list");
+  const ignoreRulePanelStatus = document.getElementById("ignore-rule-panel-status");
+  const ignoreRulesPanelClose = document.getElementById("ignore-rules-panel-close");
+  const manageIgnoreRulesBtn = document.getElementById("manage-ignore-rules-btn");
+  const addIgnoreRuleForm = document.getElementById("add-ignore-rule-form");
+  const ignoreRuleNameInput = document.getElementById("ignore-rule-name");
+  const ignoreRuleTargetType = document.getElementById("ignore-rule-target-type");
+  const ignoreRuleRoleSelect = document.getElementById("ignore-rule-role");
+  const ignoreRuleHeaderInput = document.getElementById("ignore-rule-header");
+  const ignoreRuleOpSelect = document.getElementById("ignore-rule-op");
+  const ignoreRuleValuesInput = document.getElementById("ignore-rule-values");
+
   const timezonePanel = document.getElementById("timezone-panel");
   const timezoneSummary = document.getElementById("timezone-summary");
   const timezoneSamples = document.getElementById("timezone-samples");
@@ -85,6 +99,12 @@
   let table = null;
   let currentPath = null;
   let currentSheet = null;
+
+  // Per-file, like columnRoleSuggestions: IgnoreRuleView[] from list_ignore_rules, reset on
+  // file removal and refetched after each import.
+  let ignoreRules = [];
+  let ignoreRulesLoaded = false;
+  let ignoreRulesInFlight = false;
 
   let spec = { search: null, filters: [], sort: null, expression: null, cursor: null, limit: PAGE_SIZE };
   let cursorStack = []; // for Prev navigation
@@ -180,6 +200,15 @@
     "text_evidence",
   ];
 
+  // Ignore-rule conditions can key off any data-mapping role except timestamp — matches the
+  // backend's RULE_CONDITION_ROLES (library.rs).
+  const IGNORE_RULE_ROLES = MAPPING_ROLES.filter((role) => role !== "timestamp");
+  const IGNORE_RULE_OP_LABELS = {
+    contains_any: "contains",
+    equals_any: "equals",
+    ends_with_any: "ends with",
+  };
+
   const FILTER_OPERATORS = new Set([
     "equals",
     "notEquals",
@@ -208,6 +237,7 @@
     applyBtn.disabled = !enabled;
     clearBtn.disabled = !enabled;
     reviewRolesBtn.disabled = !enabled;
+    manageIgnoreRulesBtn.disabled = !enabled;
     aiSearchAvailability.textContent = enabled
       ? "Ready to search every imported row. No enrichment scan is required."
       : "Import a file to search its evidence.";
@@ -233,6 +263,7 @@
     clearBtn.disabled = inFlight || !controlsEnabled;
     reviewRolesBtn.disabled = inFlight || !controlsEnabled;
     suspiciousScanBtn.disabled = inFlight || !controlsEnabled;
+    manageIgnoreRulesBtn.disabled = inFlight || !controlsEnabled;
     if (inFlight) {
       prevPageBtn.disabled = true;
       nextPageBtn.disabled = true;
@@ -384,6 +415,16 @@
     roleList.innerHTML = "";
     rolePanelStatus.textContent = "";
     roleReviewPanel.classList.add("hidden");
+
+    // Ignore rules are per-file (stored in this file's own database), so stale rows from the
+    // previous file must not linger in the panel while a new one loads.
+    ignoreRules = [];
+    ignoreRulesLoaded = false;
+    ignoreRuleList.innerHTML = "";
+    ignoreRulePanelStatus.textContent = "";
+    ignoreRulesSummary.textContent = "Loading…";
+    ignoreRulesPanel.classList.add("hidden");
+    ignoreRulesPanel.open = false;
     roleReviewPanel.open = false;
     dataMappingSummary.textContent = "Waiting for a file";
 
@@ -519,6 +560,137 @@
   function columnDisplayName(sqlName) {
     const column = columns.find((c) => c.sqlName === sqlName);
     return column ? column.originalName : sqlName;
+  }
+
+  function describeIgnoreRuleConditions(rule) {
+    return rule.conditions
+      .map((condition) => {
+        const target = condition.role
+          ? formatRoleName(condition.role)
+          : (condition.headerAnyOf || []).join(" / ") || "(any column)";
+        const opLabel = IGNORE_RULE_OP_LABELS[condition.op] || condition.op;
+        return `${target} ${opLabel}: ${condition.values.join(", ")}`;
+      })
+      .join(" AND ");
+  }
+
+  function renderIgnoreRules() {
+    ignoreRuleList.innerHTML = "";
+    const activeCount = ignoreRules.filter((rule) => rule.enabled).length;
+    ignoreRulesSummary.textContent = ignoreRules.length
+      ? `${activeCount} of ${ignoreRules.length} active`
+      : "No rules";
+
+    ignoreRules.forEach((rule) => {
+      const row = document.createElement("div");
+      row.className = "role-row ignore-rule-row";
+
+      const titleWrap = document.createElement("div");
+      const title = document.createElement("div");
+      title.className = "role-title";
+      title.textContent = rule.name;
+      titleWrap.appendChild(title);
+      const sourceBadge = document.createElement("span");
+      sourceBadge.className = `role-badge ${rule.source === "custom" ? "custom" : "builtin"}`;
+      sourceBadge.textContent = rule.source === "custom" ? "custom" : "built-in";
+      titleWrap.appendChild(sourceBadge);
+      if (!rule.enabled) {
+        const disabledBadge = document.createElement("span");
+        disabledBadge.className = "role-badge disabled-rule";
+        disabledBadge.textContent = "disabled";
+        titleWrap.appendChild(disabledBadge);
+      }
+
+      const condition = document.createElement("div");
+      condition.className = "ignore-rule-condition";
+      condition.textContent = describeIgnoreRuleConditions(rule);
+
+      const actions = document.createElement("div");
+      actions.className = "role-actions";
+      const toggleBtn = document.createElement("button");
+      toggleBtn.className = "btn btn-small";
+      toggleBtn.textContent = rule.enabled ? "Disable" : "Enable";
+      toggleBtn.addEventListener("click", () => {
+        toggleBtn.disabled = true;
+        setIgnoreRuleEnabled(rule.id, !rule.enabled).finally(() => {
+          toggleBtn.disabled = false;
+        });
+      });
+      actions.appendChild(toggleBtn);
+      if (rule.source === "custom") {
+        const deleteBtn = document.createElement("button");
+        deleteBtn.className = "btn btn-small";
+        deleteBtn.textContent = "Delete";
+        deleteBtn.addEventListener("click", () => {
+          if (!confirm(`Delete ignore rule "${rule.name}"?`)) return;
+          deleteBtn.disabled = true;
+          toggleBtn.disabled = true;
+          deleteIgnoreRule(rule.id).finally(() => {
+            deleteBtn.disabled = false;
+            toggleBtn.disabled = false;
+          });
+        });
+        actions.appendChild(deleteBtn);
+      }
+
+      row.append(titleWrap, condition, actions);
+      ignoreRuleList.appendChild(row);
+    });
+  }
+
+  async function loadIgnoreRules() {
+    if (ignoreRulesInFlight) return;
+    ignoreRulesInFlight = true;
+    try {
+      const listing = await invoke("list_ignore_rules");
+      ignoreRules = listing.rules;
+      ignoreRulesLoaded = true;
+      ignoreRulePanelStatus.textContent = listing.customRulesError
+        ? `Your custom ignore-rules file could not be read, so only built-in rules are active: ${listing.customRulesError}`
+        : "";
+      renderIgnoreRules();
+    } catch (err) {
+      console.error("list_ignore_rules failed", err);
+      ignoreRulePanelStatus.textContent = `Could not load ignore rules: ${err}`;
+    } finally {
+      ignoreRulesInFlight = false;
+    }
+  }
+
+  async function setIgnoreRuleEnabled(ruleId, enabled) {
+    try {
+      const listing = await invoke("set_ignore_rule_enabled", { ruleId, enabled });
+      ignoreRules = listing.rules;
+      renderIgnoreRules();
+    } catch (err) {
+      console.error("set_ignore_rule_enabled failed", err);
+      ignoreRulePanelStatus.textContent = `Could not update ignore rule: ${err}`;
+    }
+  }
+
+  async function deleteIgnoreRule(ruleId) {
+    try {
+      const listing = await invoke("delete_custom_ignore_rule", { ruleId });
+      ignoreRules = listing.rules;
+      renderIgnoreRules();
+    } catch (err) {
+      console.error("delete_custom_ignore_rule failed", err);
+      ignoreRulePanelStatus.textContent = `Could not delete ignore rule: ${err}`;
+    }
+  }
+
+  async function addIgnoreRule(input) {
+    try {
+      const listing = await invoke("add_custom_ignore_rule", { input });
+      ignoreRules = listing.rules;
+      ignoreRulePanelStatus.textContent = "";
+      renderIgnoreRules();
+      return true;
+    } catch (err) {
+      console.error("add_custom_ignore_rule failed", err);
+      ignoreRulePanelStatus.textContent = `Could not add ignore rule: ${err}`;
+      return false;
+    }
   }
 
   function upsertRoleSuggestion(updated) {
@@ -2423,6 +2595,7 @@
     detectColumnRolesForLoadedFile().catch((err) =>
       console.error("data mapping preparation failed", err)
     );
+    loadIgnoreRules().catch((err) => console.error("ignore rules load failed", err));
     const builtTable = table;
     const tableContext = {
       contextRevision: guidedContextRevision,
@@ -2777,6 +2950,12 @@
     roleReviewPanel.open = true;
   });
 
+  manageIgnoreRulesBtn.addEventListener("click", () => {
+    ignoreRulesPanel.classList.remove("hidden");
+    ignoreRulesPanel.open = true;
+    if (!ignoreRulesLoaded) loadIgnoreRules();
+  });
+
   sheetLoadBtn.addEventListener("click", () => {
     loadSheet(sheetSelect.value).catch((err) => console.error("import_sheet failed", err));
   });
@@ -2852,6 +3031,44 @@
 
   rolePanelClose.addEventListener("click", () => {
     roleReviewPanel.open = false;
+  });
+
+  ignoreRulesPanelClose.addEventListener("click", () => {
+    ignoreRulesPanel.open = false;
+  });
+
+  ignoreRuleTargetType.addEventListener("change", () => {
+    const isHeader = ignoreRuleTargetType.value === "header";
+    ignoreRuleHeaderInput.classList.toggle("hidden", !isHeader);
+    ignoreRuleRoleSelect.classList.toggle("hidden", isHeader);
+  });
+
+  addIgnoreRuleForm.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const name = ignoreRuleNameInput.value.trim();
+    const values = ignoreRuleValuesInput.value
+      .split(",")
+      .map((value) => value.trim())
+      .filter(Boolean);
+    const isHeader = ignoreRuleTargetType.value === "header";
+    const headerAnyOf = isHeader ? [ignoreRuleHeaderInput.value.trim()].filter(Boolean) : [];
+    if (!name || !values.length || (isHeader && !headerAnyOf.length)) return;
+
+    const submitBtn = addIgnoreRuleForm.querySelector('button[type="submit"]');
+    submitBtn.disabled = true;
+    const ok = await addIgnoreRule({
+      name,
+      role: isHeader ? null : ignoreRuleRoleSelect.value,
+      headerAnyOf,
+      op: ignoreRuleOpSelect.value,
+      values,
+    });
+    submitBtn.disabled = false;
+    if (ok) {
+      addIgnoreRuleForm.reset();
+      ignoreRuleHeaderInput.classList.add("hidden");
+      ignoreRuleRoleSelect.classList.remove("hidden");
+    }
   });
 
   timezoneUtcBtn.addEventListener("click", () => {
@@ -2992,6 +3209,16 @@
     showProgress(`Writing report${sheetLabel}... ${rowsDone.toLocaleString()} rows`, 0.5);
   });
 
+  // The role dropdown's option list is static (independent of which file is loaded), so it can
+  // be populated once here — the rules themselves are per-file and load after import instead
+  // (see the `manageIgnoreRulesBtn`-adjacent call in the import-success handler).
+  IGNORE_RULE_ROLES.forEach((role) => {
+    const option = document.createElement("option");
+    option.value = role;
+    option.textContent = formatRoleName(role);
+    ignoreRuleRoleSelect.appendChild(option);
+  });
+
   // Debug hook: lets automated/CDP-driven testing open a file by path directly,
   // bypassing the native OS file-picker dialog (which can't be scripted).
   // Harmless in normal use — withGlobalTauri already exposes the raw invoke()
@@ -3117,6 +3344,23 @@
     },
     setMappingForTest(role, sqlName, status = "confirmed") {
       return setColumnRoleStatus(role, sqlName, status);
+    },
+    openIgnoreRulesForTest() {
+      ignoreRulesPanel.classList.remove("hidden");
+      ignoreRulesPanel.open = true;
+      return loadIgnoreRules();
+    },
+    getIgnoreRulesForTest() {
+      return ignoreRules;
+    },
+    addIgnoreRuleForTest(input) {
+      return addIgnoreRule(input);
+    },
+    setIgnoreRuleEnabledForTest(ruleId, enabled) {
+      return setIgnoreRuleEnabled(ruleId, enabled);
+    },
+    deleteIgnoreRuleForTest(ruleId) {
+      return deleteIgnoreRule(ruleId);
     },
     decideGuidedParseForTest(decision) {
       return decideGuidedParse(decision);

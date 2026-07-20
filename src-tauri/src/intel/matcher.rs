@@ -1,7 +1,6 @@
 use crate::db;
-use crate::intel::library::{
-    self, BehaviorRule, ConditionOp, LoadedLibrary, MatchKind, Tactic, RULE_CONDITION_ROLES,
-};
+use crate::intel::library::{self, BehaviorRule, LoadedLibrary, MatchKind, RuleCondition, Tactic};
+use crate::intel::rule_conditions;
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder};
 use anyhow::{anyhow, Result};
 use rusqlite::{Connection, OptionalExtension};
@@ -28,6 +27,8 @@ pub struct IntelScanSummary {
     pub tactics: Vec<IntelCountSummary>,
     pub techniques: Vec<IntelCountSummary>,
     pub chains: Vec<crate::intel::chains::IntelChainSummary>,
+    pub rows_ignored: i64,
+    pub ignored_by_rule: Vec<crate::intel::ignore_rules::IgnoredRuleBreakdown>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -70,21 +71,6 @@ struct CompiledRule {
     rule: BehaviorRule,
     technique_name: String,
     tactics: Vec<Tactic>,
-}
-
-/// One behavior rule bound to this dataset's actual columns. `column_indices` index into the
-/// combined per-row value vector (evidence columns first, extra rule columns appended).
-#[derive(Debug, Clone)]
-struct ResolvedCondition {
-    column_indices: Vec<usize>,
-    op: ConditionOp,
-    values_lower: Vec<String>,
-}
-
-#[derive(Debug, Clone)]
-struct ResolvedRule {
-    compiled_idx: usize,
-    conditions: Vec<ResolvedCondition>,
 }
 
 pub fn scan_connection(
@@ -219,140 +205,6 @@ fn compile_library(library: LoadedLibrary) -> Result<CompiledLibrary> {
     })
 }
 
-/// Binds each behavior rule to this dataset. Role conditions use non-rejected data mappings
-/// (consistent with the optional-enrichment philosophy); header conditions match the normalized
-/// original header or SQL name. Rules with any unresolvable condition are skipped for this
-/// dataset — a condition that cannot see its column must not silently pass.
-fn resolve_behavior_rules(
-    conn: &Connection,
-    rules: &[CompiledRule],
-    scan_columns: &[String],
-) -> Result<(Vec<String>, Vec<ResolvedRule>)> {
-    if rules.is_empty() {
-        return Ok((Vec::new(), Vec::new()));
-    }
-    let all_columns = db::load_columns(conn)?;
-    let roles_exist: i64 = conn.query_row(
-        "SELECT EXISTS(
-            SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '_column_roles'
-         )",
-        [],
-        |row| row.get(0),
-    )?;
-    let mut role_columns: HashMap<String, Vec<String>> = HashMap::new();
-    if roles_exist != 0 {
-        let mut stmt = conn.prepare(
-            "SELECT role, sql_name FROM _column_roles
-             WHERE status IN ('suggested', 'confirmed')
-             ORDER BY sql_name",
-        )?;
-        let mut query = stmt.query([])?;
-        while let Some(row) = query.next()? {
-            let role: String = row.get(0)?;
-            let sql_name: String = row.get(1)?;
-            if RULE_CONDITION_ROLES.contains(&role.as_str()) {
-                role_columns.entry(role).or_default().push(sql_name);
-            }
-        }
-    }
-
-    let mut combined: Vec<String> = scan_columns.to_vec();
-    let mut combined_index: HashMap<String, usize> = combined
-        .iter()
-        .enumerate()
-        .map(|(index, name)| (name.clone(), index))
-        .collect();
-    let mut resolved_rules = Vec::new();
-    for (compiled_idx, compiled) in rules.iter().enumerate() {
-        let mut conditions = Vec::with_capacity(compiled.rule.conditions.len());
-        let mut resolvable = true;
-        for condition in &compiled.rule.conditions {
-            let target_columns: Vec<String> = if let Some(role) = &condition.role {
-                role_columns.get(role).cloned().unwrap_or_default()
-            } else {
-                let wanted: HashSet<String> = condition
-                    .header_any_of
-                    .iter()
-                    .map(|candidate| library::normalize_header_token(candidate))
-                    .collect();
-                all_columns
-                    .iter()
-                    .filter(|column| {
-                        wanted.contains(&library::normalize_header_token(&column.original_name))
-                            || wanted.contains(&library::normalize_header_token(&column.sql_name))
-                    })
-                    .map(|column| column.sql_name.clone())
-                    .collect()
-            };
-            if target_columns.is_empty() {
-                resolvable = false;
-                break;
-            }
-            let column_indices = target_columns
-                .iter()
-                .map(|name| {
-                    *combined_index.entry(name.clone()).or_insert_with(|| {
-                        combined.push(name.clone());
-                        combined.len() - 1
-                    })
-                })
-                .collect();
-            conditions.push(ResolvedCondition {
-                column_indices,
-                op: condition.op,
-                values_lower: condition
-                    .values
-                    .iter()
-                    .map(|value| value.trim().to_lowercase())
-                    .collect(),
-            });
-        }
-        if resolvable {
-            resolved_rules.push(ResolvedRule {
-                compiled_idx,
-                conditions,
-            });
-        }
-    }
-    let extra = combined.split_off(scan_columns.len());
-    Ok((extra, resolved_rules))
-}
-
-/// Returns the first (column index, cell value) satisfying the condition on this row.
-fn condition_match<'row>(
-    condition: &ResolvedCondition,
-    values: &'row [Option<String>],
-) -> Option<(usize, &'row str)> {
-    for &column_idx in &condition.column_indices {
-        let Some(value) = values.get(column_idx).and_then(|value| value.as_deref()) else {
-            continue;
-        };
-        let cell = value.trim();
-        if cell.is_empty() {
-            continue;
-        }
-        let cell_lower = cell.to_lowercase();
-        let satisfied = match condition.op {
-            ConditionOp::EqualsAny => condition
-                .values_lower
-                .iter()
-                .any(|wanted| cell_lower == *wanted),
-            ConditionOp::ContainsAny => condition
-                .values_lower
-                .iter()
-                .any(|wanted| cell_lower.contains(wanted.as_str())),
-            ConditionOp::EndsWithAny => condition
-                .values_lower
-                .iter()
-                .any(|wanted| cell_lower.ends_with(wanted.as_str())),
-        };
-        if satisfied {
-            return Some((column_idx, cell));
-        }
-    }
-    None
-}
-
 fn bounded_match_value(value: &str) -> String {
     const MAX_MATCH_VALUE_CHARS: usize = 48;
     if value.chars().count() <= MAX_MATCH_VALUE_CHARS {
@@ -379,11 +231,23 @@ fn scan_with_compiled_library(
     mut on_progress: impl FnMut(i64, i64, &str),
 ) -> Result<IntelScanSummary> {
     let scan_columns = validate_evidence_columns(conn, evidence_columns)?;
-    let (extra_rule_columns, resolved_rules) =
-        resolve_behavior_rules(conn, &compiled.rules, &scan_columns)?;
+    let condition_lists: Vec<&[RuleCondition]> = compiled
+        .rules
+        .iter()
+        .map(|compiled_rule| compiled_rule.rule.conditions.as_slice())
+        .collect();
+    let (extra_rule_columns, resolved_rules) = rule_conditions::resolve_rule_conditions(
+        conn,
+        &condition_lists,
+        &scan_columns,
+        &["suggested", "confirmed"],
+    )?;
     let mut combined_columns = scan_columns.clone();
     combined_columns.extend(extra_rule_columns);
     let total_rows = count_rows(conn)?;
+
+    crate::intel::ignore_rules::ensure_ignored_rows_computed(conn)?;
+    let ignored = crate::intel::ignore_rules::load_ignored_row_set(conn)?;
 
     db::create_intel_schema(conn)?;
     create_scan_staging_schema(conn)?;
@@ -439,6 +303,9 @@ fn scan_with_compiled_library(
             for (row_num, values) in &batch {
                 last_row_num = *row_num;
                 rows_scanned += 1;
+                if ignored.contains(row_num) {
+                    continue;
+                }
 
                 // Only evidence columns feed the keyword automaton; trailing rule-only
                 // columns are fetched solely for behavior-rule conditions.
@@ -483,7 +350,7 @@ fn scan_with_compiled_library(
                     let mut first_hit: Option<(usize, String)> = None;
                     let mut all_hold = true;
                     for condition in &resolved.conditions {
-                        match condition_match(condition, values) {
+                        match rule_conditions::condition_match(condition, values) {
                             Some((column_idx, value)) => {
                                 if first_hit.is_none() {
                                     first_hit = Some((column_idx, bounded_match_value(value)));
@@ -501,7 +368,7 @@ fn scan_with_compiled_library(
                     let Some((column_idx, matched_value)) = first_hit else {
                         continue;
                     };
-                    let compiled_rule = &compiled.rules[resolved.compiled_idx];
+                    let compiled_rule = &compiled.rules[resolved.rule_idx];
                     matched_rows.insert(*row_num);
                     increment_count(
                         &mut technique_counts,
@@ -551,7 +418,7 @@ fn scan_with_compiled_library(
                 }
                 for pending in pending_rule_matches {
                     let resolved = &resolved_rules[pending.resolved_idx];
-                    let compiled_rule = &compiled.rules[resolved.compiled_idx];
+                    let compiled_rule = &compiled.rules[resolved.rule_idx];
                     let tactic = &compiled_rule.tactics[pending.tactic_idx];
                     insert_stmt.execute(rusqlite::params![
                         pending.row_num,
@@ -645,6 +512,8 @@ fn scan_with_compiled_library(
 
     on_progress(rows_scanned, total_rows, "complete");
 
+    let (rows_ignored, ignored_by_rule) = crate::intel::ignore_rules::ignored_rows_summary(conn)?;
+
     Ok(IntelScanSummary {
         rows_scanned,
         match_count: inserted_match_rows,
@@ -655,6 +524,8 @@ fn scan_with_compiled_library(
         tactics: finalize_counts(tactic_counts),
         techniques: finalize_counts(technique_counts),
         chains,
+        rows_ignored,
+        ignored_by_rule,
     })
 }
 
@@ -800,6 +671,7 @@ fn is_short_ascii_alphanumeric_pattern(pattern: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::intel::library::ConditionOp;
     use crate::db::ColumnMeta;
     use crate::intel::library::{Keyword, LoadedLibrary, MatchKind, RuleCondition, Technique};
     use std::path::{Path, PathBuf};
@@ -935,6 +807,7 @@ mod tests {
 
         assert_eq!(summary.rows_scanned, 1);
         assert_eq!(summary.matched_rows, 1);
+        assert_eq!(summary.rows_ignored, 0);
         assert!(summary
             .techniques
             .iter()
@@ -954,6 +827,65 @@ mod tests {
         assert_eq!(hit.0, "TA0002");
         assert_eq!(hit.1, "T1059.001");
         assert_eq!(hit.2, "t1059_001_powershell_enc");
+    }
+
+    #[test]
+    fn ignored_row_produces_no_match_even_though_it_would_otherwise_flag() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        let columns = vec![
+            ColumnMeta {
+                sql_name: "commandline".into(),
+                original_name: "CommandLine".into(),
+                col_index: 0,
+                inferred_type: "text".into(),
+            },
+            ColumnMeta {
+                sql_name: "processname".into(),
+                original_name: "ProcessName".into(),
+                col_index: 1,
+                inferred_type: "text".into(),
+            },
+        ];
+        db::create_schema(&conn, &columns).unwrap();
+        conn.execute(
+            "INSERT INTO rows (row_num, commandline, processname) VALUES (1, ?1, 'QualysAgent.exe')",
+            rusqlite::params!["powershell -enc SQBFAFgA"],
+        )
+        .unwrap();
+        db::create_column_roles_table(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO _column_roles (role, sql_name, confidence, status, reasons_json)
+             VALUES ('process_name', 'processname', 1.0, 'confirmed', '[]')",
+            [],
+        )
+        .unwrap();
+
+        let library = library::load_builtin_library().unwrap();
+        let summary = scan_connection_with_library(
+            &mut conn,
+            &["commandline".to_string()],
+            library,
+            |_, _, _| {},
+        )
+        .unwrap();
+
+        assert_eq!(summary.rows_scanned, 1);
+        assert_eq!(
+            summary.matched_rows, 0,
+            "the row matches T1059.001 by keyword but is suppressed by the built-in Qualys ignore rule"
+        );
+        assert_eq!(summary.rows_ignored, 1);
+        assert_eq!(summary.ignored_by_rule.len(), 1);
+        assert_eq!(summary.ignored_by_rule[0].rule_id, "qualys-agent-activity");
+
+        let match_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM _intel_match WHERE row_num = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(match_count, 0);
     }
 
     #[test]

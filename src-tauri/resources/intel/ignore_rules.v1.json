@@ -1,0 +1,30 @@
+{
+  "schemaVersion": 1,
+  "ruleSetId": "builtin_ignore_rules_v1",
+  "rules": [
+    {
+      "id": "qualys-agent-activity",
+      "name": "Qualys Cloud Agent process activity",
+      "enabled": true,
+      "conditions": [
+        {
+          "role": "process_name",
+          "op": "contains_any",
+          "values": ["qualys"]
+        }
+      ]
+    },
+    {
+      "id": "msedge-crashpad-handler",
+      "name": "Microsoft Edge crashpad handler process",
+      "enabled": true,
+      "conditions": [
+        {
+          "role": "process_name",
+          "op": "contains_any",
+          "values": ["msedge_crashpad_handler.exe"]
+        }
+      ]
+    }
+  ]
+}

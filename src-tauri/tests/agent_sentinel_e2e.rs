@@ -341,6 +341,266 @@ fn analyst_front_door_answers_whats_in_this_file() {
     );
 }
 
+/// Proves the ignore-rules feature end to end through the REAL pipeline: CSV import (not an
+/// in-memory fixture) -> role confirmation -> MITRE scan -> report export, using only the
+/// built-in Qualys rule so this never touches the real custom_ignore_rules.v1.json on whatever
+/// machine runs it (a custom rule would persist in the *real* app's config afterward, which
+/// would be a bad side effect for a test). One planted row's command line matches a real MITRE
+/// keyword (the same "powershell -enc" trigger `scan_flags_known_powershell_keyword` uses) but
+/// also has a Qualys process name, so it must be suppressed even though the identical trigger
+/// on a non-Qualys row still fires.
+#[test]
+#[ignore]
+fn ignore_rules_suppress_planted_row_through_the_real_pipeline() {
+    use calamine::Reader;
+    use log_parser_lib::intel::ignore_rules;
+
+    let dir = dev_dir().parent().unwrap().join("agent-test-ignore-rules");
+    std::fs::create_dir_all(&dir).unwrap();
+    let csv_path = dir.join("ignore_rules_fixture.csv");
+    std::fs::write(
+        &csv_path,
+        "ProcessName,CommandLine,EventID\n\
+         powershell.exe,\"powershell.exe powershell -enc SQBFAFgA\",4688\n\
+         QualysAgent.exe,\"QualysAgent.exe powershell -enc SQBFAFgA\",4688\n\
+         QualysAgent.exe,\"QualysAgent.exe --scan --quick\",4688\n\
+         notepad.exe,\"notepad.exe C:\\Users\\bob\\notes.txt\",4688\n\
+         -,-,4624\n",
+    )
+    .unwrap();
+    let db_path = dir.join("ignore_rules_e2e.sqlite3");
+    let _ = std::fs::remove_file(&db_path);
+
+    tabular_import::import_into_db(&csv_path, "", &db_path, |_, _| {}).unwrap();
+    let mut conn = db::open(&db_path).unwrap();
+    let columns = db::load_columns(&conn).unwrap();
+
+    detect_column_roles(&conn, &columns).unwrap();
+    set_column_role_status(
+        &conn,
+        &columns,
+        "process_name",
+        "processname",
+        RoleDecisionStatus::Confirmed,
+    )
+    .unwrap();
+
+    let evidence_columns = vec!["commandline".to_string()];
+    let scan = scan_connection(&mut conn, &evidence_columns, |_, _, _| {}).unwrap();
+    println!(
+        "scan: matched_rows={} rows_ignored={} ignored_by_rule={:?}",
+        scan.matched_rows, scan.rows_ignored, scan.ignored_by_rule
+    );
+    assert_eq!(scan.rows_ignored, 2, "rows 2 and 3 are Qualys-attributed");
+    assert_eq!(scan.ignored_by_rule.len(), 1);
+    assert_eq!(scan.ignored_by_rule[0].rule_id, "qualys-agent-activity");
+    assert_eq!(
+        scan.matched_rows, 1,
+        "row 2's identical trigger phrase must not double-count once row 1 alone matches"
+    );
+
+    let row2_matches: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM _intel_match WHERE row_num = 2",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        row2_matches, 0,
+        "the Qualys row must produce zero MITRE matches despite containing the trigger phrase"
+    );
+    let row1_matches: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM _intel_match WHERE row_num = 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(row1_matches > 0, "the non-Qualys row with the same phrase must still match");
+
+    let (total_ignored, by_rule) = ignore_rules::ignored_rows_summary(&conn).unwrap();
+    assert_eq!(total_ignored, 2);
+    assert_eq!(by_rule[0].row_count, 2);
+
+    let report_path = dir.join("report_ignore_rules.xlsx");
+    let _ = std::fs::remove_file(&report_path);
+    let summary = report::export_report(&mut conn, &columns, &report_path, |_, _| {}).unwrap();
+    println!("report sheets: {:?}", summary.sheets_written);
+    assert!(
+        summary.sheets_written.iter().any(|s| s == "Ignored Rows"),
+        "the Ignored Rows sheet must be written when rows were suppressed"
+    );
+
+    let mut workbook = calamine::open_workbook_auto(&report_path).unwrap();
+    let sheet = workbook.worksheet_range("Ignored Rows").unwrap();
+    let ignored_row_nums: Vec<String> = sheet
+        .rows()
+        .skip(1)
+        .map(|row| row[0].to_string())
+        .collect();
+    assert_eq!(
+        ignored_row_nums.len(),
+        2,
+        "the report sheet must list exactly the two suppressed rows"
+    );
+    assert!(ignored_row_nums.contains(&"2".to_string()));
+    assert!(ignored_row_nums.contains(&"3".to_string()));
+
+    println!(
+        "\n=== DONE. Artifacts: {} , {} ===",
+        report_path.display(),
+        db_path.display()
+    );
+}
+
+/// Scale proof that ignore rules don't regress analysis on a partially-noisy dataset: same
+/// 100k-row dataset, same content, analyzed twice — once with the built-in Qualys rule inactive
+/// (baseline: process_name role left unconfirmed, so the role-scoped rule can't resolve),
+/// once with it active (40% of rows are Qualys-attributed and get skipped before the expensive
+/// per-row work in matcher/anomaly/activity). Isolates the feature's effect from import or
+/// model-loading time by building the table directly rather than round-tripping through XLSX,
+/// and by excluding the model-dependent semantic stage (proven separately in semantic.rs's own
+/// unit tests: an entire ignored batch doesn't stall the build, and ignored rows never reach the
+/// embedder).
+///
+/// Expect a small, sometimes-negative "speedup" here, not a dramatic one — matcher/anomaly/
+/// activity's per-row work is cheap, so on a fast (~1.6s) run the real saved work is on the same
+/// order as normal OS-scheduling noise. That's fine: this test's job is proving no *regression*,
+/// not chasing a number. The feature's real payoff for expensive per-row work (semantic
+/// embedding) is proven structurally above, not by timing it.
+///
+///   cargo test --release --test agent_sentinel_e2e ignore_rules_speed_up -- --ignored --nocapture
+#[test]
+#[ignore]
+fn ignore_rules_speed_up_analysis_on_a_partially_noisy_dataset() {
+    use log_parser_lib::intel::{activity, anomaly};
+
+    const TOTAL_ROWS: i64 = 100_000;
+    const QUALYS_MODULUS: i64 = 5; // row_num % 5 in {0,1} => 2-in-5 = 40% of rows.
+
+    let dir = dev_dir().parent().unwrap().join("agent-test-ignore-rules");
+    std::fs::create_dir_all(&dir).unwrap();
+    let db_path = dir.join("ignore_rules_scale.sqlite3");
+    let _ = std::fs::remove_file(&db_path);
+
+    let columns = vec![
+        db::ColumnMeta {
+            sql_name: "processname".into(),
+            original_name: "ProcessName".into(),
+            col_index: 0,
+            inferred_type: "text".into(),
+        },
+        db::ColumnMeta {
+            sql_name: "commandline".into(),
+            original_name: "CommandLine".into(),
+            col_index: 1,
+            inferred_type: "text".into(),
+        },
+    ];
+    let mut conn = db::open(&db_path).unwrap();
+    db::create_schema(&conn, &columns).unwrap();
+    let t = Instant::now();
+    {
+        let tx = conn.transaction().unwrap();
+        {
+            let mut stmt = tx
+                .prepare("INSERT INTO rows (row_num, processname, commandline) VALUES (?1, ?2, ?3)")
+                .unwrap();
+            for row_num in 1..=TOTAL_ROWS {
+                // 2 of every 5 rows (40%) are Qualys noise; the rest carry varied, realistically
+                // long command lines so the per-row scan work (Aho-Corasick + anomaly
+                // heuristics) does real, comparable work in both runs.
+                if row_num % QUALYS_MODULUS < 2 {
+                    stmt.execute(rusqlite::params![
+                        row_num,
+                        "QualysAgent.exe",
+                        format!("QualysAgent.exe --scan --profile=full --session={row_num}")
+                    ])
+                    .unwrap();
+                } else {
+                    stmt.execute(rusqlite::params![
+                        row_num,
+                        format!("proc-{}.exe", row_num % 50),
+                        format!(
+                            "proc-{}.exe --run --session={row_num} --token={} --path=C:\\Users\\user{}\\AppData\\Local\\Temp\\file{row_num}.tmp",
+                            row_num % 50,
+                            row_num * 7919,
+                            row_num % 1000
+                        )
+                    ])
+                    .unwrap();
+                }
+            }
+        }
+        tx.commit().unwrap();
+    }
+    println!("=== FIXTURE: {TOTAL_ROWS} rows built in {:?} ===", t.elapsed());
+
+    let evidence_columns = vec!["commandline".to_string()];
+    let run_stages = |conn: &mut rusqlite::Connection| -> (i64, i64) {
+        let t = Instant::now();
+        let scan = scan_connection(conn, &evidence_columns, |_, _, _| {}).unwrap();
+        anomaly::scan_anomalies(conn, &columns, |_, _, _| {}).unwrap();
+        activity::classify_rows(conn, &columns, |_, _, _| {}).unwrap();
+        (t.elapsed().as_millis() as i64, scan.rows_ignored)
+    };
+
+    // Role detection independently activates anomaly.rs's rare_process_findings and
+    // activity.rs's role-based signal columns (both gated on status IN ('suggested',
+    // 'confirmed')) — real work unrelated to ignore rules, which specifically require status =
+    // 'confirmed' (stricter, by design). Detecting once up front and toggling only 'suggested'
+    // -> 'confirmed' between the two runs keeps that other work identical in both, isolating
+    // the ignore-rule's own effect instead of conflating it with "roles now exist at all".
+    detect_column_roles(&conn, &columns).unwrap();
+    let role_status: String = conn
+        .query_row(
+            "SELECT status FROM _column_roles WHERE role = 'process_name'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        role_status, "suggested",
+        "expected automatic detection to suggest, not confirm, the role"
+    );
+
+    // ---- baseline: role suggested but not confirmed, ignore rule cannot resolve -------------
+    let (before_ms, before_ignored) = run_stages(&mut conn);
+    println!("=== BEFORE (ignore rule inactive): {before_ms}ms, rows_ignored={before_ignored} ===");
+    assert_eq!(before_ignored, 0, "role-scoped rule must not fire without a confirmed role");
+
+    // ---- same data, same role-gated heuristics active, ignore rule now also active ---------
+    set_column_role_status(
+        &conn,
+        &columns,
+        "process_name",
+        "processname",
+        RoleDecisionStatus::Confirmed,
+    )
+    .unwrap();
+    let (after_ms, after_ignored) = run_stages(&mut conn);
+    println!("=== AFTER (ignore rule active): {after_ms}ms, rows_ignored={after_ignored} ===");
+    assert_eq!(after_ignored, 40_000, "40% of the dataset is planted Qualys noise");
+
+    let speedup_pct = if before_ms > 0 {
+        100 - (after_ms * 100 / before_ms)
+    } else {
+        0
+    };
+    println!("=== SPEEDUP: {speedup_pct}% ({before_ms}ms -> {after_ms}ms) ===");
+    // 15% tolerance: on a ~1.6s run, matcher/anomaly/activity's per-row work is cheap enough
+    // that normal OS-scheduling noise alone can swing the measurement a couple of percent
+    // either way (observed: 0% to -2% across repeated runs on the same unchanged code). This
+    // must still catch a *real* regression — a 15% slowdown is well beyond that noise floor.
+    let tolerance_ms = before_ms / 100 * 15;
+    assert!(
+        after_ms <= before_ms + tolerance_ms,
+        "suppressing 40% of rows before the expensive per-row work should not meaningfully \
+         regress performance: before={before_ms}ms after={after_ms}ms (tolerance={tolerance_ms}ms)"
+    );
+}
+
 /// 520k-row scale proof for the v0.2.2 "parse it row by row" flow: generates (once, then
 /// cached on disk) a Sentinel-style 520,000-row XLSX — benign multi-log-type noise plus one
 /// planted multi-tactic intrusion inside a 45-minute window on one host — then drives the

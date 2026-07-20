@@ -84,6 +84,8 @@ pub struct AnomalyScanSummary {
     pub flagged_rows: i64,
     pub categories: Vec<AnomalyCategorySummary>,
     pub top_rows: Vec<AnomalyRowSummary>,
+    pub rows_ignored: i64,
+    pub ignored_by_rule: Vec<crate::intel::ignore_rules::IgnoredRuleBreakdown>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -171,6 +173,8 @@ fn scan_into_staging(
 ) -> Result<AnomalyScanSummary> {
     let total_rows: i64 = conn.query_row("SELECT COUNT(*) FROM rows", [], |row| row.get(0))?;
     let roles = load_role_columns(conn)?;
+    crate::intel::ignore_rules::ensure_ignored_rows_computed(conn)?;
+    let ignored = crate::intel::ignore_rules::load_ignored_row_set(conn)?;
     on_progress(0, total_rows, "profiling");
 
     let mut findings_inserted = 0usize;
@@ -229,6 +233,9 @@ fn scan_into_staging(
         for (row_num, values) in &batch {
             last_row_num = *row_num;
             rows_scanned += 1;
+            if ignored.contains(row_num) {
+                continue;
+            }
             // One finding per (row, category): the strongest cell wins, later duplicates in
             // the same row only add noise for the examiner.
             let mut row_best: HashMap<&'static str, usize> = HashMap::new();
@@ -369,12 +376,15 @@ fn summarize(conn: &Connection, rows_scanned: i64) -> Result<AnomalyScanSummary>
             });
         }
     }
+    let (rows_ignored, ignored_by_rule) = crate::intel::ignore_rules::ignored_rows_summary(conn)?;
     Ok(AnomalyScanSummary {
         rows_scanned,
         finding_count,
         flagged_rows,
         categories,
         top_rows,
+        rows_ignored,
+        ignored_by_rule,
     })
 }
 
@@ -413,10 +423,13 @@ fn rare_process_findings(
     let sql = format!(
         "SELECT r.row_num, r.{ident}, rare.c
          FROM rows r
+         LEFT JOIN _ignored_rows ir ON ir.row_num = r.row_num
          JOIN (SELECT {ident} AS v, COUNT(*) AS c FROM rows
-               WHERE {ident} IS NOT NULL AND TRIM({ident}) != ''
+               LEFT JOIN _ignored_rows ir2 ON ir2.row_num = rows.row_num
+               WHERE {ident} IS NOT NULL AND TRIM({ident}) != '' AND ir2.row_num IS NULL
                GROUP BY {ident} HAVING c <= ?1) rare
            ON r.{ident} = rare.v
+         WHERE ir.row_num IS NULL
          ORDER BY r.row_num ASC
          LIMIT ?2"
     );
@@ -463,14 +476,20 @@ fn rare_user_host_findings(
     let sql = format!(
         "SELECT r.row_num, r.{user_ident}, r.{host_ident}, pair.c
          FROM rows r
+         LEFT JOIN _ignored_rows ir ON ir.row_num = r.row_num
          JOIN (SELECT {user_ident} AS u, {host_ident} AS h, COUNT(*) AS c FROM rows
+               LEFT JOIN _ignored_rows ir2 ON ir2.row_num = rows.row_num
                WHERE {user_ident} IS NOT NULL AND TRIM({user_ident}) != ''
                  AND {host_ident} IS NOT NULL AND TRIM({host_ident}) != ''
+                 AND ir2.row_num IS NULL
                GROUP BY {user_ident}, {host_ident} HAVING c <= ?1) pair
            ON r.{user_ident} = pair.u AND r.{host_ident} = pair.h
          JOIN (SELECT {user_ident} AS u, COUNT(*) AS c FROM rows
+               LEFT JOIN _ignored_rows ir3 ON ir3.row_num = rows.row_num
+               WHERE ir3.row_num IS NULL
                GROUP BY {user_ident} HAVING c >= ?2) active
            ON pair.u = active.u
+         WHERE ir.row_num IS NULL
          ORDER BY r.row_num ASC
          LIMIT ?3"
     );
@@ -517,7 +536,9 @@ fn off_hours_findings(conn: &Connection) -> Result<Vec<Finding>> {
     let (total, off): (i64, i64) = conn.query_row(
         &format!(
             "SELECT COUNT(*), SUM(CASE WHEN {off_hours_predicate} THEN 1 ELSE 0 END)
-             FROM _row_time"
+             FROM _row_time
+             LEFT JOIN _ignored_rows ir ON ir.row_num = _row_time.row_num
+             WHERE ir.row_num IS NULL"
         ),
         [],
         |row| {
@@ -537,9 +558,10 @@ fn off_hours_findings(conn: &Connection) -> Result<Vec<Finding>> {
     }
     let mut findings = Vec::new();
     let mut stmt = conn.prepare(&format!(
-        "SELECT row_num, utc_text FROM _row_time
-         WHERE {off_hours_predicate}
-         ORDER BY row_num ASC
+        "SELECT _row_time.row_num, utc_text FROM _row_time
+         LEFT JOIN _ignored_rows ir ON ir.row_num = _row_time.row_num
+         WHERE ({off_hours_predicate}) AND ir.row_num IS NULL
+         ORDER BY _row_time.row_num ASC
          LIMIT ?1"
     ))?;
     let mut rows = stmt.query([MAX_OFF_HOURS_FINDINGS as i64])?;
@@ -892,6 +914,7 @@ mod tests {
         let summary = scan_anomalies(&mut conn, &columns, |_, _, _| {}).unwrap();
 
         assert_eq!(summary.rows_scanned, 5);
+        assert_eq!(summary.rows_ignored, 0);
         let categories_for = |row: i64| -> Vec<String> {
             let mut stmt = conn
                 .prepare("SELECT category FROM _anomaly WHERE row_num = ?1 ORDER BY category")
@@ -965,6 +988,135 @@ mod tests {
             .unwrap();
         assert_eq!(ordinary_flagged, 0);
         assert_eq!(summary.rows_scanned, 121);
+    }
+
+    #[test]
+    fn rare_user_host_denominator_excludes_ignored_rows() {
+        let mut conn = test_conn(&["proc", "acct", "box"]);
+        add_role(&conn, "process_name", "proc");
+        add_role(&conn, "user", "acct");
+        add_role(&conn, "host", "box");
+        // 120 ordinary rows keep alice "active" and WS-1 her common host.
+        for row_num in 1..=120 {
+            conn.execute(
+                "INSERT INTO rows (row_num, proc, acct, box) VALUES (?1, 'svchost.exe', 'alice', 'WS-1')",
+                [row_num],
+            )
+            .unwrap();
+        }
+        // The real anomaly: alice's single hop to DC-9 on a non-Qualys process.
+        conn.execute(
+            "INSERT INTO rows (row_num, proc, acct, box) VALUES (121, 'xyzdumper.exe', 'alice', 'DC-9')",
+            [],
+        )
+        .unwrap();
+        // Noise: 6 more alice/DC-9 rows via the Qualys agent. Left uncounted-for, these would
+        // inflate (alice, DC-9)'s raw row count from 1 to 7 — over RARE_VALUE_MAX_COUNT — and
+        // hide row 121's pairing, which is genuinely rare among real (non-ignored) traffic.
+        for row_num in 122..=127 {
+            conn.execute(
+                "INSERT INTO rows (row_num, proc, acct, box) VALUES (?1, 'QualysAgent.exe', 'alice', 'DC-9')",
+                [row_num],
+            )
+            .unwrap();
+        }
+
+        let columns = vec![
+            column("proc", "Process"),
+            column("acct", "Account"),
+            column("box", "Host"),
+        ];
+        let summary = scan_anomalies(&mut conn, &columns, |_, _, _| {}).unwrap();
+
+        let row_121: Vec<String> = {
+            let mut stmt = conn
+                .prepare("SELECT category FROM _anomaly WHERE row_num = 121 ORDER BY category")
+                .unwrap();
+            stmt.query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        assert!(
+            row_121.contains(&"rare_user_host".to_string()),
+            "6 ignored Qualys rows sharing (alice, DC-9) must not inflate the rarity \
+             denominator and hide row 121's genuinely rare pairing: {row_121:?}"
+        );
+
+        let ignored_flagged: i64 = conn
+            .query_row(
+                "SELECT COUNT(DISTINCT row_num) FROM _anomaly WHERE row_num BETWEEN 122 AND 127",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(ignored_flagged, 0, "ignored rows must never surface in _anomaly");
+        assert_eq!(summary.rows_ignored, 6);
+        assert_eq!(summary.ignored_by_rule.len(), 1);
+        assert_eq!(summary.ignored_by_rule[0].rule_id, "qualys-agent-activity");
+        assert_eq!(summary.ignored_by_rule[0].row_count, 6);
+    }
+
+    #[test]
+    fn off_hours_ratio_excludes_ignored_rows_from_numerator_and_denominator() {
+        let mut conn = test_conn(&["msg", "proc"]);
+        add_role(&conn, "process_name", "proc");
+        db::create_row_time_table(&conn).unwrap();
+        // 99 business-hours rows + 1 real off-hours row (row 50): a business-hours dataset
+        // with one genuine outlier, same shape as off_hours_only_fires_in_business_hours_datasets.
+        for row_num in 1..=100i64 {
+            let epoch_ms = if row_num == 50 {
+                1_752_800_400_000i64 // 01:00 UTC
+            } else {
+                1_752_825_600_000i64 // 08:00 UTC
+            };
+            conn.execute(
+                "INSERT INTO rows (row_num, msg, proc) VALUES (?1, 'event', 'svchost.exe')",
+                [row_num],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO _row_time (row_num, epoch_ms, utc_text, source_text, parse_status)
+                 VALUES (?1, ?2, ?3, 'src', 'ok')",
+                rusqlite::params![row_num, epoch_ms, format!("row-{row_num}")],
+            )
+            .unwrap();
+        }
+        // 20 more off-hours rows, all ignored via the Qualys agent rule. Left uncounted-for,
+        // these push the off-hours ratio from 1/100 (1%) to 21/120 (17.5%) — over
+        // OFF_HOURS_MAX_RATIO — and would silence the whole category, hiding row 50.
+        for row_num in 101..=120i64 {
+            conn.execute(
+                "INSERT INTO rows (row_num, msg, proc) VALUES (?1, 'event', 'QualysAgent.exe')",
+                [row_num],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO _row_time (row_num, epoch_ms, utc_text, source_text, parse_status)
+                 VALUES (?1, 1752800400000, ?2, 'src', 'ok')",
+                rusqlite::params![row_num, format!("row-{row_num}")],
+            )
+            .unwrap();
+        }
+
+        let columns = vec![column("msg", "Message"), column("proc", "Process")];
+        let summary = scan_anomalies(&mut conn, &columns, |_, _, _| {}).unwrap();
+
+        let row_50_categories: Vec<String> = {
+            let mut stmt = conn
+                .prepare("SELECT category FROM _anomaly WHERE row_num = 50")
+                .unwrap();
+            stmt.query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        assert!(
+            row_50_categories.contains(&"off_hours".to_string()),
+            "20 ignored off-hours rows must not inflate the ratio past OFF_HOURS_MAX_RATIO and \
+             silence the category for the genuinely rare off-hours row: {row_50_categories:?}"
+        );
+        assert_eq!(summary.rows_ignored, 20);
     }
 
     #[test]

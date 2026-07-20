@@ -38,6 +38,7 @@
       "../LICENSE": "legal/LICENSE",
       "../NOTICE": "legal/NOTICE",
       "resources/intel/mitre_core.v1.json": "intel/mitre_core.v1.json",
+      "resources/intel/ignore_rules.v1.json": "intel/ignore_rules.v1.json",
       "resources/models/qwen2.5-1.5b-instruct-q4_k_m.gguf": "models/qwen2.5-1.5b-instruct-q4_k_m.gguf",
       "resources/models/qwen2.5-1.5b-instruct-tokenizer.json": "models/qwen2.5-1.5b-instruct-tokenizer.json",
       "resources/models/all-minilm-l6-v2-model.safetensors": "models/all-minilm-l6-v2-model.safetensors",

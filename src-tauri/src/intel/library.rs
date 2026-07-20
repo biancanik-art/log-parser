@@ -437,7 +437,7 @@ fn bytes_to_hex(bytes: &[u8]) -> String {
     output
 }
 
-fn normalize_line_endings(value: &str) -> Cow<'_, str> {
+pub(crate) fn normalize_line_endings(value: &str) -> Cow<'_, str> {
     if value.contains("\r\n") {
         Cow::Owned(value.replace("\r\n", "\n"))
     } else {

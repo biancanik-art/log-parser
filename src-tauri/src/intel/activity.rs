@@ -39,6 +39,8 @@ const EVENT_ID_HEADERS: [&str; 3] = ["eventid", "eventcode", "eventnumber"];
 pub struct ActivityScanSummary {
     pub rows_classified: i64,
     pub categories: Vec<ActivityCategorySummary>,
+    pub rows_ignored: i64,
+    pub ignored_by_rule: Vec<crate::intel::ignore_rules::IgnoredRuleBreakdown>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -263,10 +265,11 @@ fn plan_signal_columns(conn: &Connection, columns: &[ColumnMeta]) -> Result<Sign
     Ok(plan)
 }
 
-/// Classifies EVERY row into exactly one activity category and atomically publishes the result
-/// to `_row_activity`. Deterministic and complete by design: the examiner asked "row by row,
-/// what activity is there" — a row the heuristics cannot place still gets a labeled `other`
-/// row rather than silence.
+/// Classifies EVERY non-ignored row into exactly one activity category and atomically publishes
+/// the result to `_row_activity`. Deterministic and complete by design: the examiner asked "row
+/// by row, what activity is there" — a row the heuristics cannot place still gets a labeled
+/// `other` row rather than silence. Rows matching an enabled ignore rule are excluded entirely
+/// (see `_ignored_rows`), not classified as `other`.
 pub fn classify_rows(
     conn: &mut Connection,
     columns: &[ColumnMeta],
@@ -296,6 +299,8 @@ fn classify_into_staging(
 ) -> Result<ActivityScanSummary> {
     let total_rows: i64 = conn.query_row("SELECT COUNT(*) FROM rows", [], |row| row.get(0))?;
     let plan = plan_signal_columns(conn, columns)?;
+    crate::intel::ignore_rules::ensure_ignored_rows_computed(conn)?;
+    let ignored = crate::intel::ignore_rules::load_ignored_row_set(conn)?;
     on_progress(0, total_rows, "classifying");
 
     let select_sql = if plan.select_idents.is_empty() {
@@ -307,6 +312,7 @@ fn classify_into_staging(
         )
     };
 
+    let mut rows_visited = 0i64;
     let mut rows_classified = 0i64;
     let mut last_row_num = i64::MIN;
     let mut next_progress_at = PROGRESS_INTERVAL_ROWS;
@@ -330,14 +336,16 @@ fn classify_into_staging(
             break;
         }
 
-        let tx_rows: Vec<(i64, &'static str, String, String)> = batch
-            .iter()
-            .map(|(row_num, values)| {
-                last_row_num = *row_num;
-                let (category, detail, source) = classify_row(&plan, values);
-                (*row_num, category, detail, source)
-            })
-            .collect();
+        let mut tx_rows: Vec<(i64, &'static str, String, String)> = Vec::with_capacity(batch.len());
+        for (row_num, values) in &batch {
+            last_row_num = *row_num;
+            rows_visited += 1;
+            if ignored.contains(row_num) {
+                continue;
+            }
+            let (category, detail, source) = classify_row(&plan, values);
+            tx_rows.push((*row_num, category, detail, source));
+        }
         {
             let mut stmt = conn.prepare_cached(&format!(
                 "INSERT INTO {STAGING_TABLE} (row_num, category, detail, source_column)
@@ -349,9 +357,9 @@ fn classify_into_staging(
         }
         rows_classified += tx_rows.len() as i64;
 
-        if rows_classified >= next_progress_at {
-            on_progress(rows_classified, total_rows, "classifying");
-            while next_progress_at <= rows_classified {
+        if rows_visited >= next_progress_at {
+            on_progress(rows_visited, total_rows, "classifying");
+            while next_progress_at <= rows_visited {
                 next_progress_at += PROGRESS_INTERVAL_ROWS;
             }
         }
@@ -374,7 +382,7 @@ fn classify_into_staging(
     )?;
     tx.commit()?;
 
-    on_progress(rows_classified, total_rows, "complete");
+    on_progress(rows_visited, total_rows, "complete");
     summarize(conn, rows_classified)
 }
 
@@ -466,9 +474,12 @@ fn summarize(conn: &Connection, rows_classified: i64) -> Result<ActivityScanSumm
             top_details,
         });
     }
+    let (rows_ignored, ignored_by_rule) = crate::intel::ignore_rules::ignored_rows_summary(conn)?;
     Ok(ActivityScanSummary {
         rows_classified,
         categories,
+        rows_ignored,
+        ignored_by_rule,
     })
 }
 
@@ -566,6 +577,7 @@ mod tests {
         let summary = classify_rows(&mut conn, &columns, |_, _, _| {}).unwrap();
 
         assert_eq!(summary.rows_classified, 6);
+        assert_eq!(summary.rows_ignored, 0);
         assert_eq!(category_of(&conn, 1), "authentication");
         assert_eq!(category_of(&conn, 2), "account_management");
         assert_eq!(category_of(&conn, 3), "process");
@@ -573,6 +585,45 @@ mod tests {
         assert_eq!(category_of(&conn, 5), "scheduled_task");
         // 9999 is unmapped, but the message descriptor still resolves it.
         assert_eq!(category_of(&conn, 6), "other");
+    }
+
+    #[test]
+    fn ignored_row_is_excluded_from_classification_entirely() {
+        let mut conn = test_conn(&["event_id", "processname"]);
+        add_role(&conn, "process_name", "processname");
+        conn.execute(
+            "INSERT INTO rows (row_num, event_id, processname) VALUES
+             (1, '4624', 'QualysAgent.exe'),
+             (2, '4624', 'winlogon.exe')",
+            [],
+        )
+        .unwrap();
+        let columns = vec![
+            column("event_id", "EventID"),
+            column("processname", "ProcessName"),
+        ];
+        let summary = classify_rows(&mut conn, &columns, |_, _, _| {}).unwrap();
+
+        assert_eq!(
+            summary.rows_classified, 1,
+            "the Qualys row is excluded entirely, not classified as 'other'"
+        );
+        assert_eq!(summary.rows_ignored, 1);
+        assert_eq!(summary.ignored_by_rule.len(), 1);
+        assert_eq!(summary.ignored_by_rule[0].rule_id, "qualys-agent-activity");
+        assert_eq!(category_of(&conn, 2), "authentication");
+
+        let row1_exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM _row_activity WHERE row_num = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            row1_exists, 0,
+            "ignored row must not appear in _row_activity, not even as 'other'"
+        );
     }
 
     #[test]

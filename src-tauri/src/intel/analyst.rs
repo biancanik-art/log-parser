@@ -365,6 +365,37 @@ pub fn ask(
         }),
     }
 
+    // Step 6: how many rows active ignore rules excluded from steps 3-5 above. Dataset-wide,
+    // not specific to any one stage, so it's stated once here rather than repeated in each of
+    // their details — by this point every stage above has run, so `_ignored_rows` is populated.
+    on_progress("ignore-rules");
+    match crate::intel::ignore_rules::ignored_rows_summary(conn) {
+        Ok((rows_ignored, by_rule)) if rows_ignored > 0 => {
+            let breakdown = by_rule
+                .iter()
+                .map(|rule| format!("{} ({})", rule.rule_name, rule.row_count))
+                .collect::<Vec<_>>()
+                .join(", ");
+            steps.push(AnalystStep {
+                step: "ignore_rules".to_string(),
+                status: "ran".to_string(),
+                detail: format!(
+                    "{rows_ignored} row(s) excluded from analysis by active ignore rules: {breakdown}"
+                ),
+            });
+        }
+        Ok(_) => steps.push(AnalystStep {
+            step: "ignore_rules".to_string(),
+            status: "ran".to_string(),
+            detail: "no rows excluded by ignore rules".to_string(),
+        }),
+        Err(error) => steps.push(AnalystStep {
+            step: "ignore_rules".to_string(),
+            status: "failed".to_string(),
+            detail: error.to_string(),
+        }),
+    }
+
     on_progress("compose");
     let sections = compose_sections(
         conn,
@@ -898,6 +929,47 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn profile_ask_reports_an_ignore_rules_step() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        let columns = vec![db::ColumnMeta {
+            sql_name: "processname".into(),
+            original_name: "ProcessName".into(),
+            col_index: 0,
+            inferred_type: "text".into(),
+        }];
+        db::create_schema(&conn, &columns).unwrap();
+        db::create_column_roles_table(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO _column_roles (role, sql_name, confidence, status, reasons_json)
+             VALUES ('process_name', 'processname', 1.0, 'confirmed', '[]')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO rows (row_num, processname) VALUES
+             (1, 'QualysAgent.exe'), (2, 'winlogon.exe'), (3, 'explorer.exe')",
+            [],
+        )
+        .unwrap();
+
+        let answer = ask(&mut conn, &columns, "what is in this file?", |_| {}).unwrap();
+        let ignore_step = answer
+            .steps
+            .iter()
+            .find(|step| step.step == "ignore_rules")
+            .expect("ignore_rules step must always be present");
+        assert_eq!(ignore_step.status, "ran");
+        assert!(
+            ignore_step.detail.contains("1 row(s)")
+                && ignore_step.detail.contains("Qualys Cloud Agent process activity"),
+            "{}",
+            ignore_step.detail
+        );
+        assert_eq!(answer.activity.as_ref().unwrap().rows_ignored, 1);
+        assert_eq!(answer.anomalies.as_ref().unwrap().rows_ignored, 1);
     }
 
     #[test]

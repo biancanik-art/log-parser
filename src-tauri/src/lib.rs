@@ -23,6 +23,10 @@ pub fn run() {
                 .path()
                 .resolve("intel/mitre_core.v1.json", BaseDirectory::Resource)?;
             intel::library::configure_builtin_library_path(library_path)?;
+            let ignore_rules_path = app
+                .path()
+                .resolve("intel/ignore_rules.v1.json", BaseDirectory::Resource)?;
+            intel::ignore_rules::configure_builtin_ignore_rules_path(ignore_rules_path)?;
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -39,6 +43,10 @@ pub fn run() {
             commands::clear_loaded_file,
             commands::detect_column_roles,
             commands::set_column_role_status,
+            commands::list_ignore_rules,
+            commands::add_custom_ignore_rule,
+            commands::delete_custom_ignore_rule,
+            commands::set_ignore_rule_enabled,
             commands::analyze_timestamp_column,
             commands::normalize_timestamp_column,
             commands::export_data,

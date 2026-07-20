@@ -1010,6 +1010,8 @@ where
     // that underestimates cannot let a build overrun its resource limits.
     let source_expressions = source_select_expressions(columns);
     let rows_total: i64 = conn.query_row("SELECT COUNT(*) FROM rows", [], |row| row.get(0))?;
+    // Callers ensure `_ignored_rows` is current before calling this function.
+    let ignored = crate::intel::ignore_rules::load_ignored_row_set(conn)?;
     let mut cursor = 0i64;
     let mut sampled_rows = 0i64;
     let mut scanned_all_rows = false;
@@ -1030,6 +1032,13 @@ where
         for (row_num, values) in &batch.rows {
             cursor = *row_num;
             sampled_rows += 1;
+            if ignored.contains(row_num) {
+                // Never embedded, so it must not inflate the document/mapping estimate — but
+                // it still counts as a sampled row (conservative: at worst this shrinks the
+                // effective sample on a heavily-noisy file, which the doc comment above already
+                // establishes is safe since budget_documents_v2 enforces hard caps regardless).
+                continue;
+            }
             let mut row_hashes = HashSet::<String>::new();
             for (kind, column_key, text) in row_documents_v2(plans, values) {
                 let hash = text_sha256(kind, &column_key, &text);
@@ -1103,6 +1112,8 @@ pub struct SemanticIndexSummary {
     pub cancelled: bool,
     pub model_name: &'static str,
     pub model_version: &'static str,
+    pub rows_ignored: i64,
+    pub ignored_by_rule: Vec<crate::intel::ignore_rules::IgnoredRuleBreakdown>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1166,7 +1177,11 @@ pub fn semantic_schema_hash(columns: &[ColumnMeta]) -> String {
 
 /// Stable identity for semantic artifacts. Raw imported rows are immutable; the cache import
 /// record, schema, and row count therefore identify the dataset without depending on optional
-/// role, timestamp, or intelligence-enrichment tables.
+/// role or timestamp tables. Ignore-rule state IS folded in, deliberately: which rows the index
+/// actually contains depends on it, so an existing "ready" build must be invalidated the same
+/// way a schema change would when the merged rule set or a confirmed role mapping changes —
+/// otherwise a rule added after a build already exists would silently keep serving results that
+/// include rows the user just asked to suppress.
 pub fn semantic_dataset_hash(conn: &Connection, columns: &[ColumnMeta]) -> Result<String> {
     let mut hasher = Sha256::new();
     hasher.update(V2_INDEX_VERSION.as_bytes());
@@ -1184,6 +1199,10 @@ pub fn semantic_dataset_hash(conn: &Connection, columns: &[ColumnMeta]) -> Resul
         }
         hasher.update(info.row_count.to_le_bytes());
     }
+    let merged_ignore_rules = crate::intel::ignore_rules::load_merged_ignore_rules(conn)?;
+    let ignore_rules_hash =
+        crate::intel::ignore_rules::rules_state_hash(conn, &merged_ignore_rules)?;
+    hasher.update(ignore_rules_hash.as_bytes());
     Ok(bytes_to_hex(&hasher.finalize()))
 }
 
@@ -4258,6 +4277,7 @@ fn build_summary(
     } else {
         Vec::new()
     };
+    let (rows_ignored, ignored_by_rule) = crate::intel::ignore_rules::ignored_rows_summary(conn)?;
     Ok(SemanticIndexSummary {
         rows_indexed: rows,
         documents_indexed: documents,
@@ -4276,6 +4296,8 @@ fn build_summary(
         cancelled,
         model_name: MODEL_NAME,
         model_version: MODEL_VERSION,
+        rows_ignored,
+        ignored_by_rule,
     })
 }
 
@@ -4346,6 +4368,8 @@ where
         create_semantic_v2_schema(&schema_tx)?;
         schema_tx.commit()?;
     }
+    crate::intel::ignore_rules::ensure_ignored_rows_computed(conn)?;
+    let ignored = crate::intel::ignore_rules::load_ignored_row_set(conn)?;
     let rows_total: i64 = conn.query_row("SELECT COUNT(*) FROM rows", [], |row| row.get(0))?;
     let empty_progress = |phase: &str, build_id: i64| SemanticBuildProgress {
         build_id,
@@ -4504,10 +4528,10 @@ where
 
             let source_batch =
                 load_bounded_source_batch(conn, columns, &source_expressions, cursor)?;
-            let source_rows = source_batch.rows;
+            let raw_source_rows = source_batch.rows;
             let cells_truncated = source_batch.cells_truncated;
 
-            if source_rows.is_empty() {
+            if raw_source_rows.is_empty() {
                 if is_cancelled() {
                     continue;
                 }
@@ -4547,6 +4571,15 @@ where
                 });
                 return Ok(summary);
             }
+
+            // Cursor advancement and the rows-visited count must come from the raw fetched
+            // page, before ignore-filtering — if a long contiguous run of ignored rows fills an
+            // entire page, filtering it down to empty here must not stall pagination on the
+            // same page forever, and progress must still visibly reach rows_total.
+            let last_row = raw_source_rows.last().map(|row| row.0).unwrap_or(cursor);
+            let rows_visited = raw_source_rows.len() as i64;
+            let mut source_rows = raw_source_rows;
+            source_rows.retain(|(row_num, _)| !ignored.contains(row_num));
 
             let (rows_before, mapped_documents_before, mappings_before): (i64, i64, i64) = conn
                 .query_row(
@@ -4646,7 +4679,6 @@ where
                 return build_summary(conn, build_id, started, false, resumed, true);
             }
 
-            let last_row = source_rows.last().map(|row| row.0).unwrap_or(cursor);
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let claimed = tx.execute(
                 "UPDATE _semantic_v2_build SET
@@ -4659,7 +4691,7 @@ where
                 params![
                     build_id,
                     last_row,
-                    source_rows.len() as i64,
+                    rows_visited,
                     budgeted.documents_seen,
                     chrono::Utc::now().to_rfc3339(),
                     cursor,
@@ -6471,6 +6503,157 @@ mod tests {
         assert_eq!(summary.mappings_written, 120);
         assert_eq!(summary.documents_skipped, 0);
         assert_eq!(summary.mappings_skipped, 0);
+        assert_eq!(summary.rows_ignored, 0);
+    }
+
+    #[test]
+    fn ignored_rows_are_never_embedded_or_mapped() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        let columns = vec![
+            text_column("event_id", "Event ID", 0),
+            text_column("processname", "ProcessName", 1),
+        ];
+        db::create_schema(&conn, &columns).unwrap();
+        db::create_column_roles_table(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO _column_roles (role, sql_name, confidence, status, reasons_json)
+             VALUES ('process_name', 'processname', 1.0, 'confirmed', '[]')",
+            [],
+        )
+        .unwrap();
+        let tx = conn.transaction().unwrap();
+        {
+            let mut insert = tx
+                .prepare("INSERT INTO rows(row_num, event_id, processname) VALUES (?1, ?2, ?3)")
+                .unwrap();
+            // 3 real rows with distinct content.
+            for index in 0..3i64 {
+                insert
+                    .execute(params![index + 1, format!("evt-{index}"), "svchost.exe"])
+                    .unwrap();
+            }
+            // 2 Qualys rows — must never reach the embedder or _semantic_v2_mapping.
+            for index in 3..5i64 {
+                insert
+                    .execute(params![index + 1, format!("evt-{index}"), "QualysAgent.exe"])
+                    .unwrap();
+            }
+        }
+        tx.commit().unwrap();
+
+        let embedder = FakeEmbedder::default();
+        let summary = ensure_semantic_index_v2_with_limits(
+            &mut conn,
+            &columns,
+            &embedder,
+            || false,
+            |_| {},
+            SemanticResourceLimits {
+                mapped_documents: 100,
+                mappings: 100,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(summary.rows_indexed, 5, "all 5 rows are visited for progress purposes");
+        assert_eq!(summary.rows_ignored, 2);
+        assert_eq!(summary.ignored_by_rule.len(), 1);
+        assert_eq!(summary.ignored_by_rule[0].rule_id, "qualys-agent-activity");
+        assert_eq!(summary.ignored_by_rule[0].row_count, 2);
+
+        let mapped_rows: Vec<i64> = conn
+            .prepare("SELECT DISTINCT row_num FROM _semantic_v2_mapping ORDER BY row_num")
+            .unwrap()
+            .query_map([], |row| row.get::<_, i64>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            mapped_rows,
+            vec![1, 2, 3],
+            "the Qualys rows must never be mapped/embedded"
+        );
+
+        let seen = embedder.seen.lock().unwrap();
+        assert!(
+            seen.iter().all(|text| !text.to_lowercase().contains("qualys")),
+            "no Qualys row content should ever reach the embedder: {seen:?}"
+        );
+    }
+
+    #[test]
+    fn an_entire_ignored_batch_does_not_stall_the_cursor() {
+        // Regression test for the exact scenario this feature targets: a long contiguous run
+        // of one noisy source (e.g. a Qualys scan) filling an entire V2_SOURCE_BATCH_ROWS page.
+        // If cursor advancement were derived from the ignore-filtered batch instead of the raw
+        // fetch, an all-ignored page would filter down to empty, `.last()` would return `None`,
+        // and the cursor would never move past 0 — infinitely refetching the same page. This
+        // test times out (never returns) rather than failing an assertion if that regresses.
+        let mut conn = Connection::open_in_memory().unwrap();
+        let columns = vec![
+            text_column("event_id", "Event ID", 0),
+            text_column("processname", "ProcessName", 1),
+        ];
+        db::create_schema(&conn, &columns).unwrap();
+        db::create_column_roles_table(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO _column_roles (role, sql_name, confidence, status, reasons_json)
+             VALUES ('process_name', 'processname', 1.0, 'confirmed', '[]')",
+            [],
+        )
+        .unwrap();
+        let tx = conn.transaction().unwrap();
+        {
+            let mut insert = tx
+                .prepare("INSERT INTO rows(row_num, event_id, processname) VALUES (?1, ?2, ?3)")
+                .unwrap();
+            // Exactly one full source batch, entirely Qualys/ignored.
+            for row_num in 1..=(V2_SOURCE_BATCH_ROWS as i64) {
+                insert
+                    .execute(params![row_num, format!("evt-{row_num}"), "QualysAgent.exe"])
+                    .unwrap();
+            }
+            // A handful of real rows spilling into the next batch.
+            for offset in 0..3i64 {
+                let row_num = V2_SOURCE_BATCH_ROWS as i64 + 1 + offset;
+                insert
+                    .execute(params![row_num, format!("evt-{row_num}"), "winlogon.exe"])
+                    .unwrap();
+            }
+        }
+        tx.commit().unwrap();
+
+        let embedder = FakeEmbedder::default();
+        let summary = ensure_semantic_index_v2_with_limits(
+            &mut conn,
+            &columns,
+            &embedder,
+            || false,
+            |_| {},
+            SemanticResourceLimits {
+                mapped_documents: 100,
+                mappings: 100,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(summary.rows_indexed, V2_SOURCE_BATCH_ROWS as i64 + 3);
+        assert_eq!(summary.rows_ignored, V2_SOURCE_BATCH_ROWS as i64);
+        let mapped_rows: Vec<i64> = conn
+            .prepare("SELECT DISTINCT row_num FROM _semantic_v2_mapping ORDER BY row_num")
+            .unwrap()
+            .query_map([], |row| row.get::<_, i64>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            mapped_rows,
+            vec![
+                V2_SOURCE_BATCH_ROWS as i64 + 1,
+                V2_SOURCE_BATCH_ROWS as i64 + 2,
+                V2_SOURCE_BATCH_ROWS as i64 + 3
+            ]
+        );
     }
 
     #[test]

@@ -1,6 +1,7 @@
 use crate::db::{self, ColumnMeta, ImportInfo};
 use crate::export;
 use crate::intel::analyst::{self, AnalystAnswer};
+use crate::intel::ignore_rules::{self, IgnoreRulesListing, NewIgnoreRuleInput};
 use crate::intel::matcher::{self, IntelScanSummary};
 use crate::intel::{llm_parser, parser as guided_parser, query as guided_query, roles, time};
 use crate::query::{self, QueryExpression, QueryPage, QuerySpec};
@@ -1274,6 +1275,64 @@ pub async fn set_column_role_status(
     })
     .await
     .map_err(|e| format!("column role update task join error: {e}"))?
+}
+
+// Ignore rules are per-file, stored in the currently loaded database like column roles are —
+// not a shared global config. Same state_snapshot/db::open/spawn_blocking shape as
+// set_column_role_status above; a file must be loaded to use any of these.
+
+#[tauri::command]
+pub async fn list_ignore_rules(state: State<'_, AppState>) -> Result<IgnoreRulesListing, String> {
+    let (db_path, _, _) = state_snapshot(&state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = db::open(&db_path).map_err(|e| e.to_string())?;
+        ignore_rules::list_ignore_rules(&conn).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("list ignore rules task join error: {e}"))?
+}
+
+#[tauri::command]
+pub async fn add_custom_ignore_rule(
+    state: State<'_, AppState>,
+    input: NewIgnoreRuleInput,
+) -> Result<IgnoreRulesListing, String> {
+    let (db_path, _, _) = state_snapshot(&state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = db::open(&db_path).map_err(|e| e.to_string())?;
+        ignore_rules::add_custom_ignore_rule(&conn, input).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("add ignore rule task join error: {e}"))?
+}
+
+#[tauri::command]
+pub async fn delete_custom_ignore_rule(
+    state: State<'_, AppState>,
+    rule_id: String,
+) -> Result<IgnoreRulesListing, String> {
+    let (db_path, _, _) = state_snapshot(&state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = db::open(&db_path).map_err(|e| e.to_string())?;
+        ignore_rules::delete_custom_ignore_rule(&conn, &rule_id).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("delete ignore rule task join error: {e}"))?
+}
+
+#[tauri::command]
+pub async fn set_ignore_rule_enabled(
+    state: State<'_, AppState>,
+    rule_id: String,
+    enabled: bool,
+) -> Result<IgnoreRulesListing, String> {
+    let (db_path, _, _) = state_snapshot(&state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = db::open(&db_path).map_err(|e| e.to_string())?;
+        ignore_rules::set_ignore_rule_enabled(&conn, &rule_id, enabled).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("set ignore rule enabled task join error: {e}"))?
 }
 
 #[tauri::command]
