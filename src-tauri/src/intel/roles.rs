@@ -7,6 +7,17 @@ use std::collections::HashSet;
 use std::net::IpAddr;
 
 const SAMPLE_LIMIT: i64 = 500;
+/// Above this many columns, per-value scoring is scaled down: this codebase's normal files
+/// (Sentinel/Taegis/Defender exports) run ~50-300 columns, so this threshold never engages for
+/// real-world normal usage — it exists for pathological outliers (e.g. a 1,824-column export)
+/// where scoring 8 roles x every column x 500 sampled values each becomes a multi-minute
+/// synchronous scan. See AGENT_NOTES/memory for the real-file freeze this fixes.
+const WIDE_FILE_COLUMN_THRESHOLD: usize = 500;
+/// Reduced per-column sample size used only once `WIDE_FILE_COLUMN_THRESHOLD` is exceeded.
+const WIDE_FILE_SAMPLE_LIMIT: i64 = 120;
+/// Hard cap on characters considered per sampled cell, mirroring semantic.rs's
+/// `V2_MAX_CELL_INPUT_CHARS` precedent for the same class of problem.
+const MAX_SAMPLE_VALUE_CHARS: usize = 4_000;
 const ROLES: [&str; 8] = [
     "timestamp",
     "user",
@@ -85,7 +96,14 @@ pub fn detect_column_roles(
     columns: &[ColumnMeta],
 ) -> Result<Vec<ColumnRoleSuggestion>> {
     db::create_column_roles_table(conn)?;
-    let samples = sample_column_values(conn, columns)?;
+    let wide_file = columns.len() > WIDE_FILE_COLUMN_THRESHOLD;
+    let sample_limit = if wide_file {
+        WIDE_FILE_SAMPLE_LIMIT
+    } else {
+        SAMPLE_LIMIT
+    };
+    let candidate_mask = candidate_column_mask(columns, wide_file);
+    let samples = sample_column_values(conn, columns, &candidate_mask, sample_limit)?;
 
     // Score every role against every column independently first (each role's candidates sorted
     // best-first), then assign roles to columns greedily by confidence: the strongest signal
@@ -279,27 +297,58 @@ fn upsert_suggestion(conn: &Connection, candidate: &Candidate) -> Result<()> {
     Ok(())
 }
 
-fn sample_column_values(conn: &Connection, columns: &[ColumnMeta]) -> Result<Vec<Vec<String>>> {
+/// Which columns are worth spending a real per-value sample on. On normal-sized files (below
+/// `WIDE_FILE_COLUMN_THRESHOLD`) every column is a candidate, identical to the pre-existing
+/// behavior. On wide files, this reuses `score_column` as-is with an empty values slice — every
+/// `score_*` function's `if total > 0 { ...values scan... }` guard already short-circuits on
+/// empty input, so this only ever evaluates the cheap header-keyword check, never a value scan.
+/// A column with no header hint for any role gets no automatic suggestion on wide files (the
+/// examiner can still map it manually) instead of paying for 8 full value scans that were never
+/// going to score anyway.
+fn candidate_column_mask(columns: &[ColumnMeta], wide_file: bool) -> Vec<bool> {
+    if !wide_file {
+        return vec![true; columns.len()];
+    }
+    columns
+        .iter()
+        .map(|column| ROLES.iter().any(|&role| score_column(role, column, &[]).is_some()))
+        .collect()
+}
+
+fn sample_column_values(
+    conn: &Connection,
+    columns: &[ColumnMeta],
+    candidate_mask: &[bool],
+    sample_limit: i64,
+) -> Result<Vec<Vec<String>>> {
+    let mut samples = vec![Vec::new(); columns.len()];
     if columns.is_empty() {
-        return Ok(Vec::new());
+        return Ok(samples);
     }
 
-    let select_cols = columns
+    let selected: Vec<usize> = (0..columns.len()).filter(|&i| candidate_mask[i]).collect();
+    if selected.is_empty() {
+        return Ok(samples);
+    }
+
+    let select_cols = selected
         .iter()
-        .map(|column| db::quote_ident(&column.sql_name))
+        .map(|&i| db::quote_ident(&columns[i].sql_name))
         .collect::<Vec<_>>()
         .join(", ");
-    let sql = format!("SELECT {select_cols} FROM rows ORDER BY row_num ASC LIMIT {SAMPLE_LIMIT}");
+    let sql = format!("SELECT {select_cols} FROM rows ORDER BY row_num ASC LIMIT {sample_limit}");
     let mut stmt = conn.prepare(&sql)?;
     let mut rows = stmt.query([])?;
-    let mut samples = vec![Vec::new(); columns.len()];
 
     while let Some(row) = rows.next()? {
-        for (idx, column_samples) in samples.iter_mut().enumerate() {
-            let value: Option<String> = row.get(idx)?;
-            let value = value.unwrap_or_default();
+        for (result_idx, &orig_idx) in selected.iter().enumerate() {
+            let value: Option<String> = row.get(result_idx)?;
+            let mut value = value.unwrap_or_default();
+            if value.chars().count() > MAX_SAMPLE_VALUE_CHARS {
+                value = value.chars().take(MAX_SAMPLE_VALUE_CHARS).collect();
+            }
             if !value.trim().is_empty() {
-                column_samples.push(value);
+                samples[orig_idx].push(value);
             }
         }
     }
@@ -1041,5 +1090,127 @@ mod tests {
                 process_name.sql_name
             );
         }
+    }
+
+    fn signal_columns() -> Vec<ColumnMeta> {
+        vec![
+            ColumnMeta {
+                sql_name: "timegenerated".into(),
+                original_name: "TimeGenerated".into(),
+                col_index: 0,
+                inferred_type: "text".into(),
+            },
+            ColumnMeta {
+                sql_name: "account".into(),
+                original_name: "Account".into(),
+                col_index: 1,
+                inferred_type: "text".into(),
+            },
+            ColumnMeta {
+                sql_name: "processcommandline".into(),
+                original_name: "ProcessCommandLine".into(),
+                col_index: 2,
+                inferred_type: "text".into(),
+            },
+            ColumnMeta {
+                sql_name: "device_name".into(),
+                original_name: "DeviceName".into(),
+                col_index: 3,
+                inferred_type: "text".into(),
+            },
+            ColumnMeta {
+                sql_name: "sourceip".into(),
+                original_name: "SourceIP".into(),
+                col_index: 4,
+                inferred_type: "text".into(),
+            },
+        ]
+    }
+
+    fn push_noise_columns(columns: &mut Vec<ColumnMeta>, count: usize) {
+        let start = columns.len();
+        for i in 0..count {
+            // Deliberately keyword-free against every role's header list (no "user"/"time"/
+            // "file"/"host"/"ip" token/"process"/etc substrings) so these columns never score
+            // any automatic signal on their own - they exist purely to push the column count
+            // past WIDE_FILE_COLUMN_THRESHOLD.
+            columns.push(ColumnMeta {
+                sql_name: format!("noisecolumn{i:04}"),
+                original_name: format!("NoiseColumn{i:04}"),
+                col_index: start + i,
+                inferred_type: "text".into(),
+            });
+        }
+    }
+
+    #[test]
+    fn candidate_mask_narrows_to_header_matching_columns_on_wide_files() {
+        // Real-file regression guard: a 107,443-row x 1,824-column production export made
+        // `detect_column_roles` scan ~7.3M values (8 roles x every column x up to 500 sampled
+        // values, no early exit) and froze the whole app for over an hour. This proves the mask
+        // that fixes it actually narrows work at real-world scale (well past 1,824 columns),
+        // independent of any SQLite column-count ceiling since no database is involved here.
+        let mut columns = signal_columns();
+        let signal_count = columns.len();
+        push_noise_columns(&mut columns, 2_000);
+
+        let wide_mask = candidate_column_mask(&columns, true);
+        assert_eq!(
+            wide_mask.iter().filter(|&&m| m).count(),
+            signal_count,
+            "only the header-matching columns should be sampled once the wide-file threshold is crossed"
+        );
+        assert!(
+            wide_mask[..signal_count].iter().all(|&m| m),
+            "every real signal column must remain a candidate"
+        );
+        assert!(
+            wide_mask[signal_count..].iter().all(|&m| !m),
+            "header-less noise columns must be skipped on wide files"
+        );
+
+        let narrow_mask = candidate_column_mask(&columns, false);
+        assert!(
+            narrow_mask.iter().all(|&m| m),
+            "below the wide-file threshold every column must still be a candidate, unchanged from prior behavior"
+        );
+    }
+
+    #[test]
+    fn detect_column_roles_still_finds_signal_columns_on_a_wide_file() {
+        let conn = Connection::open_in_memory().unwrap();
+        let mut columns = signal_columns();
+        let signal_count = columns.len();
+        push_noise_columns(&mut columns, 600);
+        assert!(
+            columns.len() > WIDE_FILE_COLUMN_THRESHOLD,
+            "test fixture must actually exercise the wide-file path"
+        );
+        let _ = signal_count;
+
+        db::create_schema(&conn, &columns).unwrap();
+        conn.execute(
+            "INSERT INTO rows (row_num, timegenerated, account, processcommandline, device_name, sourceip)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                1i64,
+                "2026-01-01T02:30:00+02:00",
+                "CORP\\alice",
+                r#"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe -NoP -EncodedCommand SQBFAFg="#,
+                "WKSTN-01",
+                "10.0.0.5",
+            ],
+        )
+        .unwrap();
+
+        let suggestions = detect_column_roles(&conn, &columns).unwrap();
+        assert_eq!(role(&suggestions, "timestamp").sql_name, "timegenerated");
+        assert_eq!(role(&suggestions, "user").sql_name, "account");
+        assert_eq!(
+            role(&suggestions, "command_line").sql_name,
+            "processcommandline"
+        );
+        assert_eq!(role(&suggestions, "host").sql_name, "device_name");
+        assert_eq!(role(&suggestions, "ip").sql_name, "sourceip");
     }
 }

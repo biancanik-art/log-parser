@@ -94,6 +94,11 @@
 
   // -- state --------------------------------------------------------------
   const PAGE_SIZE = 300;
+  // Above this many columns, the grid switches to a cheaper layout/render mode (see the
+  // Tabulator setup below). Normal files here run ~50-300 columns; this exists for outliers
+  // (a real 1,824-column export made "fitDataFill" + non-virtualized rendering measure every
+  // cell of every column synchronously and stall the whole app).
+  const WIDE_GRID_COLUMN_THRESHOLD = 400;
 
   let columns = []; // ColumnMeta[] from ImportSummary
   let table = null;
@@ -142,6 +147,8 @@
   let controlsEnabled = false;
 
   let columnRoleSuggestions = [];
+  let cachedColumnOptionsRef = null;
+  let cachedColumnOptionsTemplate = null;
   let timestampAnalysis = null;
   let timestampNormalizationSummary = null;
   let intelScanSummaryResult = null;
@@ -747,6 +754,31 @@
     }
   }
 
+  // Building this <select>'s <option> list is the same 1-per-column DOM work for every one of
+  // the 8 roles, every time the panel renders (including once per single confirm/reject). On a
+  // very wide file (1,800+ columns) that's tens of thousands of createElement/appendChild calls
+  // per render. `columns` is reassigned wholesale on every import (never mutated in place), so
+  // reference equality is a safe, free cache-invalidation signal: build the template once per
+  // loaded file and hand out cheap native clones instead of rebuilding from scratch every time.
+  function columnOptionsTemplate() {
+    if (cachedColumnOptionsRef !== columns) {
+      const template = document.createElement("select");
+      const emptyOption = document.createElement("option");
+      emptyOption.value = "";
+      emptyOption.textContent = "(not mapped)";
+      template.appendChild(emptyOption);
+      columns.forEach((candidate) => {
+        const option = document.createElement("option");
+        option.value = candidate.sqlName;
+        option.textContent = candidate.originalName;
+        template.appendChild(option);
+      });
+      cachedColumnOptionsTemplate = template;
+      cachedColumnOptionsRef = columns;
+    }
+    return cachedColumnOptionsTemplate.cloneNode(true);
+  }
+
   function renderRoleSuggestions() {
     roleList.innerHTML = "";
     roleReviewPanel.classList.toggle("hidden", columns.length === 0);
@@ -779,19 +811,9 @@
       roleTitle.className = "role-title";
       roleTitle.textContent = formatRoleName(role);
 
-      const columnSelect = document.createElement("select");
+      const columnSelect = columnOptionsTemplate();
       columnSelect.className = "mapping-column-select";
       columnSelect.setAttribute("aria-label", `Column mapped to ${formatRoleName(role)}`);
-      const emptyOption = document.createElement("option");
-      emptyOption.value = "";
-      emptyOption.textContent = "(not mapped)";
-      columnSelect.appendChild(emptyOption);
-      columns.forEach((candidate) => {
-        const option = document.createElement("option");
-        option.value = candidate.sqlName;
-        option.textContent = candidate.originalName;
-        columnSelect.appendChild(option);
-      });
       columnSelect.value = suggestion.sqlName || "";
 
       const meta = document.createElement("div");
@@ -2542,6 +2564,7 @@
     spec = { search: null, filters: [], sort: null, expression: null, cursor: null, limit: PAGE_SIZE };
     resetPagination();
 
+    const isWideGrid = columns.length > WIDE_GRID_COLUMN_THRESHOLD;
     const tabulatorColumns = [
       { title: "#", field: "row_num", width: 70, headerSort: false, frozen: true },
       {
@@ -2572,6 +2595,7 @@
         field: c.sqlName,
         headerSort: false,
         resizable: true,
+        ...(isWideGrid ? { width: 160 } : {}),
       })),
     ];
 
@@ -2581,7 +2605,14 @@
     table = new Tabulator("#grid", {
       data: [],
       columns: tabulatorColumns,
-      layout: "fitDataFill",
+      // "fitDataFill" measures every rendered cell of every column to size columns to content
+      // (Tabulator's reinitializeWidth()/fitToData()) - on a very wide file that's real,
+      // synchronous, per-cell DOM measurement work repeated on every page turn. "fitColumns"
+      // instead sizes columns from fixed width/grow/shrink config with no content measurement,
+      // and "virtual" horizontal rendering avoids building DOM cells for off-screen columns.
+      // Below the threshold this is unchanged from before (fitDataFill + basic rendering).
+      layout: isWideGrid ? "fitColumns" : "fitDataFill",
+      renderHorizontal: isWideGrid ? "virtual" : "basic",
       height: "100%",
       placeholder: "No matching rows",
     });
