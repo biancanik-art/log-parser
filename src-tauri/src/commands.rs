@@ -2034,7 +2034,7 @@ pub async fn cross_search_files(
     .map_err(|e| format!("cross search task join error: {e}"))?
 }
 
-#[derive(Serialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct CrossFileIocOccurrence {
     pub file_name: String,
@@ -2044,7 +2044,7 @@ pub struct CrossFileIocOccurrence {
     pub first_row: i64,
 }
 
-#[derive(Serialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct CrossFileIocItem {
     pub ioc_type: String,
@@ -2056,7 +2056,7 @@ pub struct CrossFileIocItem {
     pub vpn_label: Option<String>,
 }
 
-#[derive(Serialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct CrossFileIocSummary {
     pub files_scanned: usize,
@@ -2257,6 +2257,156 @@ pub async fn cross_ioc_overlap(
     })
     .await
     .map_err(|e| format!("cross ioc overlap task join error: {e}"))?
+}
+
+#[tauri::command]
+pub async fn export_ioc_overlap_file(
+    dest_path: String,
+    items: Vec<CrossFileIocItem>,
+) -> Result<usize, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let path = PathBuf::from(&dest_path);
+        let ext = path
+            .extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or("json")
+            .to_lowercase();
+
+        let count = items.len();
+
+        match ext.as_str() {
+            "csv" => {
+                let file = std::fs::File::create(&path).map_err(|e| e.to_string())?;
+                let mut writer = csv::Writer::from_writer(std::io::BufWriter::new(file));
+                writer
+                    .write_record([
+                        "Type",
+                        "Indicator Value",
+                        "File Count",
+                        "Total Occurrences",
+                        "Private / VPN",
+                        "File Breakdown",
+                    ])
+                    .map_err(|e| e.to_string())?;
+
+                for item in &items {
+                    let mut tag = String::new();
+                    if item.is_private {
+                        tag.push_str("Private IP");
+                    }
+                    if let Some(ref vpn) = item.vpn_label {
+                        if !tag.is_empty() {
+                            tag.push_str(" | ");
+                        }
+                        tag.push_str(&format!("VPN: {vpn}"));
+                    }
+                    let breakdown = item
+                        .occurrences
+                        .iter()
+                        .map(|o| format!("{} ({})", o.file_name, o.count))
+                        .collect::<Vec<_>>()
+                        .join("; ");
+
+                    writer
+                        .write_record([
+                            &item.ioc_type,
+                            &item.value,
+                            &item.file_count.to_string(),
+                            &item.total_count.to_string(),
+                            &tag,
+                            &breakdown,
+                        ])
+                        .map_err(|e| e.to_string())?;
+                }
+                writer.flush().map_err(|e| e.to_string())?;
+            }
+            "xlsx" => {
+                let mut workbook = rust_xlsxwriter::Workbook::new();
+                let worksheet = workbook.add_worksheet();
+                worksheet
+                    .set_name("Shared IOC Overlap")
+                    .map_err(|e| e.to_string())?;
+
+                let bold = rust_xlsxwriter::Format::new().set_bold();
+
+                let headers = [
+                    "Type",
+                    "Indicator Value",
+                    "File Count",
+                    "Total Occurrences",
+                    "Private / VPN",
+                    "File Breakdown",
+                ];
+
+                for (col, h) in headers.iter().enumerate() {
+                    worksheet
+                        .write_string_with_format(0, col as u16, *h, &bold)
+                        .map_err(|e| e.to_string())?;
+                }
+
+                for (idx, item) in items.iter().enumerate() {
+                    let row = (idx + 1) as u32;
+                    let mut tag = String::new();
+                    if item.is_private {
+                        tag.push_str("Private IP");
+                    }
+                    if let Some(ref vpn) = item.vpn_label {
+                        if !tag.is_empty() {
+                            tag.push_str(" | ");
+                        }
+                        tag.push_str(&format!("VPN: {vpn}"));
+                    }
+                    let breakdown = item
+                        .occurrences
+                        .iter()
+                        .map(|o| format!("{} ({})", o.file_name, o.count))
+                        .collect::<Vec<_>>()
+                        .join("; ");
+
+                    worksheet
+                        .write_string(row, 0, &item.ioc_type)
+                        .map_err(|e| e.to_string())?;
+                    worksheet
+                        .write_string(row, 1, &item.value)
+                        .map_err(|e| e.to_string())?;
+                    worksheet
+                        .write_number(row, 2, item.file_count as f64)
+                        .map_err(|e| e.to_string())?;
+                    worksheet
+                        .write_number(row, 3, item.total_count as f64)
+                        .map_err(|e| e.to_string())?;
+                    worksheet
+                        .write_string(row, 4, &tag)
+                        .map_err(|e| e.to_string())?;
+                    worksheet
+                        .write_string(row, 5, &breakdown)
+                        .map_err(|e| e.to_string())?;
+                }
+
+                worksheet.autofit();
+                workbook.save(&path).map_err(|e| e.to_string())?;
+            }
+            _ => {
+                let json_str =
+                    serde_json::to_string_pretty(&items).map_err(|e| e.to_string())?;
+                std::fs::write(&path, json_str.as_bytes()).map_err(|e| e.to_string())?;
+            }
+        }
+
+        Ok(count)
+    })
+    .await
+    .map_err(|e| format!("export task join error: {e}"))?
+}
+
+#[tauri::command]
+pub async fn export_text_file(dest_path: String, content: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let path = PathBuf::from(&dest_path);
+        std::fs::write(&path, content.as_bytes()).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("export text file task join error: {e}"))?
 }
 
 #[cfg(test)]

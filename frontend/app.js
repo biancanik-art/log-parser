@@ -1671,23 +1671,33 @@
     });
   }
 
-  function exportIocsJson() {
+  async function exportIocsJson() {
     if (!iocExtractionSummaryResult) return;
-    const payload = {
-      exportedAt: new Date().toISOString(),
-      file: currentPath,
-      sheet: currentSheet,
-      summary: iocExtractionSummaryResult,
-    };
-    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `iocs_${(currentPath ? currentPath.split(/[\\/]/).pop() : "evidence").replace(/\.[^.]+$/, "")}.json`;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
+    try {
+      const baseName = (currentPath ? currentPath.split(/[\\/]/).pop() : "evidence").replace(/\.[^.]+$/, "");
+      const destPath = await invoke("plugin:dialog|save", {
+        options: {
+          filters: [{ name: "JSON Data (*.json)", extensions: ["json"] }],
+          defaultPath: `iocs_${baseName}.json`,
+        },
+      });
+      if (!destPath) return;
+
+      const payload = {
+        exportedAt: new Date().toISOString(),
+        file: currentPath,
+        sheet: currentSheet,
+        summary: iocExtractionSummaryResult,
+      };
+      await invoke("export_text_file", {
+        destPath,
+        content: JSON.stringify(payload, null, 2),
+      });
+      alert(`Export complete!\n\nSuccessfully wrote extracted IOCs to:\n${destPath}`);
+    } catch (err) {
+      console.error("exportIocsJson failed", err);
+      alert(`Export failed: ${err}`);
+    }
   }
 
   function normalizeQueryExpression(expression, depth = 0, state = { nodes: 0 }) {
@@ -3950,24 +3960,52 @@
     }
   }
 
-  function exportCrossIocs() {
-    if (!crossIocSummary || !crossIocSummary.items) return;
-    const exportData = crossIocSummary.items.map((i) => ({
-      type: i.iocType,
-      value: i.value,
-      fileCount: i.fileCount,
-      totalOccurrences: i.totalCount,
-      isPrivate: i.isPrivate,
-      vpnLabel: i.vpnLabel,
-      files: i.occurrences.map((o) => `${o.fileName} (${o.count})`).join("; "),
-    }));
-    const blob = new Blob([JSON.stringify(exportData, null, 2)], { type: "application/json" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `cross_file_ioc_overlap_${new Date().toISOString().replace(/[:.]/g, "-")}.json`;
-    a.click();
-    URL.revokeObjectURL(url);
+  async function exportCrossIocs() {
+    if (!crossIocSummary || !crossIocSummary.items || crossIocSummary.items.length === 0) {
+      alert("No cross-file IOC data available to export. Run 'Scan All Files for IOCs' first.");
+      return;
+    }
+
+    try {
+      const defaultFilename = `cross_file_ioc_overlap_${new Date().toISOString().slice(0, 10)}.xlsx`;
+      const destPath = await invoke("plugin:dialog|save", {
+        options: {
+          filters: [
+            { name: "Excel Workbook (*.xlsx)", extensions: ["xlsx"] },
+            { name: "CSV (Comma Separated) (*.csv)", extensions: ["csv"] },
+            { name: "JSON Data (*.json)", extensions: ["json"] },
+          ],
+          defaultPath: defaultFilename,
+        },
+      });
+
+      if (!destPath) return;
+
+      // Filter according to currently active tab filter (e.g. overlap vs all)
+      let itemsToExport = crossIocSummary.items;
+      if (crossIocActiveFilter === "overlap") {
+        itemsToExport = itemsToExport.filter((i) => i.fileCount >= 2);
+      }
+      if (crossIocActiveType !== "all") {
+        itemsToExport = itemsToExport.filter((i) => i.iocType === crossIocActiveType);
+      }
+      const q = (crossIocSearch.value || "").trim().toLowerCase();
+      if (q) {
+        itemsToExport = itemsToExport.filter((i) => i.value.toLowerCase().includes(q));
+      }
+
+      showProgress("Exporting IOC overlap...", 0.5);
+      const count = await invoke("export_ioc_overlap_file", {
+        destPath,
+        items: itemsToExport.length > 0 ? itemsToExport : crossIocSummary.items,
+      });
+      hideProgress();
+      alert(`Export complete!\n\nSuccessfully wrote ${count} indicators to:\n${destPath}`);
+    } catch (err) {
+      hideProgress();
+      console.error("exportCrossIocs failed", err);
+      alert(`Export failed: ${err}`);
+    }
   }
 
   // -- AI analyst ----------------------------------------------------------------
