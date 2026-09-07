@@ -1018,6 +1018,37 @@
     updateEvidenceColumnsUi();
   }
 
+  function filterGridByIntel(filterType, filterValue, displayName) {
+    if (sheetLoadInFlight || tableTransitionInFlight()) return;
+    discardGuidedPlanForTableAction();
+    queryMode = "querySpec";
+    activeEvidenceQuery = null;
+    spec.search = null;
+    searchBox.value = "";
+    spec.filters = [];
+    filterList.innerHTML = "";
+    spec.sort = null;
+
+    if (filterType === "tactic") {
+      spec.expression = { type: "intelTactic", name: filterValue };
+    } else if (filterType === "technique") {
+      spec.expression = { type: "intelTechnique", id: filterValue };
+    } else if (filterType === "chain") {
+      if (Array.isArray(filterValue) && filterValue.length > 0) {
+        spec.expression = { type: "rowIds", values: filterValue };
+      }
+    }
+
+    resetPagination();
+    switchTab("tab-grid");
+    guidedResetBtn.classList.remove("hidden");
+    guidedResetBtn.textContent = `✕ Clear Filter (${displayName})`;
+    aiSearchAvailability.textContent = `Filtered to MITRE ${filterType}: ${displayName}`;
+    aiSearchAvailability.classList.add("ready");
+    refreshData();
+    refreshCount();
+  }
+
   function renderScanSummary(summary) {
     intelScanSummary.innerHTML = "";
     if (badgeEnrichment) {
@@ -1031,58 +1062,275 @@
     }
     if (!summary) return;
 
-    const header = document.createElement("div");
-    header.className = "sidebar-note";
-    header.textContent = `${summary.matchedRows.toLocaleString()} matched rows, ${summary.matchCount.toLocaleString()} matches`;
-    intelScanSummary.appendChild(header);
+    const container = document.createElement("div");
+    container.className = "intel-summary-container";
+
+    // 1. KPI Cards
+    const kpiGrid = document.createElement("div");
+    kpiGrid.className = "intel-kpi-grid";
+
+    const kpiScanned = createKpiCard(
+      "Scanned Evidence",
+      `${summary.rowsScanned.toLocaleString()} rows`,
+      "All imported records evaluated"
+    );
+    const kpiMatched = createKpiCard(
+      "Threat Detections",
+      `${summary.matchedRows.toLocaleString()} rows`,
+      `${summary.matchCount.toLocaleString()} total TTP matches`
+    );
+    const tacticsCount = (summary.tactics || []).length;
+    const kpiTactics = createKpiCard(
+      "MITRE Tactics",
+      `${tacticsCount} detected`,
+      "Adversary progression stages"
+    );
+    const techniquesCount = (summary.techniques || []).length;
+    const kpiTechniques = createKpiCard(
+      "MITRE Techniques",
+      `${techniquesCount} detected`,
+      "Specific attack behaviors"
+    );
+
+    kpiGrid.append(kpiScanned, kpiMatched, kpiTactics, kpiTechniques);
+    container.appendChild(kpiGrid);
+
+    // 2. Action Bar with Forensic Threat Report Button & Guidance
+    const actionBar = document.createElement("div");
+    actionBar.className = "intel-actions-bar";
+
+    const reportBtn = document.createElement("button");
+    reportBtn.className = "btn btn-primary btn-small";
+    reportBtn.innerHTML = "📊 Generate Forensic Threat Report (XLSX)";
+    reportBtn.title =
+      "Export full multi-tab forensic workbook with executive summary, timeline, ATT&CK matrix, and evidence";
+    reportBtn.addEventListener("click", () => doReportExport());
+
+    const hintText = document.createElement("span");
+    hintText.className = "sidebar-note";
+    hintText.style.margin = "0";
+    hintText.textContent =
+      "💡 Click any tactic, technique, or attack chain below to immediately isolate and inspect those rows in the Evidence Grid.";
+
+    actionBar.append(reportBtn, hintText);
+    container.appendChild(actionBar);
 
     if (summary.customLibraryError) {
       const warning = document.createElement("div");
       warning.className = "sidebar-note";
+      warning.style.color = "var(--error, #e53e3e)";
       warning.textContent = `Custom library skipped: ${summary.customLibraryError}`;
-      intelScanSummary.appendChild(warning);
+      container.appendChild(warning);
     }
 
-    const tactics = summary.tactics || [];
-    if (tactics.length === 0) {
-      const empty = document.createElement("div");
-      empty.className = "sidebar-note";
-      empty.textContent = "No tactic matches found.";
-      intelScanSummary.appendChild(empty);
-      return;
-    }
-
-    tactics.slice(0, 10).forEach((tactic) => {
-      const row = document.createElement("div");
-      row.className = "scan-summary-row";
-      const name = document.createElement("span");
-      name.textContent = tactic.name;
-      const count = document.createElement("span");
-      count.className = "scan-summary-count";
-      count.textContent = `${tactic.rowCount.toLocaleString()} rows`;
-      row.append(name, count);
-      intelScanSummary.appendChild(row);
-    });
-
+    // 3. Attack Chains Section
     const chains = summary.chains || [];
     if (chains.length > 0) {
-      const chainHeader = document.createElement("div");
-      chainHeader.className = "sidebar-note";
-      chainHeader.textContent = `${chains.length.toLocaleString()} attack chain${chains.length === 1 ? "" : "s"} (multi-tactic sequences)`;
-      intelScanSummary.appendChild(chainHeader);
-      chains.slice(0, 5).forEach((chain) => {
-        const row = document.createElement("div");
-        row.className = "scan-summary-row";
-        const name = document.createElement("span");
-        name.textContent = `${chain.host || "all rows"} — ${chain.tacticCount} tactics`;
-        name.title = `${(chain.tacticNames || []).join(" → ")}\nTechniques: ${(chain.techniqueNames || []).join(", ")}\nRows ${chain.firstRow}–${chain.lastRow}`;
-        const count = document.createElement("span");
-        count.className = "scan-summary-count";
-        count.textContent = `${chain.rowCount.toLocaleString()} rows, score ${chain.score}`;
-        row.append(name, count);
-        intelScanSummary.appendChild(row);
+      const chainSection = document.createElement("div");
+      const title = document.createElement("div");
+      title.className = "intel-section-title";
+      title.innerHTML = `<span>⚡ Correlated Attack Chains <span class="sidebar-note">(${chains.length} detected multi-stage progression${chains.length === 1 ? "" : "s"})</span></span>`;
+      chainSection.appendChild(title);
+
+      const chainList = document.createElement("div");
+      chainList.className = "intel-card-list";
+
+      chains.forEach((chain, idx) => {
+        const card = document.createElement("div");
+        card.className = "intel-interactive-card";
+
+        const left = document.createElement("div");
+        left.className = "intel-card-left";
+
+        const flow = document.createElement("div");
+        flow.className = "intel-chain-flow";
+        const tacticNames = chain.tacticNames || [];
+        tacticNames.forEach((tName, tIdx) => {
+          const badge = document.createElement("span");
+          const tSlug = tName.toLowerCase().replace(/\s+/g, "-");
+          badge.className = `intel-tactic-badge ${tSlug}`;
+          badge.textContent = tName;
+          flow.appendChild(badge);
+          if (tIdx < tacticNames.length - 1) {
+            const arrow = document.createElement("span");
+            arrow.className = "intel-chain-arrow";
+            arrow.textContent = "➔";
+            flow.appendChild(arrow);
+          }
+        });
+
+        const sub = document.createElement("div");
+        sub.className = "intel-card-sub";
+        const hostInfo = chain.host ? `Host/Entity: ${chain.host} | ` : "";
+        const userInfo = chain.user ? `User: ${chain.user} | ` : "";
+        const techList = (chain.techniqueNames || []).slice(0, 3).join(", ");
+        sub.textContent = `${hostInfo}${userInfo}Rows ${chain.firstRow}–${chain.lastRow} (Score: ${chain.score}) • Techniques: ${techList}`;
+
+        left.append(flow, sub);
+
+        const right = document.createElement("div");
+        right.className = "intel-card-right";
+        const drillBtn = document.createElement("button");
+        drillBtn.className = "intel-drill-btn";
+        drillBtn.innerHTML = `🔍 View Chain (${chain.rowCount} rows)`;
+        drillBtn.addEventListener("click", (e) => {
+          e.stopPropagation();
+          filterGridByIntel("chain", chain.sampleRows, `Attack Chain #${idx + 1}`);
+        });
+        right.appendChild(drillBtn);
+
+        card.append(left, right);
+        card.addEventListener("click", () => {
+          filterGridByIntel("chain", chain.sampleRows, `Attack Chain #${idx + 1}`);
+        });
+        chainList.appendChild(card);
       });
+
+      chainSection.appendChild(chainList);
+      container.appendChild(chainSection);
     }
+
+    // 4. Tactics Section
+    const tactics = summary.tactics || [];
+    if (tactics.length > 0) {
+      const tacticSection = document.createElement("div");
+      const title = document.createElement("div");
+      title.className = "intel-section-title";
+      title.innerHTML = `<span>🎯 MITRE ATT&CK Tactics <span class="sidebar-note">(${tactics.length} tactics matched)</span></span>`;
+      tacticSection.appendChild(title);
+
+      const tacticList = document.createElement("div");
+      tacticList.className = "intel-card-list";
+
+      tactics.forEach((tactic) => {
+        const card = document.createElement("div");
+        card.className = "intel-interactive-card";
+
+        const left = document.createElement("div");
+        left.className = "intel-card-left";
+
+        const name = document.createElement("div");
+        name.className = "intel-card-name";
+        const badge = document.createElement("span");
+        const tSlug = tactic.name.toLowerCase().replace(/\s+/g, "-");
+        badge.className = `intel-tactic-badge ${tSlug}`;
+        badge.textContent = tactic.id || "TACTIC";
+        const label = document.createElement("span");
+        label.textContent = tactic.name;
+        name.append(badge, label);
+
+        const sub = document.createElement("div");
+        sub.className = "intel-card-sub";
+        sub.textContent = `${tactic.matchCount.toLocaleString()} pattern detections across ${tactic.rowCount.toLocaleString()} log rows`;
+
+        left.append(name, sub);
+
+        const right = document.createElement("div");
+        right.className = "intel-card-right";
+
+        const countBadge = document.createElement("span");
+        countBadge.className = "intel-count-badge";
+        countBadge.textContent = `${tactic.rowCount.toLocaleString()} rows`;
+
+        const drillBtn = document.createElement("button");
+        drillBtn.className = "intel-drill-btn";
+        drillBtn.innerHTML = "🔍 View in Table";
+        drillBtn.addEventListener("click", (e) => {
+          e.stopPropagation();
+          filterGridByIntel("tactic", tactic.name, tactic.name);
+        });
+
+        right.append(countBadge, drillBtn);
+        card.append(left, right);
+        card.addEventListener("click", () => {
+          filterGridByIntel("tactic", tactic.name, tactic.name);
+        });
+        tacticList.appendChild(card);
+      });
+
+      tacticSection.appendChild(tacticList);
+      container.appendChild(tacticSection);
+    }
+
+    // 5. Techniques Section
+    const techniques = summary.techniques || [];
+    if (techniques.length > 0) {
+      const techSection = document.createElement("div");
+      const title = document.createElement("div");
+      title.className = "intel-section-title";
+      title.innerHTML = `<span>🛡️ Detected ATT&CK Techniques <span class="sidebar-note">(${techniques.length} techniques matched)</span></span>`;
+      techSection.appendChild(title);
+
+      const techList = document.createElement("div");
+      techList.className = "intel-card-list";
+
+      techniques.forEach((tech) => {
+        const card = document.createElement("div");
+        card.className = "intel-interactive-card";
+
+        const left = document.createElement("div");
+        left.className = "intel-card-left";
+
+        const name = document.createElement("div");
+        name.className = "intel-card-name";
+        const badge = document.createElement("span");
+        badge.className = "intel-tactic-badge";
+        badge.style.fontFamily = "ui-monospace, Consolas, monospace";
+        badge.textContent = tech.id;
+        const label = document.createElement("span");
+        label.textContent = tech.name;
+        name.append(badge, label);
+
+        const sub = document.createElement("div");
+        sub.className = "intel-card-sub";
+        sub.textContent = `${tech.matchCount.toLocaleString()} pattern matches across ${tech.rowCount.toLocaleString()} log rows`;
+
+        left.append(name, sub);
+
+        const right = document.createElement("div");
+        right.className = "intel-card-right";
+
+        const countBadge = document.createElement("span");
+        countBadge.className = "intel-count-badge";
+        countBadge.textContent = `${tech.rowCount.toLocaleString()} rows`;
+
+        const drillBtn = document.createElement("button");
+        drillBtn.className = "intel-drill-btn";
+        drillBtn.innerHTML = "🔍 Filter Grid";
+        drillBtn.addEventListener("click", (e) => {
+          e.stopPropagation();
+          filterGridByIntel("technique", tech.id, `${tech.id} ${tech.name}`);
+        });
+
+        right.append(countBadge, drillBtn);
+        card.append(left, right);
+        card.addEventListener("click", () => {
+          filterGridByIntel("technique", tech.id, `${tech.id} ${tech.name}`);
+        });
+        techList.appendChild(card);
+      });
+
+      techSection.appendChild(techList);
+      container.appendChild(techSection);
+    }
+
+    intelScanSummary.appendChild(container);
+  }
+
+  function createKpiCard(label, val, sub) {
+    const card = document.createElement("div");
+    card.className = "intel-kpi-card";
+    const lbl = document.createElement("div");
+    lbl.className = "intel-kpi-label";
+    lbl.textContent = label;
+    const v = document.createElement("div");
+    v.className = "intel-kpi-val";
+    v.textContent = val;
+    const s = document.createElement("div");
+    s.className = "intel-kpi-sub";
+    s.textContent = sub;
+    card.append(lbl, v, s);
+    return card;
   }
 
   function renderIocResults(summary = iocExtractionSummaryResult) {
@@ -1501,6 +1749,16 @@
         // Row IDs are only accepted by copying a trusted backend-built QuerySpec. They are
         // never derived from the request text or synthesized in the frontend.
         return { type: "rowIds", values: [...expression.values] };
+      case "intelTactic":
+        if (typeof expression.name !== "string" || !expression.name.trim()) {
+          throw new Error("Query plan contains an invalid intel tactic");
+        }
+        return { type: "intelTactic", name: expression.name.trim() };
+      case "intelTechnique":
+        if (typeof expression.id !== "string" || !expression.id.trim()) {
+          throw new Error("Query plan contains an invalid intel technique");
+        }
+        return { type: "intelTechnique", id: expression.id.trim() };
       case "matchNone":
         return { type: "matchNone" };
       case "semanticSelection":

@@ -56,6 +56,7 @@ pub fn run() {
             commands::export_data,
             commands::export_guided_data,
             commands::scan_intel_matches,
+            commands::get_intel_matching_rows,
             commands::extract_iocs,
             commands::ask_analyst,
             commands::export_report,

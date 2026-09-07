@@ -373,7 +373,9 @@ fn expression_uses_semantic_selection(expression: &QueryExpression, selection_id
         QueryExpression::MatchNone
         | QueryExpression::Search { .. }
         | QueryExpression::Predicate { .. }
-        | QueryExpression::RowIds { .. } => false,
+        | QueryExpression::RowIds { .. }
+        | QueryExpression::IntelTactic { .. }
+        | QueryExpression::IntelTechnique { .. } => false,
     }
 }
 
@@ -1601,6 +1603,67 @@ pub async fn scan_intel_matches(
     })
     .await
     .map_err(|e| format!("intel scan task join error: {e}"))?
+}
+
+#[tauri::command]
+pub async fn get_intel_matching_rows(
+    state: State<'_, AppState>,
+    filter_type: String,
+    filter_value: String,
+) -> Result<Vec<i64>, String> {
+    let (db_path, _, _) = state_snapshot(&state)?;
+    let conn = db::open(&db_path).map_err(|e| e.to_string())?;
+    let _ = db::create_intel_schema(&conn);
+    let trimmed = filter_value.trim();
+    let mut rows = Vec::new();
+    match filter_type.as_str() {
+        "tactic" => {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT DISTINCT row_num FROM _intel_match 
+                     WHERE tactic_name = ?1 OR tactic_id = ?1 
+                     ORDER BY row_num ASC LIMIT 1000",
+                )
+                .map_err(|e| e.to_string())?;
+            let mapped = stmt
+                .query_map([trimmed], |r| r.get(0))
+                .map_err(|e| e.to_string())?;
+            for r in mapped {
+                rows.push(r.map_err(|e| e.to_string())?);
+            }
+        }
+        "technique" => {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT DISTINCT row_num FROM _intel_match 
+                     WHERE technique_id = ?1 OR technique_name = ?1 
+                     ORDER BY row_num ASC LIMIT 1000",
+                )
+                .map_err(|e| e.to_string())?;
+            let mapped = stmt
+                .query_map([trimmed], |r| r.get(0))
+                .map_err(|e| e.to_string())?;
+            for r in mapped {
+                rows.push(r.map_err(|e| e.to_string())?);
+            }
+        }
+        "chain" => {
+            if let Ok(chain_id) = trimmed.parse::<i64>() {
+                let sample_json: Result<String, _> = conn.query_row(
+                    "SELECT sample_rows FROM _intel_chain WHERE chain_id = ?1",
+                    [chain_id],
+                    |r| r.get(0),
+                );
+                if let Ok(json_str) = sample_json {
+                    if let Ok(parsed) = serde_json::from_str::<Vec<i64>>(&json_str) {
+                        rows = parsed;
+                    }
+                }
+            }
+        }
+        _ => return Err(format!("unknown filter type: {filter_type}")),
+    }
+    Ok(rows)
 }
 
 #[tauri::command]

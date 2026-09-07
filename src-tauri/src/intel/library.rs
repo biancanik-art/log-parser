@@ -335,6 +335,7 @@ fn verify_builtin_bec_library_checksum(path: &Path, raw: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg(not(test))]
 pub fn custom_library_path() -> PathBuf {
     // User-authored data: must live somewhere the OS never purges (on macOS the previous
     // LOCALAPPDATA fallback landed in the temp dir, which is cleaned after days of disuse).
@@ -342,6 +343,11 @@ pub fn custom_library_path() -> PathBuf {
         .join("log-parser")
         .join("intel")
         .join("custom_library.v1.json")
+}
+
+#[cfg(test)]
+pub fn custom_library_path() -> PathBuf {
+    std::env::temp_dir().join("log_parser_test_isolated_custom_library.json")
 }
 
 fn parse_library(label: &str, raw: &str) -> Result<LibraryFile> {

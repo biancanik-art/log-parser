@@ -95,6 +95,12 @@ pub enum QueryExpression {
     RowIds {
         values: Vec<i64>,
     },
+    IntelTactic {
+        name: String,
+    },
+    IntelTechnique {
+        id: String,
+    },
     /// Backend-created, dataset-bound semantic document selection. The identifier is never
     /// interpreted as SQL and is accepted only when it names the currently active semantic build.
     SemanticSelection {
@@ -306,6 +312,8 @@ impl ExpressionCompiler<'_> {
                 compile_column_predicate(self.columns, column, *op, value, self.params)
             }
             QueryExpression::RowIds { values } => self.compile_row_ids(values),
+            QueryExpression::IntelTactic { name } => self.compile_intel_tactic(name),
+            QueryExpression::IntelTechnique { id } => self.compile_intel_technique(id),
             QueryExpression::SemanticSelection { selection_id } => {
                 self.compile_semantic_selection(selection_id)
             }
@@ -352,6 +360,32 @@ impl ExpressionCompiler<'_> {
             }
         }
         Ok(format!("row_num IN ({})", placeholders.join(", ")))
+    }
+
+    fn compile_intel_tactic(&mut self, name: &str) -> Result<String> {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            return Err(anyhow!("intelTactic expression name must not be empty"));
+        }
+        if let Some(conn) = self.conn {
+            let _ = crate::db::create_intel_schema(conn);
+        }
+        self.params.push(Box::new(trimmed.to_string()));
+        self.params.push(Box::new(trimmed.to_string()));
+        Ok("row_num IN (SELECT row_num FROM _intel_match WHERE tactic_name = ? OR tactic_id = ?)".to_string())
+    }
+
+    fn compile_intel_technique(&mut self, id: &str) -> Result<String> {
+        let trimmed = id.trim();
+        if trimmed.is_empty() {
+            return Err(anyhow!("intelTechnique expression id must not be empty"));
+        }
+        if let Some(conn) = self.conn {
+            let _ = crate::db::create_intel_schema(conn);
+        }
+        self.params.push(Box::new(trimmed.to_string()));
+        self.params.push(Box::new(trimmed.to_string()));
+        Ok("row_num IN (SELECT row_num FROM _intel_match WHERE technique_id = ? OR technique_name = ?)".to_string())
     }
 
     fn compile_semantic_selection(&mut self, selection_id: &str) -> Result<String> {
@@ -1267,5 +1301,33 @@ mod tests {
         let (other_conn, other_columns, _) = semantic_scale_fixture(2);
         let cross_dataset = semantic_selection_spec(selection_id, 10);
         assert!(count_rows(&other_conn, &other_columns, &cross_dataset).is_err());
+    }
+
+    #[test]
+    fn intel_tactic_and_technique_filter_rows_correctly() {
+        let (conn, columns) = setup();
+        crate::db::create_intel_schema(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO _intel_match (row_num, tactic_id, tactic_name, technique_id, technique_name, pattern_id, keyword, column_name, score)
+             VALUES (2, 'TA0009', 'Collection', 'T1114.003', 'Email Forwarding Rule', 'p1', 'forward', 'account', 80),
+                    (4, 'TA0010', 'Exfiltration', 'T1048', 'Exfiltration Over Alternative Protocol', 'p2', 'exfil', 'account', 90)",
+            [],
+        ).unwrap();
+
+        let tactic_spec = expression_spec(QueryExpression::IntelTactic {
+            name: "Collection".into(),
+        });
+        let page = query_rows(&conn, &columns, &tactic_spec).unwrap();
+        let rows: Vec<i64> = page.rows.iter().map(|r| r["row_num"].as_i64().unwrap()).collect();
+        assert_eq!(rows, vec![2]);
+        assert_eq!(count_rows(&conn, &columns, &tactic_spec).unwrap(), 1);
+
+        let tech_spec = expression_spec(QueryExpression::IntelTechnique {
+            id: "T1048".into(),
+        });
+        let page = query_rows(&conn, &columns, &tech_spec).unwrap();
+        let rows: Vec<i64> = page.rows.iter().map(|r| r["row_num"].as_i64().unwrap()).collect();
+        assert_eq!(rows, vec![4]);
+        assert_eq!(count_rows(&conn, &columns, &tech_spec).unwrap(), 1);
     }
 }
