@@ -9,6 +9,7 @@ use crate::report::{self, ReportExportSummary};
 use crate::semantic;
 use crate::tabular_import;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -1724,6 +1725,477 @@ pub async fn export_report(
     .map_err(|e| format!("report export task join error: {e}"))?
 }
 
+fn format_row_snippet(
+    conn: &rusqlite::Connection,
+    columns: &[ColumnMeta],
+    row_num: i64,
+    query: &str,
+) -> Result<String, rusqlite::Error> {
+    if columns.is_empty() {
+        return Ok(format!("Row #{row_num}"));
+    }
+    let select_cols: Vec<String> = columns
+        .iter()
+        .map(|c| db::quote_ident(&c.sql_name))
+        .collect();
+    let sql = format!(
+        "SELECT {} FROM rows WHERE row_num = ?1",
+        select_cols.join(", ")
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let row_values: Vec<String> = stmt.query_row([row_num], |row| {
+        let mut vals = Vec::with_capacity(columns.len());
+        for i in 0..columns.len() {
+            let val: Option<String> = row.get(i).unwrap_or(None);
+            vals.push(val.unwrap_or_default());
+        }
+        Ok(vals)
+    })?;
+
+    let lower_q = query.to_lowercase();
+    let mut priority_parts = Vec::new();
+    let mut other_parts = Vec::new();
+
+    for (col, val) in columns.iter().zip(row_values.iter()) {
+        let trimmed = val.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let part = format!("{}: {}", col.original_name, trimmed);
+        if !lower_q.is_empty() && trimmed.to_lowercase().contains(&lower_q) {
+            priority_parts.push(part);
+        } else {
+            other_parts.push(part);
+        }
+    }
+
+    let mut combined: Vec<String> = priority_parts;
+    for part in other_parts {
+        if combined.len() >= 4 {
+            break;
+        }
+        combined.push(part);
+    }
+
+    let full_text = combined.join(" | ");
+    if full_text.chars().count() > 180 {
+        let truncated: String = full_text.chars().take(177).collect();
+        Ok(format!("{truncated}…"))
+    } else {
+        Ok(full_text)
+    }
+}
+
+#[derive(Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct FileTarget {
+    pub path: String,
+    pub sheet: Option<String>,
+    pub cache_db_path: Option<String>,
+}
+
+#[derive(Serialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct CrossFileSnippet {
+    pub row_num: i64,
+    pub preview: String,
+}
+
+#[derive(Serialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct CrossFileSearchResult {
+    pub path: String,
+    pub sheet: String,
+    pub file_name: String,
+    pub total_rows: i64,
+    pub match_count: i64,
+    pub snippets: Vec<CrossFileSnippet>,
+    pub error: Option<String>,
+}
+
+#[tauri::command]
+pub async fn cross_search_files(
+    files: Vec<FileTarget>,
+    query: String,
+) -> Result<Vec<CrossFileSearchResult>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let clean_query = query.trim().to_string();
+        let mut results = Vec::with_capacity(files.len());
+
+        for target in files {
+            let file_name = Path::new(&target.path)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| target.path.clone());
+            let sheet_name = target.sheet.clone().unwrap_or_default();
+
+            let db_path = if let Some(ref p) = target.cache_db_path {
+                let candidate = PathBuf::from(p);
+                if candidate.exists() {
+                    candidate
+                } else {
+                    db::cache_db_path(Path::new(&target.path), &sheet_name)
+                        .unwrap_or_else(|_| PathBuf::from(p))
+                }
+            } else {
+                match db::cache_db_path(Path::new(&target.path), &sheet_name) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        results.push(CrossFileSearchResult {
+                            path: target.path,
+                            sheet: sheet_name,
+                            file_name,
+                            total_rows: 0,
+                            match_count: 0,
+                            snippets: Vec::new(),
+                            error: Some(format!("Could not determine cache path: {e}")),
+                        });
+                        continue;
+                    }
+                }
+            };
+
+            if !db_path.exists() {
+                results.push(CrossFileSearchResult {
+                    path: target.path,
+                    sheet: sheet_name,
+                    file_name,
+                    total_rows: 0,
+                    match_count: 0,
+                    snippets: Vec::new(),
+                    error: Some("Cache database not found; re-open file to index.".to_string()),
+                });
+                continue;
+            }
+
+            let conn = match db::open(&db_path) {
+                Ok(c) => c,
+                Err(e) => {
+                    results.push(CrossFileSearchResult {
+                        path: target.path,
+                        sheet: sheet_name,
+                        file_name,
+                        total_rows: 0,
+                        match_count: 0,
+                        snippets: Vec::new(),
+                        error: Some(format!("Failed to open cache database: {e}")),
+                    });
+                    continue;
+                }
+            };
+
+            let total_rows: i64 = conn
+                .query_row("SELECT count(*) FROM rows", [], |r| r.get(0))
+                .unwrap_or(0);
+
+            if clean_query.is_empty() {
+                results.push(CrossFileSearchResult {
+                    path: target.path,
+                    sheet: sheet_name,
+                    file_name,
+                    total_rows,
+                    match_count: 0,
+                    snippets: Vec::new(),
+                    error: None,
+                });
+                continue;
+            }
+
+            let escaped = clean_query.replace('"', "\"\"");
+            let phrase = format!("\"{escaped}\"");
+
+            let mut match_count: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM rows_fts WHERE rows_fts MATCH ?1",
+                    [&phrase],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+
+            let mut used_match_term = phrase.clone();
+
+            if match_count == 0
+                && !clean_query.contains(' ')
+                && !clean_query.contains('*')
+            {
+                let prefix_phrase = format!("\"{escaped}\"*");
+                if let Ok(count) = conn.query_row(
+                    "SELECT count(*) FROM rows_fts WHERE rows_fts MATCH ?1",
+                    [&prefix_phrase],
+                    |r| r.get(0),
+                ) {
+                    if count > 0 {
+                        match_count = count;
+                        used_match_term = prefix_phrase;
+                    }
+                }
+            }
+
+            let mut snippets = Vec::new();
+            if match_count > 0 {
+                if let Ok(mut stmt) =
+                    conn.prepare("SELECT rowid FROM rows_fts WHERE rows_fts MATCH ?1 LIMIT 3")
+                {
+                    if let Ok(rows) = stmt.query_map([&used_match_term], |r| r.get::<_, i64>(0)) {
+                        let row_ids: Vec<i64> = rows.filter_map(|r| r.ok()).collect();
+                        if let Ok(columns) = db::load_columns(&conn) {
+                            for rid in row_ids {
+                                if let Ok(snip) =
+                                    format_row_snippet(&conn, &columns, rid, &clean_query)
+                                {
+                                    snippets.push(CrossFileSnippet {
+                                        row_num: rid,
+                                        preview: snip,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            results.push(CrossFileSearchResult {
+                path: target.path,
+                sheet: sheet_name,
+                file_name,
+                total_rows,
+                match_count,
+                snippets,
+                error: None,
+            });
+        }
+
+        Ok(results)
+    })
+    .await
+    .map_err(|e| format!("cross search task join error: {e}"))?
+}
+
+#[derive(Serialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct CrossFileIocOccurrence {
+    pub file_name: String,
+    pub path: String,
+    pub sheet: String,
+    pub count: i64,
+    pub first_row: i64,
+}
+
+#[derive(Serialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct CrossFileIocItem {
+    pub ioc_type: String,
+    pub value: String,
+    pub occurrences: Vec<CrossFileIocOccurrence>,
+    pub total_count: i64,
+    pub file_count: usize,
+    pub is_private: bool,
+    pub vpn_label: Option<String>,
+}
+
+#[derive(Serialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct CrossFileIocSummary {
+    pub files_scanned: usize,
+    pub total_unique_iocs: usize,
+    pub overlapping_count: usize,
+    pub items: Vec<CrossFileIocItem>,
+}
+
+#[tauri::command]
+pub async fn cross_ioc_overlap(
+    files: Vec<FileTarget>,
+) -> Result<CrossFileIocSummary, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut map: HashMap<(String, String), CrossFileIocItem> = HashMap::new();
+        let mut scanned_count = 0;
+
+        for target in &files {
+            let file_name = Path::new(&target.path)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| target.path.clone());
+            let sheet_name = target.sheet.clone().unwrap_or_default();
+
+            let db_path = if let Some(ref p) = target.cache_db_path {
+                let candidate = PathBuf::from(p);
+                if candidate.exists() {
+                    candidate
+                } else {
+                    db::cache_db_path(Path::new(&target.path), &sheet_name)
+                        .unwrap_or_else(|_| PathBuf::from(p))
+                }
+            } else {
+                match db::cache_db_path(Path::new(&target.path), &sheet_name) {
+                    Ok(p) => p,
+                    Err(_) => continue,
+                }
+            };
+
+            if !db_path.exists() {
+                continue;
+            }
+
+            let conn = match db::open(&db_path) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+
+            let columns = match db::load_columns(&conn) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+
+            let summary = match crate::intel::ioc::extract_iocs(&conn, &columns, |_, _, _| {}) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+
+            scanned_count += 1;
+
+            // 1. IPs
+            for ip in summary.ip_indicators {
+                let key = ("ip".to_string(), ip.ip.clone());
+                let entry = map.entry(key).or_insert_with(|| CrossFileIocItem {
+                    ioc_type: "ip".to_string(),
+                    value: ip.ip.clone(),
+                    occurrences: Vec::new(),
+                    total_count: 0,
+                    file_count: 0,
+                    is_private: ip.is_private,
+                    vpn_label: ip.vpn_label.clone(),
+                });
+                entry.total_count += ip.occurrence_count;
+                if entry.vpn_label.is_none() && ip.vpn_label.is_some() {
+                    entry.vpn_label = ip.vpn_label;
+                }
+                entry.occurrences.push(CrossFileIocOccurrence {
+                    file_name: file_name.clone(),
+                    path: target.path.clone(),
+                    sheet: sheet_name.clone(),
+                    count: ip.occurrence_count,
+                    first_row: ip.first_row,
+                });
+            }
+
+            // 2. Domains
+            for d in summary.domain_indicators {
+                let key = ("domain".to_string(), d.domain.clone());
+                let entry = map.entry(key).or_insert_with(|| CrossFileIocItem {
+                    ioc_type: "domain".to_string(),
+                    value: d.domain.clone(),
+                    occurrences: Vec::new(),
+                    total_count: 0,
+                    file_count: 0,
+                    is_private: false,
+                    vpn_label: None,
+                });
+                entry.total_count += d.occurrence_count;
+                entry.occurrences.push(CrossFileIocOccurrence {
+                    file_name: file_name.clone(),
+                    path: target.path.clone(),
+                    sheet: sheet_name.clone(),
+                    count: d.occurrence_count,
+                    first_row: d.first_row,
+                });
+            }
+
+            // 3. URLs
+            for u in summary.url_indicators {
+                let key = ("url".to_string(), u.url.clone());
+                let entry = map.entry(key).or_insert_with(|| CrossFileIocItem {
+                    ioc_type: "url".to_string(),
+                    value: u.url.clone(),
+                    occurrences: Vec::new(),
+                    total_count: 0,
+                    file_count: 0,
+                    is_private: false,
+                    vpn_label: None,
+                });
+                entry.total_count += u.occurrence_count;
+                entry.occurrences.push(CrossFileIocOccurrence {
+                    file_name: file_name.clone(),
+                    path: target.path.clone(),
+                    sheet: sheet_name.clone(),
+                    count: u.occurrence_count,
+                    first_row: u.first_row,
+                });
+            }
+
+            // 4. Emails
+            for em in summary.email_indicators {
+                let key = ("email".to_string(), em.email.clone());
+                let entry = map.entry(key).or_insert_with(|| CrossFileIocItem {
+                    ioc_type: "email".to_string(),
+                    value: em.email.clone(),
+                    occurrences: Vec::new(),
+                    total_count: 0,
+                    file_count: 0,
+                    is_private: false,
+                    vpn_label: None,
+                });
+                entry.total_count += em.occurrence_count;
+                entry.occurrences.push(CrossFileIocOccurrence {
+                    file_name: file_name.clone(),
+                    path: target.path.clone(),
+                    sheet: sheet_name.clone(),
+                    count: em.occurrence_count,
+                    first_row: em.first_row,
+                });
+            }
+
+            // 5. User Agents
+            for ua in summary.user_agent_indicators {
+                let key = ("user_agent".to_string(), ua.user_agent.clone());
+                let entry = map.entry(key).or_insert_with(|| CrossFileIocItem {
+                    ioc_type: "user_agent".to_string(),
+                    value: ua.user_agent.clone(),
+                    occurrences: Vec::new(),
+                    total_count: 0,
+                    file_count: 0,
+                    is_private: false,
+                    vpn_label: None,
+                });
+                entry.total_count += ua.occurrence_count;
+                entry.occurrences.push(CrossFileIocOccurrence {
+                    file_name: file_name.clone(),
+                    path: target.path.clone(),
+                    sheet: sheet_name.clone(),
+                    count: ua.occurrence_count,
+                    first_row: ua.first_row,
+                });
+            }
+        }
+
+        let mut items: Vec<CrossFileIocItem> = map
+            .into_values()
+            .map(|mut item| {
+                item.file_count = item.occurrences.len();
+                item
+            })
+            .collect();
+
+        // Sort: items appearing across multiple files first (descending file_count), then descending total occurrences
+        items.sort_by(|a, b| {
+            b.file_count
+                .cmp(&a.file_count)
+                .then_with(|| b.total_count.cmp(&a.total_count))
+        });
+
+        let overlapping_count = items.iter().filter(|i| i.file_count >= 2).count();
+        let total_unique_iocs = items.len();
+
+        Ok(CrossFileIocSummary {
+            files_scanned: scanned_count,
+            total_unique_iocs,
+            overlapping_count,
+            items,
+        })
+    })
+    .await
+    .map_err(|e| format!("cross ioc overlap task join error: {e}"))?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2284,5 +2756,120 @@ mod tests {
         assert_eq!(std::fs::read(&temporary).unwrap(), b"new report");
 
         let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn cross_search_and_ioc_overlap_across_multiple_databases() {
+        tauri::async_runtime::block_on(async {
+        let db1_path = import_cache_test_path("cross1");
+        let db2_path = import_cache_test_path("cross2");
+
+        let cols1 = vec![
+            ColumnMeta {
+                sql_name: "ip".to_string(),
+                original_name: "ClientIP".to_string(),
+                col_index: 0,
+                inferred_type: "text".to_string(),
+            },
+            ColumnMeta {
+                sql_name: "user".to_string(),
+                original_name: "UserName".to_string(),
+                col_index: 1,
+                inferred_type: "text".to_string(),
+            },
+        ];
+
+        let cols2 = vec![
+            ColumnMeta {
+                sql_name: "src_ip".to_string(),
+                original_name: "SourceIP".to_string(),
+                col_index: 0,
+                inferred_type: "text".to_string(),
+            },
+            ColumnMeta {
+                sql_name: "msg".to_string(),
+                original_name: "Message".to_string(),
+                col_index: 1,
+                inferred_type: "text".to_string(),
+            },
+        ];
+
+        // Setup DB 1
+        {
+            let conn1 = Connection::open(&db1_path).unwrap();
+            db::create_schema(&conn1, &cols1).unwrap();
+            conn1.execute(
+                "INSERT INTO rows (row_num, ip, user) VALUES (1, '198.51.100.45', 'alice')",
+                [],
+            ).unwrap();
+            conn1.execute(
+                "INSERT INTO rows (row_num, ip, user) VALUES (2, '203.0.113.10', 'charlie')",
+                [],
+            ).unwrap();
+            db::populate_fts(&conn1, &cols1).unwrap();
+        }
+
+        // Setup DB 2
+        {
+            let conn2 = Connection::open(&db2_path).unwrap();
+            db::create_schema(&conn2, &cols2).unwrap();
+            conn2.execute(
+                "INSERT INTO rows (row_num, src_ip, msg) VALUES (1, '198.51.100.45', 'Connection accepted from 198.51.100.45')",
+                [],
+            ).unwrap();
+            conn2.execute(
+                "INSERT INTO rows (row_num, src_ip, msg) VALUES (2, '192.0.2.1', 'Local traffic from bob')",
+                [],
+            ).unwrap();
+            db::populate_fts(&conn2, &cols2).unwrap();
+        }
+
+        let files = vec![
+            FileTarget {
+                path: "test1.csv".to_string(),
+                sheet: None,
+                cache_db_path: Some(db1_path.to_string_lossy().to_string()),
+            },
+            FileTarget {
+                path: "test2.csv".to_string(),
+                sheet: None,
+                cache_db_path: Some(db2_path.to_string_lossy().to_string()),
+            },
+        ];
+
+        // 1. Cross Search for IP 198.51.100.45
+        let results_ip = cross_search_files(files.clone(), "198.51.100.45".to_string())
+            .await
+            .unwrap();
+        assert_eq!(results_ip.len(), 2);
+        assert_eq!(results_ip[0].match_count, 1);
+        assert_eq!(results_ip[1].match_count, 1);
+        assert!(!results_ip[0].snippets.is_empty());
+        assert!(!results_ip[1].snippets.is_empty());
+
+        // 2. Cross Search for user alice (only in DB1)
+        let results_alice = cross_search_files(files.clone(), "alice".to_string())
+            .await
+            .unwrap();
+        assert_eq!(results_alice.len(), 2);
+        assert_eq!(results_alice[0].match_count, 1);
+        assert_eq!(results_alice[1].match_count, 0);
+
+        // 3. Cross IOC Overlap
+        let ioc_summary = cross_ioc_overlap(files).await.unwrap();
+        assert_eq!(ioc_summary.files_scanned, 2);
+        assert!(ioc_summary.overlapping_count >= 1);
+        let shared_ip = ioc_summary
+            .items
+            .iter()
+            .find(|item| item.value == "198.51.100.45");
+        assert!(shared_ip.is_some());
+        let shared = shared_ip.unwrap();
+        assert_eq!(shared.file_count, 2);
+        assert_eq!(shared.total_count, 3);
+
+        let _ = std::fs::remove_file(&db1_path);
+        let _ = std::fs::remove_file(&db2_path);
+        });
     }
 }

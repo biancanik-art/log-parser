@@ -1049,3 +1049,344 @@ select { font: inherit; }
 #sidebar.collapsed {
   display: none;
 }
+
+/* -- Multi-File Correlation Styles ------------------------------------------ */
+.correlation-scroll-area {
+  padding: 16px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  flex: 1;
+}
+
+.correlation-intro-banner {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 12px 14px;
+  background: var(--panel-bg);
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--accent);
+  border-radius: 6px;
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--text);
+}
+
+.correlation-intro-banner .banner-icon {
+  font-size: 18px;
+  flex-shrink: 0;
+  margin-top: 1px;
+}
+
+.correlation-section {
+  background: var(--panel-bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 14px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.correlation-section-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.correlation-section-header h3 {
+  margin: 0;
+  font-size: 13.5px;
+  font-weight: 600;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.correlation-title-with-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.section-hint {
+  font-size: 11.5px;
+  color: var(--text-muted);
+}
+
+.correlation-count-badge {
+  font-size: 11px;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 12px;
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.correlation-files-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.correlation-file-card {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel-subtle);
+  font-size: 12px;
+}
+
+.correlation-file-card.active {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.correlation-file-card .file-name-label {
+  font-weight: 600;
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.correlation-file-card .file-rows-label {
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.cross-search-form {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.cross-search-form input[type="search"] {
+  flex: 1;
+  padding: 8px 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--text);
+  font-size: 13px;
+}
+
+.cross-search-form input[type="search"]:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.cross-search-results {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.cross-file-result-card {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel-subtle);
+  overflow: hidden;
+}
+
+.cross-file-result-card.has-matches {
+  border-color: var(--accent);
+}
+
+.cross-result-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 14px;
+  background: var(--panel-bg);
+  border-bottom: 1px solid var(--border);
+}
+
+.cross-result-file-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 600;
+  font-size: 12.5px;
+}
+
+.cross-match-badge {
+  font-size: 11px;
+  font-weight: 700;
+  padding: 2px 8px;
+  border-radius: 10px;
+}
+
+.cross-match-badge.hit {
+  background: var(--success);
+  color: #fff;
+}
+
+.cross-match-badge.zero {
+  background: var(--border);
+  color: var(--text-muted);
+}
+
+.cross-snippets-list {
+  padding: 8px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.cross-snippet-item {
+  font-family: ui-monospace, SFMono-Regular, Consolas, Menlo, monospace;
+  font-size: 11.5px;
+  padding: 6px 10px;
+  background: var(--panel-bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text);
+  line-height: 1.4;
+  word-break: break-all;
+}
+
+.cross-snippet-rowid {
+  color: var(--accent);
+  font-weight: 600;
+  margin-right: 6px;
+}
+
+.cross-ioc-toolbar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--border);
+}
+
+.cross-ioc-filter-btn,
+.cross-ioc-type-btn {
+  padding: 4px 10px;
+  border: 1px solid var(--border);
+  background: var(--panel-bg);
+  color: var(--text);
+  border-radius: 4px;
+  font-size: 11.5px;
+  cursor: pointer;
+}
+
+.cross-ioc-filter-btn.active,
+.cross-ioc-type-btn.active {
+  background: var(--accent);
+  color: #fff;
+  border-color: var(--accent);
+}
+
+.cross-ioc-results {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 480px;
+  overflow-y: auto;
+}
+
+.cross-ioc-card {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel-subtle);
+  padding: 10px 14px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.cross-ioc-card.overlapping {
+  border-left: 4px solid var(--accent);
+}
+
+.cross-ioc-left {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.cross-ioc-type-tag {
+  font-size: 10px;
+  font-weight: 700;
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  text-transform: uppercase;
+}
+
+.cross-ioc-val {
+  font-family: ui-monospace, SFMono-Regular, Consolas, Menlo, monospace;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.cross-ioc-meta-tag {
+  font-size: 10.5px;
+  padding: 1px 6px;
+  border-radius: 3px;
+  background: var(--border);
+  color: var(--text-muted);
+}
+
+.cross-ioc-files-breakdown {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.cross-ioc-file-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  padding: 3px 8px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--panel-bg);
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.cross-ioc-file-chip:hover {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.cross-ioc-file-chip .chip-count {
+  font-weight: 700;
+  background: var(--accent-soft);
+  color: var(--accent);
+  padding: 1px 5px;
+  border-radius: 8px;
+  font-size: 10px;
+}
+
+#grid-cross-search-btn {
+  background: var(--accent-soft);
+  color: var(--accent);
+  border-color: var(--accent);
+  font-weight: 600;
+  margin-left: 4px;
+}
+
+#grid-cross-search-btn:hover {
+  background: var(--accent);
+  color: #fff;
+}
+

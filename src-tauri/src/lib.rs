@@ -59,6 +59,8 @@ pub fn run() {
             commands::extract_iocs,
             commands::ask_analyst,
             commands::export_report,
+            commands::cross_search_files,
+            commands::cross_ioc_overlap,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

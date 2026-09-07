@@ -40,6 +40,10 @@
         <span class="tab-icon">📊</span> Evidence Grid
         <span id="badge-grid" class="nav-tab-badge hidden">0</span>
       </button>
+      <button class="nav-tab" data-tab="tab-correlation" role="tab" aria-selected="false">
+        <span class="tab-icon">🔗</span> Multi-File Correlation
+        <span id="badge-correlation" class="nav-tab-badge hidden">0 files</span>
+      </button>
       <button class="nav-tab" data-tab="tab-analyst" role="tab" aria-selected="false">
         <span class="tab-icon">🤖</span> AI Analyst
         <span id="badge-analyst" class="nav-tab-badge">Ready</span>
@@ -67,6 +71,7 @@
           <div class="pane-title-group">
             <button id="sidebar-toggle-btn" class="btn btn-small" title="Toggle Filter Sidebar">◧ Toggle Filters</button>
             <input id="search-box" type="search" placeholder="Quick search all columns&hellip;" disabled />
+            <button id="grid-cross-search-btn" class="btn btn-small hidden" title="Search this term across all loaded files">🌐 Pivot All Files</button>
           </div>
           <div class="pane-actions">
             <button id="grid-maximize-btn" class="btn btn-small btn-expand-pane" title="Maximize Table View">⛶ Expand Table</button>
@@ -110,6 +115,86 @@
             </footer>
           </section>
         </main>
+      </div>
+
+      <!-- TAB: Multi-File Correlation -->
+      <div id="tab-correlation" class="tab-pane" role="tabpanel">
+        <div class="pane-header">
+          <div class="pane-title-group">
+            <h2 class="pane-title">Multi-File Cross-Log Correlation &amp; Pivot Analysis</h2>
+            <span class="offline-badge">Parallel Multi-Log Pivot</span>
+          </div>
+          <div class="pane-actions">
+            <button id="correlation-refresh-btn" class="btn btn-small" title="Refresh cross-file analysis">🔄 Refresh</button>
+            <button id="correlation-maximize-btn" class="btn btn-small btn-expand-pane" title="Maximize View">⛶ Expand</button>
+          </div>
+        </div>
+        <div class="correlation-scroll-area">
+          <!-- Architecture Note Banner -->
+          <div class="correlation-intro-banner">
+            <div class="banner-icon">💡</div>
+            <div class="banner-text">
+              <strong>Schema-Preserving Cross-Log Correlation:</strong> Disparate log sources (e.g. M365 UAL, Firewall, Sysmon, VPN) have different column schemas. Rather than collapsing them into a lossy merged table with mostly empty columns, log-parser queries all open files in parallel: search any entity across all logs, and discover shared indicators (co-occurrence) across evidence files.
+            </div>
+          </div>
+
+          <!-- Open Files in Scope -->
+          <div class="correlation-section">
+            <div class="correlation-section-header">
+              <h3>📂 Open Files in Correlation Scope</h3>
+              <span id="correlation-file-count" class="correlation-count-badge">0 files</span>
+            </div>
+            <div id="correlation-files-list" class="correlation-files-list">
+              <div class="correlation-empty-state">No files open. Use "Open File" to load 2 or more files.</div>
+            </div>
+          </div>
+
+          <!-- Section 1: Global Pivot Search -->
+          <div class="correlation-section">
+            <div class="correlation-section-header">
+              <h3>🔍 Global Pivot Search (All Open Files)</h3>
+              <span class="section-hint">Search any IP, user, domain, hash, or keyword across all loaded logs simultaneously</span>
+            </div>
+            <div class="cross-search-form">
+              <input id="cross-search-input" type="search" placeholder="Enter IP (e.g. 198.51.100.45), username (e.g. alice), keyword or hash..." />
+              <button id="cross-search-btn" class="btn btn-primary">Search All Files</button>
+              <button id="cross-search-clear-btn" class="btn hidden">Clear</button>
+            </div>
+            <div id="cross-search-status" class="intel-panel-note hidden"></div>
+            <div id="cross-search-results" class="cross-search-results"></div>
+          </div>
+
+          <!-- Section 2: Shared Indicators (Cross-File IOC Overlap) -->
+          <div class="correlation-section">
+            <div class="correlation-section-header">
+              <div class="correlation-title-with-actions">
+                <h3>🛡️ Shared Indicators (Cross-File Co-occurrence)</h3>
+                <span class="section-hint">Indicators (IPs, domains, hashes, emails) appearing across multiple evidence files</span>
+              </div>
+              <div class="correlation-header-actions">
+                <button id="cross-ioc-scan-btn" class="btn btn-primary btn-small">Scan All Files for IOCs</button>
+                <button id="cross-ioc-export-btn" class="btn btn-small" disabled>📥 Export Overlap</button>
+              </div>
+            </div>
+            <div class="cross-ioc-toolbar">
+              <div class="ioc-category-tabs">
+                <button class="cross-ioc-filter-btn active" data-filter="overlap">Shared Only (&ge;2 files)</button>
+                <button class="cross-ioc-filter-btn" data-filter="all">All Indicators</button>
+              </div>
+              <div class="ioc-category-tabs" style="margin-left: 10px;">
+                <button class="cross-ioc-type-btn active" data-type="all">All Types</button>
+                <button class="cross-ioc-type-btn" data-type="ip">IPs</button>
+                <button class="cross-ioc-type-btn" data-type="domain">Domains</button>
+                <button class="cross-ioc-type-btn" data-type="url">URLs</button>
+                <button class="cross-ioc-type-btn" data-type="email">Emails</button>
+                <button class="cross-ioc-type-btn" data-type="user_agent">User Agents</button>
+              </div>
+              <input id="cross-ioc-search" class="ioc-filter-input" type="search" placeholder="Filter indicators..." style="margin-left: auto; max-width: 240px;" />
+            </div>
+            <div id="cross-ioc-status" class="intel-panel-note">Click "Scan All Files for IOCs" to detect shared indicators across all open log files.</div>
+            <div id="cross-ioc-results" class="cross-ioc-results"></div>
+          </div>
+        </div>
       </div>
 
       <!-- TAB 2: AI Analyst -->

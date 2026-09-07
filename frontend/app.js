@@ -93,10 +93,26 @@
   const sidebarToggleBtn = document.getElementById("sidebar-toggle-btn");
   const sidebar = document.getElementById("sidebar");
   const badgeGrid = document.getElementById("badge-grid");
+  const badgeCorrelation = document.getElementById("badge-correlation");
   const badgeAnalyst = document.getElementById("badge-analyst");
   const badgeIocs = document.getElementById("badge-iocs");
   const badgeEnrichment = document.getElementById("badge-enrichment");
   const badgeRules = document.getElementById("badge-rules");
+  const gridCrossSearchBtn = document.getElementById("grid-cross-search-btn");
+  const correlationFileCount = document.getElementById("correlation-file-count");
+  const correlationFilesList = document.getElementById("correlation-files-list");
+  const correlationRefreshBtn = document.getElementById("correlation-refresh-btn");
+  const correlationMaximizeBtn = document.getElementById("correlation-maximize-btn");
+  const crossSearchInput = document.getElementById("cross-search-input");
+  const crossSearchBtn = document.getElementById("cross-search-btn");
+  const crossSearchClearBtn = document.getElementById("cross-search-clear-btn");
+  const crossSearchStatus = document.getElementById("cross-search-status");
+  const crossSearchResults = document.getElementById("cross-search-results");
+  const crossIocScanBtn = document.getElementById("cross-ioc-scan-btn");
+  const crossIocExportBtn = document.getElementById("cross-ioc-export-btn");
+  const crossIocStatus = document.getElementById("cross-ioc-status");
+  const crossIocResults = document.getElementById("cross-ioc-results");
+  const crossIocSearch = document.getElementById("cross-ioc-search");
   const iocPanel = document.getElementById("ioc-panel");
   const iocPanelSummary = document.getElementById("ioc-panel-summary");
   const iocStats = document.getElementById("ioc-stats");
@@ -127,6 +143,12 @@
   // Multi-file tracking
   let loadedFiles = []; // array of { path, sheet, name, rowCount, columns, summary }
   let activeFileIndex = -1;
+
+  // Cross-file correlation state
+  let crossIocSummary = null;
+  let crossIocActiveFilter = "overlap"; // "overlap" or "all"
+  let crossIocActiveType = "all"; // "all", "ip", "domain", "url", "email", "user_agent"
+  let crossSearchResultsData = null;
 
   // IOC filtering state
   let currentIocCategory = "all";
@@ -3121,6 +3143,7 @@
       activeFileIndex = loadedFiles.length - 1;
     }
     updateFileSwitcherUi();
+    renderCorrelationScope();
 
     const fileName = importedPath.split(/[\\/]/).pop();
     const fileCountBadge = loadedFiles.length > 1 ? ` [${activeFileIndex + 1}/${loadedFiles.length} files]` : "";
@@ -3231,6 +3254,7 @@
         loadedFiles.splice(remIdx, 1);
       }
       updateFileSwitcherUi();
+      renderCorrelationScope();
       if (loadedFiles.length > 0) {
         const nextIdx = Math.min(remIdx, loadedFiles.length - 1);
         return switchLoadedFile(nextIdx);
@@ -3240,6 +3264,7 @@
     loadedFiles = [];
     activeFileIndex = -1;
     updateFileSwitcherUi();
+    renderCorrelationScope();
 
     if (table) {
       table.destroy();
@@ -3398,6 +3423,293 @@
         updateGuidedInteractionControls();
       }
     }
+  }
+
+  // -- Multi-File Correlation --------------------------------------------------
+
+  function escapeHtml(str) {
+    if (str == null) return "";
+    return String(str)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#039;");
+  }
+
+  function renderCorrelationScope() {
+    if (!correlationFileCount || !correlationFilesList) return;
+    const count = loadedFiles.length;
+    if (badgeCorrelation) {
+      if (count > 1) {
+        badgeCorrelation.textContent = `${count} files`;
+        badgeCorrelation.classList.remove("hidden");
+      } else if (count === 1) {
+        badgeCorrelation.textContent = `1 file`;
+        badgeCorrelation.classList.remove("hidden");
+      } else {
+        badgeCorrelation.classList.add("hidden");
+      }
+    }
+
+    if (gridCrossSearchBtn) {
+      if (count > 1) {
+        gridCrossSearchBtn.classList.remove("hidden");
+      } else {
+        gridCrossSearchBtn.classList.add("hidden");
+      }
+    }
+
+    correlationFileCount.textContent = `${count} open file${count === 1 ? "" : "s"}`;
+    correlationFilesList.innerHTML = "";
+
+    if (count === 0) {
+      correlationFilesList.innerHTML = `<div class="correlation-empty-state">No files open. Use "Open File" to load 2 or more files.</div>`;
+      return;
+    }
+
+    loadedFiles.forEach((file, idx) => {
+      const isCurrent = file.path === currentPath;
+      const card = document.createElement("div");
+      card.className = `correlation-file-card${isCurrent ? " active" : ""}`;
+      card.innerHTML = `
+        <span style="font-size:16px;">📄</span>
+        <div>
+          <div class="file-name-label" title="${file.path}">${escapeHtml(file.name)}</div>
+          <div class="file-rows-label">${file.rowCount != null ? `${file.rowCount.toLocaleString()} rows` : "Imported"}${file.sheet ? ` [${escapeHtml(file.sheet)}]` : ""}</div>
+        </div>
+        <button class="btn btn-small" style="margin-left:auto;">${isCurrent ? "Active" : "Switch"}</button>
+      `;
+      card.querySelector("button").addEventListener("click", () => {
+        switchLoadedFile(idx);
+      });
+      correlationFilesList.appendChild(card);
+    });
+  }
+
+  async function runCrossFileSearch(query) {
+    const q = (query !== undefined ? query : crossSearchInput.value).trim();
+    if (!q) return;
+    if (loadedFiles.length === 0) {
+      crossSearchStatus.textContent = "No files loaded to search.";
+      crossSearchStatus.classList.remove("hidden");
+      return;
+    }
+    crossSearchInput.value = q;
+    crossSearchStatus.textContent = `Searching across ${loadedFiles.length} files for "${q}"...`;
+    crossSearchStatus.classList.remove("hidden");
+    crossSearchResults.innerHTML = "";
+    crossSearchClearBtn.classList.remove("hidden");
+
+    try {
+      const filesPayload = loadedFiles.map((f) => ({
+        path: f.path,
+        sheet: f.sheet || null,
+        cacheDbPath: f.summary?.cacheDbPath || null,
+      }));
+      const results = await invoke("cross_search_files", { files: filesPayload, query: q });
+      crossSearchResultsData = { query: q, results };
+      renderCrossSearchResults(results, q);
+    } catch (err) {
+      console.error("cross_search_files error", err);
+      crossSearchStatus.textContent = `Cross search failed: ${err}`;
+    }
+  }
+
+  function renderCrossSearchResults(results, query) {
+    crossSearchResults.innerHTML = "";
+    const totalHits = results.reduce((acc, r) => acc + (r.matchCount || 0), 0);
+    crossSearchStatus.textContent = `Found ${totalHits.toLocaleString()} total match${totalHits === 1 ? "" : "es"} across ${results.length} files for "${query}"`;
+    crossSearchStatus.classList.remove("hidden");
+
+    results.forEach((r) => {
+      const card = document.createElement("div");
+      card.className = `cross-file-result-card${r.matchCount > 0 ? " has-matches" : ""}`;
+
+      const fileIdx = loadedFiles.findIndex((f) => f.path === r.path);
+      const isHit = r.matchCount > 0;
+
+      let snippetsHtml = "";
+      if (r.snippets && r.snippets.length > 0) {
+        snippetsHtml =
+          `<div class="cross-snippets-list">` +
+          r.snippets
+            .map(
+              (s) => `
+            <div class="cross-snippet-item">
+              <span class="cross-snippet-rowid">Row #${s.rowNum}</span>
+              <span>${escapeHtml(s.preview)}</span>
+            </div>
+          `
+            )
+            .join("") +
+          (r.matchCount > r.snippets.length
+            ? `<div style="font-size:11px;color:var(--text-muted);margin-top:2px;">+ ${(r.matchCount - r.snippets.length).toLocaleString()} more matching rows in this file</div>`
+            : "") +
+          `</div>`;
+      } else if (isHit) {
+        snippetsHtml = `<div class="cross-snippets-list"><div style="font-size:11px;color:var(--text-muted);">${r.matchCount.toLocaleString()} rows match in this file</div></div>`;
+      } else if (r.error) {
+        snippetsHtml = `<div class="cross-snippets-list" style="color:var(--danger);font-size:11px;">${escapeHtml(r.error)}</div>`;
+      }
+
+      card.innerHTML = `
+        <div class="cross-result-header">
+          <div class="cross-result-file-title">
+            <span>📄</span>
+            <span title="${escapeHtml(r.path)}">${escapeHtml(r.fileName)}</span>
+            <span style="font-size:11px;color:var(--text-muted);font-weight:normal;">(${r.totalRows.toLocaleString()} rows)</span>
+          </div>
+          <div style="display:flex;align-items:center;gap:10px;">
+            <span class="cross-match-badge ${isHit ? "hit" : "zero"}">${isHit ? `${r.matchCount.toLocaleString()} matches` : "0 matches"}</span>
+            ${isHit && fileIdx !== -1 ? `<button class="btn btn-small btn-view-in-grid" data-idx="${fileIdx}" title="Open this file and filter table by this term">🔍 View in Table</button>` : ""}
+          </div>
+        </div>
+        ${snippetsHtml}
+      `;
+
+      const viewBtn = card.querySelector(".btn-view-in-grid");
+      if (viewBtn) {
+        viewBtn.addEventListener("click", async () => {
+          const idx = parseInt(viewBtn.dataset.idx, 10);
+          await switchLoadedFile(idx);
+          switchTab("tab-grid");
+          searchBox.value = query;
+          debouncedApply();
+        });
+      }
+
+      crossSearchResults.appendChild(card);
+    });
+  }
+
+  async function runCrossIocScan() {
+    if (loadedFiles.length === 0) {
+      crossIocStatus.textContent = "No files loaded to scan.";
+      return;
+    }
+    crossIocScanBtn.disabled = true;
+    crossIocStatus.textContent = `Extracting and correlating IOCs across ${loadedFiles.length} files...`;
+    try {
+      const filesPayload = loadedFiles.map((f) => ({
+        path: f.path,
+        sheet: f.sheet || null,
+        cacheDbPath: f.summary?.cacheDbPath || null,
+      }));
+      const summary = await invoke("cross_ioc_overlap", { files: filesPayload });
+      crossIocSummary = summary;
+      crossIocExportBtn.disabled = false;
+      renderCrossIocResults();
+    } catch (err) {
+      console.error("cross_ioc_overlap error", err);
+      crossIocStatus.textContent = `IOC overlap scan failed: ${err}`;
+    } finally {
+      crossIocScanBtn.disabled = false;
+    }
+  }
+
+  function renderCrossIocResults() {
+    if (!crossIocSummary) return;
+    const { filesScanned, totalUniqueIocs, overlappingCount, items } = crossIocSummary;
+    crossIocStatus.textContent = `Scanned ${filesScanned} files • Found ${totalUniqueIocs.toLocaleString()} unique indicators • ${overlappingCount.toLocaleString()} shared across 2+ files`;
+
+    const q = (crossIocSearch.value || "").trim().toLowerCase();
+
+    let filtered = items;
+    if (crossIocActiveFilter === "overlap") {
+      filtered = filtered.filter((i) => i.fileCount >= 2);
+    }
+    if (crossIocActiveType !== "all") {
+      filtered = filtered.filter((i) => i.iocType === crossIocActiveType);
+    }
+    if (q) {
+      filtered = filtered.filter((i) => i.value.toLowerCase().includes(q));
+    }
+
+    crossIocResults.innerHTML = "";
+    if (filtered.length === 0) {
+      crossIocResults.innerHTML = `<div class="correlation-empty-state" style="padding:20px;text-align:center;color:var(--text-muted);">No indicators matching current filter criteria.</div>`;
+      return;
+    }
+
+    const slice = filtered.slice(0, 500);
+    slice.forEach((item) => {
+      const card = document.createElement("div");
+      card.className = `cross-ioc-card${item.fileCount >= 2 ? " overlapping" : ""}`;
+
+      let metaTagsHtml = "";
+      if (item.isPrivate) metaTagsHtml += `<span class="cross-ioc-meta-tag">Private IP</span>`;
+      if (item.vpnLabel) metaTagsHtml += `<span class="cross-ioc-meta-tag">VPN: ${escapeHtml(item.vpnLabel)}</span>`;
+
+      const fileChipsHtml = item.occurrences
+        .map((occ) => {
+          const fIdx = loadedFiles.findIndex((f) => f.path === occ.path);
+          return `
+          <button type="button" class="cross-ioc-file-chip" data-file-idx="${fIdx}" data-val="${escapeHtml(item.value)}" title="Switch to ${escapeHtml(occ.fileName)} and filter">
+            <span>📄 ${escapeHtml(occ.fileName)}</span>
+            <span class="chip-count">${occ.count}</span>
+          </button>
+        `;
+        })
+        .join("");
+
+      card.innerHTML = `
+        <div class="cross-ioc-left">
+          <span class="cross-ioc-type-tag">${escapeHtml(item.iocType)}</span>
+          <span class="cross-ioc-val">${escapeHtml(item.value)}</span>
+          ${metaTagsHtml}
+          ${item.fileCount >= 2 ? `<span class="correlation-count-badge">Found in ${item.fileCount} files (${item.totalCount} total hits)</span>` : ""}
+        </div>
+        <div class="cross-ioc-files-breakdown">
+          ${fileChipsHtml}
+        </div>
+      `;
+
+      card.querySelectorAll(".cross-ioc-file-chip").forEach((chip) => {
+        chip.addEventListener("click", async () => {
+          const idx = parseInt(chip.dataset.fileIdx, 10);
+          const val = chip.dataset.val;
+          if (idx >= 0) {
+            await switchLoadedFile(idx);
+          }
+          switchTab("tab-grid");
+          searchBox.value = val;
+          debouncedApply();
+        });
+      });
+
+      crossIocResults.appendChild(card);
+    });
+
+    if (filtered.length > 500) {
+      const more = document.createElement("div");
+      more.style.textAlign = "center";
+      more.style.fontSize = "11.5px";
+      more.style.color = "var(--text-muted)";
+      more.style.padding = "8px";
+      more.textContent = `Showing first 500 of ${filtered.length.toLocaleString()} indicators. Use the search box above to narrow down.`;
+      crossIocResults.appendChild(more);
+    }
+  }
+
+  function exportCrossIocs() {
+    if (!crossIocSummary || !crossIocSummary.items) return;
+    const exportData = crossIocSummary.items.map((i) => ({
+      type: i.iocType,
+      value: i.value,
+      fileCount: i.fileCount,
+      totalOccurrences: i.totalCount,
+      isPrivate: i.isPrivate,
+      vpnLabel: i.vpnLabel,
+      files: i.occurrences.map((o) => `${o.fileName} (${o.count})`).join("; "),
+    }));
+    const blob = new Blob([JSON.stringify(exportData, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `cross_file_ioc_overlap_${new Date().toISOString().replace(/[:.]/g, "-")}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
   }
 
   // -- AI analyst ----------------------------------------------------------------
@@ -3587,6 +3899,13 @@
         try { table.redraw(true); } catch (_) {}
       }, 30);
     }
+
+    if (tabId === "tab-correlation") {
+      renderCorrelationScope();
+      if (!crossIocSummary && loadedFiles.length > 1) {
+        runCrossIocScan();
+      }
+    }
   }
 
   if (typeof document.querySelectorAll === "function") {
@@ -3654,6 +3973,75 @@
         switchLoadedFile(idx);
       }
     });
+  }
+
+  // Multi-File Correlation events
+  if (crossSearchBtn) {
+    crossSearchBtn.addEventListener("click", () => runCrossFileSearch());
+  }
+  if (crossSearchInput) {
+    crossSearchInput.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        runCrossFileSearch();
+      }
+    });
+  }
+  if (crossSearchClearBtn) {
+    crossSearchClearBtn.addEventListener("click", () => {
+      crossSearchInput.value = "";
+      crossSearchResults.innerHTML = "";
+      crossSearchStatus.classList.add("hidden");
+      crossSearchClearBtn.classList.add("hidden");
+      crossSearchResultsData = null;
+    });
+  }
+  if (crossIocScanBtn) {
+    crossIocScanBtn.addEventListener("click", runCrossIocScan);
+  }
+  if (crossIocExportBtn) {
+    crossIocExportBtn.addEventListener("click", exportCrossIocs);
+  }
+  if (correlationRefreshBtn) {
+    correlationRefreshBtn.addEventListener("click", () => {
+      renderCorrelationScope();
+      if (crossSearchInput.value.trim()) runCrossFileSearch();
+      if (crossIocSummary) runCrossIocScan();
+    });
+  }
+  if (gridCrossSearchBtn) {
+    gridCrossSearchBtn.addEventListener("click", () => {
+      const q = searchBox.value.trim();
+      switchTab("tab-correlation");
+      if (q) {
+        crossSearchInput.value = q;
+        runCrossFileSearch(q);
+      }
+    });
+  }
+
+  if (typeof document.querySelectorAll === "function") {
+    document.querySelectorAll(".cross-ioc-filter-btn").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        document.querySelectorAll(".cross-ioc-filter-btn").forEach((b) => b.classList.remove("active"));
+        btn.classList.add("active");
+        crossIocActiveFilter = btn.dataset.filter;
+        renderCrossIocResults();
+      });
+    });
+
+    document.querySelectorAll(".cross-ioc-type-btn").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        document.querySelectorAll(".cross-ioc-type-btn").forEach((b) => b.classList.remove("active"));
+        btn.classList.add("active");
+        crossIocActiveType = btn.dataset.type;
+        renderCrossIocResults();
+      });
+    });
+  }
+
+  if (crossIocSearch) {
+    crossIocSearch.addEventListener("input", renderCrossIocResults);
   }
 
   // Quick prompts in AI Analyst
@@ -4160,6 +4548,21 @@
     },
     removeFileForTest() {
       removeFile();
+    },
+    getLoadedFilesForTest() {
+      return loadedFiles;
+    },
+    runCrossSearchForTest(query) {
+      return runCrossFileSearch(query);
+    },
+    runCrossIocScanForTest() {
+      return runCrossIocScan();
+    },
+    getCrossIocSummaryForTest() {
+      return crossIocSummary;
+    },
+    getCrossSearchResultsForTest() {
+      return crossSearchResultsData;
     },
   });
 })();
