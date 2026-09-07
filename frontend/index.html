@@ -12,141 +12,21 @@
     <header id="toolbar">
       <button id="open-file-btn" class="btn btn-primary">Open File&hellip;</button>
       <button id="remove-file-btn" class="btn" disabled>Remove File</button>
+      <div id="file-switcher-wrap" class="file-switcher-wrap hidden">
+        <label for="file-switcher" class="file-switcher-label">Active:</label>
+        <select id="file-switcher" class="file-switcher" title="Switch loaded file"></select>
+      </div>
       <div id="file-info" class="file-info">No file loaded</div>
       <div class="toolbar-spacer"></div>
-      <input id="search-box" type="search" placeholder="Quick search all columns&hellip;" disabled />
       <button id="report-export-btn" class="btn" disabled>Threat Report</button>
       <button id="export-csv-btn" class="btn" disabled>Export CSV</button>
       <button id="export-xlsx-btn" class="btn" disabled>Export Excel</button>
     </header>
 
-    <section id="ai-search-workspace" class="ai-search-workspace" aria-labelledby="ai-search-heading">
-      <div class="ai-search-heading-row">
-        <div>
-          <div class="ai-search-title-line">
-            <h1 id="ai-search-heading">AI analyst (offline)</h1>
-            <span class="offline-badge">On-device</span>
-          </div>
-          <p>Ask anything: &ldquo;what is in this file&rdquo;, &ldquo;map this to MITRE&rdquo;, &ldquo;find chained activity&rdquo;, &ldquo;make a report&rdquo; &mdash; or describe evidence to filter the table.</p>
-        </div>
-      </div>
-      <form id="guided-search-form" class="guided-search-form">
-        <label for="guided-search-box" class="sr-only">Describe evidence to find</label>
-        <input id="guided-search-box" type="search" maxlength="4096" placeholder="Example: what is in this file? &mdash; or: failed logons for alice chronologically" disabled />
-        <button id="guided-search-submit" class="btn btn-primary" disabled>Ask</button>
-        <button id="guided-reset-btn" type="button" class="btn hidden">Clear AI search</button>
-      </form>
-      <div id="ai-search-availability" class="ai-search-availability" aria-live="polite">Import a file to search its evidence.</div>
-      <div id="semantic-index-status" class="semantic-index-status">Semantic matching starts automatically after import.</div>
-    </section>
-
     <div id="progress-bar-wrap" class="hidden">
       <div id="progress-bar"><div id="progress-fill"></div></div>
       <div id="progress-label"></div>
     </div>
-
-    <section id="analyst-panel" class="intel-panel analyst-panel hidden" aria-live="polite">
-      <div class="intel-panel-header">
-        <strong id="analyst-headline">AI analyst</strong>
-        <button id="analyst-panel-close" class="btn btn-small" title="Dismiss analyst answer" aria-label="Dismiss analyst answer">&times;</button>
-      </div>
-      <div id="analyst-status" class="intel-panel-note hidden"></div>
-      <div id="analyst-sections" class="intel-panel-body analyst-sections"></div>
-      <div id="analyst-steps" class="analyst-steps hidden"></div>
-      <div class="intel-panel-actions">
-        <button id="analyst-report-btn" class="btn btn-primary hidden">Generate report&hellip;</button>
-      </div>
-    </section>
-
-    <section id="guided-query-panel" class="intel-panel guided-query-panel hidden" aria-live="polite">
-      <div class="intel-panel-header">
-        <strong>AI search needs attention</strong>
-        <button id="guided-panel-close" class="btn btn-small" title="Dismiss message" aria-label="Dismiss AI search message">&times;</button>
-      </div>
-      <div id="guided-ai-status" class="guided-ai-status hidden"></div>
-      <div id="guided-preview-text" class="intel-panel-body"></div>
-      <div id="guided-clarification" class="intel-panel-note hidden"></div>
-      <div class="intel-panel-actions">
-        <button id="guided-run-btn" class="btn btn-primary hidden">Search evidence</button>
-        <button id="guided-reject-btn" class="btn hidden">Reject interpretation</button>
-      </div>
-    </section>
-
-    <details id="role-review-panel" class="mapping-panel hidden">
-      <summary>
-        <span class="mapping-summary-title">Data mapping <span class="automatic-badge">Automatic</span></span>
-        <span id="data-mapping-summary" class="mapping-summary-status">Waiting for a file</span>
-      </summary>
-      <div class="mapping-panel-content">
-        <p class="mapping-explainer">Mappings improve timeline ordering and optional threat enrichment. AI evidence search still searches every imported column when mappings are incomplete.</p>
-        <div id="role-list" class="role-list"></div>
-        <div id="role-panel-status" class="intel-panel-note"></div>
-        <div class="intel-panel-actions">
-          <button id="role-panel-close" class="btn btn-small">Collapse data mapping</button>
-        </div>
-      </div>
-    </details>
-
-    <details id="ignore-rules-panel" class="mapping-panel hidden">
-      <summary>
-        <span class="mapping-summary-title">Ignore rules</span>
-        <span id="ignore-rules-summary" class="mapping-summary-status">Loading&hellip;</span>
-      </summary>
-      <div class="mapping-panel-content">
-        <p class="mapping-explainer">Rows matching an enabled rule are excluded from MITRE matching, activity classification, anomaly scanning, and AI semantic search &mdash; they stay fully visible in the grid and in plain search. Rules are specific to this file: built-in rules start enabled here by default, and anything you disable, enable, or add only affects this file's database, never any other file you open.</p>
-        <div id="ignore-rule-list" class="role-list"></div>
-        <div id="ignore-rule-panel-status" class="intel-panel-note"></div>
-        <form id="add-ignore-rule-form" class="add-ignore-rule-form">
-          <input id="ignore-rule-name" type="text" placeholder="Rule name, e.g. Backup agent noise" maxlength="120" required />
-          <select id="ignore-rule-target-type" aria-label="Match by">
-            <option value="role">Column role</option>
-            <option value="header">Column header</option>
-          </select>
-          <select id="ignore-rule-role" aria-label="Column role"></select>
-          <input id="ignore-rule-header" type="text" placeholder="Column header, e.g. EventID" class="hidden" aria-label="Column header" />
-          <select id="ignore-rule-op" aria-label="Match operator">
-            <option value="contains_any">contains</option>
-            <option value="equals_any">equals</option>
-            <option value="ends_with_any">ends with</option>
-          </select>
-          <input id="ignore-rule-values" type="text" placeholder="Value(s), comma-separated" required aria-label="Values to match" />
-          <button type="submit" class="btn btn-small">+ Add rule</button>
-        </form>
-        <div class="intel-panel-actions">
-          <button id="ignore-rules-panel-close" class="btn btn-small">Collapse ignore rules</button>
-        </div>
-      </div>
-    </details>
-
-    <section id="timezone-panel" class="intel-panel timezone-panel hidden" aria-live="polite">
-      <div class="intel-panel-header">
-        <strong>Timestamp details needed</strong>
-        <button id="timezone-panel-close" class="btn btn-small" title="Dismiss timezone prompt" aria-label="Dismiss timestamp timezone prompt">&times;</button>
-      </div>
-      <div id="timezone-summary" class="intel-panel-body"></div>
-      <div id="timezone-samples" class="intel-panel-note hidden"></div>
-      <div class="timezone-controls">
-        <input id="timezone-input" type="text" placeholder="UTC offset or IANA timezone, e.g. +02:00 or Europe/Bucharest" />
-        <label id="date-convention-wrap" class="hidden" for="date-convention-select">
-          Slash-date order
-          <select id="date-convention-select">
-            <option value="">Choose date order&hellip;</option>
-            <option value="month_first">MM/DD/YYYY (month first)</option>
-            <option value="day_first">DD/MM/YYYY (day first)</option>
-          </select>
-        </label>
-        <button id="timezone-utc-btn" class="btn">Already UTC</button>
-        <button id="timezone-normalize-btn" class="btn btn-primary">Use timezone</button>
-      </div>
-    </section>
-
-    <section id="report-summary-panel" class="intel-panel hidden">
-      <div class="intel-panel-header">
-        <strong>Report export</strong>
-        <button id="report-summary-close" class="btn btn-small" title="Dismiss report summary">&times;</button>
-      </div>
-      <div id="report-summary-text" class="intel-panel-body"></div>
-    </section>
 
     <div id="sheet-picker" class="hidden">
       <label for="sheet-select">This workbook has multiple sheets &mdash; pick one:</label>
@@ -154,55 +34,301 @@
       <button id="sheet-load-btn" class="btn btn-primary">Load Sheet</button>
     </div>
 
-    <main id="main-area">
-      <aside id="sidebar">
-        <div class="sidebar-section">
-          <h3>Sort</h3>
-          <select id="sort-column"><option value="">(row order)</option></select>
-          <select id="sort-direction">
-            <option value="asc">Ascending</option>
-            <option value="desc">Descending</option>
-          </select>
-        </div>
+    <!-- App Navigation Tabs -->
+    <nav id="app-nav-tabs" class="app-nav-tabs" role="tablist">
+      <button class="nav-tab active" data-tab="tab-grid" role="tab" aria-selected="true">
+        <span class="tab-icon">📊</span> Evidence Grid
+        <span id="badge-grid" class="nav-tab-badge hidden">0</span>
+      </button>
+      <button class="nav-tab" data-tab="tab-analyst" role="tab" aria-selected="false">
+        <span class="tab-icon">🤖</span> AI Analyst
+        <span id="badge-analyst" class="nav-tab-badge">Ready</span>
+      </button>
+      <button class="nav-tab" data-tab="tab-iocs" role="tab" aria-selected="false">
+        <span class="tab-icon">🛡️</span> Extracted IOCs
+        <span id="badge-iocs" class="nav-tab-badge hidden">0</span>
+      </button>
+      <button class="nav-tab" data-tab="tab-enrichment" role="tab" aria-selected="false">
+        <span class="tab-icon">⚡</span> Threat Enrichment
+        <span id="badge-enrichment" class="nav-tab-badge hidden">0</span>
+      </button>
+      <button class="nav-tab" data-tab="tab-rules" role="tab" aria-selected="false">
+        <span class="tab-icon">⚙️</span> Data Mapping &amp; Rules
+        <span id="badge-rules" class="nav-tab-badge hidden">0</span>
+      </button>
+    </nav>
 
-        <div class="sidebar-section">
-          <h3>Filters</h3>
-          <div id="filter-list"></div>
-          <button id="add-filter-btn" class="btn btn-small" disabled>+ Add filter</button>
-        </div>
+    <!-- Tab Contents Container -->
+    <div id="tab-container" class="tab-content-container">
 
-        <div class="sidebar-section">
-          <button id="apply-btn" class="btn btn-primary" disabled>Apply</button>
-          <button id="clear-btn" class="btn" disabled>Clear all</button>
+      <!-- TAB 1: Evidence Grid -->
+      <div id="tab-grid" class="tab-pane active" role="tabpanel">
+        <div class="pane-header grid-pane-header">
+          <div class="pane-title-group">
+            <button id="sidebar-toggle-btn" class="btn btn-small" title="Toggle Filter Sidebar">◧ Toggle Filters</button>
+            <input id="search-box" type="search" placeholder="Quick search all columns&hellip;" disabled />
+          </div>
+          <div class="pane-actions">
+            <button id="grid-maximize-btn" class="btn btn-small btn-expand-pane" title="Maximize Table View">⛶ Expand Table</button>
+          </div>
         </div>
+        <main id="main-area">
+          <aside id="sidebar">
+            <div class="sidebar-section">
+              <h3>Sort</h3>
+              <select id="sort-column"><option value="">(row order)</option></select>
+              <select id="sort-direction">
+                <option value="asc">Ascending</option>
+                <option value="desc">Descending</option>
+              </select>
+            </div>
 
-        <div class="sidebar-section optional-enrichment-section">
-          <h3>Optional enrichment</h3>
-          <p class="sidebar-note enrichment-intro">Add known threat-technique matches after import. This is not required for AI evidence search.</p>
-          <button id="suspicious-scan-btn" class="btn" disabled>Run threat enrichment</button>
-          <button id="review-roles-btn" class="btn btn-small" disabled>Open data mapping</button>
-          <div id="evidence-columns-label" class="sidebar-note">Automatic evidence mapping starts after import.</div>
+            <div class="sidebar-section">
+              <h3>Filters</h3>
+              <div id="filter-list"></div>
+              <button id="add-filter-btn" class="btn btn-small" disabled>+ Add filter</button>
+            </div>
+
+            <div class="sidebar-section">
+              <button id="apply-btn" class="btn btn-primary" disabled>Apply</button>
+              <button id="clear-btn" class="btn" disabled>Clear all</button>
+            </div>
+
+            <div class="sidebar-section">
+              <div id="evidence-columns-label" class="sidebar-note">Automatic evidence mapping starts after import.</div>
+            </div>
+          </aside>
+
+          <section id="grid-area">
+            <div id="grid"></div>
+            <footer id="status-bar">
+              <span id="row-count-label">&mdash;</span>
+              <div class="toolbar-spacer"></div>
+              <button id="prev-page-btn" class="btn btn-small" disabled>&laquo; Prev</button>
+              <span id="page-label"></span>
+              <button id="next-page-btn" class="btn btn-small" disabled>Next &raquo;</button>
+            </footer>
+          </section>
+        </main>
+      </div>
+
+      <!-- TAB 2: AI Analyst -->
+      <div id="tab-analyst" class="tab-pane" role="tabpanel">
+        <div class="pane-header">
+          <div class="pane-title-group">
+            <h2 class="pane-title">AI Forensic Analyst (offline Qwen2.5-1.5B)</h2>
+            <span class="offline-badge">On-device Private</span>
+          </div>
+          <div class="pane-actions">
+            <button id="analyst-maximize-btn" class="btn btn-small btn-expand-pane" title="Maximize AI View">⛶ Expand</button>
+          </div>
+        </div>
+        <div class="analyst-scroll-area">
+          <section id="ai-search-workspace" class="ai-search-workspace" aria-labelledby="ai-search-heading">
+            <div class="ai-search-heading-row">
+              <div>
+                <h1 id="ai-search-heading" style="display:none">AI analyst (offline)</h1>
+                <p>Ask anything: &ldquo;what is in this file&rdquo;, &ldquo;map this to MITRE&rdquo;, &ldquo;find chained activity&rdquo;, &ldquo;make a report&rdquo; &mdash; or describe evidence to filter the table.</p>
+              </div>
+            </div>
+            <form id="guided-search-form" class="guided-search-form">
+              <label for="guided-search-box" class="sr-only">Describe evidence to find</label>
+              <input id="guided-search-box" type="search" maxlength="4096" placeholder="Example: what is in this file? &mdash; or: failed logons for alice chronologically" disabled />
+              <button id="guided-search-submit" class="btn btn-primary" disabled>Ask AI</button>
+              <button id="guided-reset-btn" type="button" class="btn hidden">Clear AI search</button>
+            </form>
+            <div class="quick-prompts-bar">
+              <span style="font-size: 11.5px; color: var(--text-muted); font-weight: 600;">Quick Prompts:</span>
+              <button type="button" class="prompt-chip" data-prompt="what is in this file?">What is in this file?</button>
+              <button type="button" class="prompt-chip" data-prompt="map this to MITRE ATT&amp;CK">Map to MITRE</button>
+              <button type="button" class="prompt-chip" data-prompt="find chained activity and anomalies">Find anomalies &amp; chains</button>
+              <button type="button" class="prompt-chip" data-prompt="summarize suspicious activity">Suspicious activity</button>
+              <button type="button" class="prompt-chip" data-prompt="make an executive summary report">Make report</button>
+            </div>
+            <div id="ai-search-availability" class="ai-search-availability" aria-live="polite">Import a file to search its evidence.</div>
+            <div id="semantic-index-status" class="semantic-index-status">Semantic matching starts automatically after import.</div>
+          </section>
+
+          <section id="analyst-panel" class="intel-panel analyst-panel hidden" aria-live="polite">
+            <div class="intel-panel-header">
+              <strong id="analyst-headline">AI analyst</strong>
+              <button id="analyst-panel-close" class="btn btn-small" title="Dismiss analyst answer" aria-label="Dismiss analyst answer">&times;</button>
+            </div>
+            <div id="analyst-status" class="intel-panel-note hidden"></div>
+            <div id="analyst-sections" class="intel-panel-body analyst-sections"></div>
+            <div id="analyst-steps" class="analyst-steps hidden"></div>
+            <div class="intel-panel-actions">
+              <button id="analyst-report-btn" class="btn btn-primary hidden">Generate report&hellip;</button>
+            </div>
+          </section>
+
+          <section id="guided-query-panel" class="intel-panel guided-query-panel hidden" aria-live="polite">
+            <div class="intel-panel-header">
+              <strong>AI search needs attention</strong>
+              <button id="guided-panel-close" class="btn btn-small" title="Dismiss message" aria-label="Dismiss AI search message">&times;</button>
+            </div>
+            <div id="guided-ai-status" class="guided-ai-status hidden"></div>
+            <div id="guided-preview-text" class="intel-panel-body"></div>
+            <div id="guided-clarification" class="intel-panel-note hidden"></div>
+            <div class="intel-panel-actions">
+              <button id="guided-run-btn" class="btn btn-primary hidden">Search evidence</button>
+              <button id="guided-reject-btn" class="btn hidden">Reject interpretation</button>
+            </div>
+          </section>
+        </div>
+      </div>
+
+      <!-- TAB 3: Extracted IOCs -->
+      <div id="tab-iocs" class="tab-pane" role="tabpanel">
+        <div class="pane-header">
+          <div class="pane-title-group">
+            <h2 class="pane-title">Extracted Indicators of Compromise (IOCs)</h2>
+            <span class="automatic-badge">Offline Extraction</span>
+          </div>
+          <div class="pane-actions">
+            <button id="extract-iocs-btn" class="btn btn-primary btn-small" disabled>Extract / Refresh IOCs</button>
+            <button id="copy-iocs-btn" class="btn btn-small" disabled>📋 Copy All</button>
+            <button id="export-iocs-btn" class="btn btn-small" disabled>📥 Export JSON</button>
+            <button id="iocs-maximize-btn" class="btn btn-small btn-expand-pane" title="Maximize IOC View">⛶ Expand</button>
+          </div>
+        </div>
+        <div class="ioc-workspace">
+          <div class="ioc-toolbar">
+            <input id="ioc-search-filter" class="ioc-filter-input" type="search" placeholder="Filter IOCs (e.g. domain name, IP, email, user-agent)..." />
+            <div class="ioc-category-tabs">
+              <button class="ioc-cat-btn active" data-cat="all">All</button>
+              <button class="ioc-cat-btn" data-cat="ip">IPs</button>
+              <button class="ioc-cat-btn" data-cat="domain">Domains</button>
+              <button class="ioc-cat-btn" data-cat="url">URLs</button>
+              <button class="ioc-cat-btn" data-cat="email">Emails</button>
+              <button class="ioc-cat-btn" data-cat="ua">User Agents</button>
+            </div>
+          </div>
+          <div id="ioc-stats" class="intel-panel-note">Click "Extract IOCs" to scan evidence rows for IPs, domains, URLs, emails, and user agents.</div>
+          <details id="ioc-panel" class="mapping-panel hidden" style="display:none">
+            <summary><span id="ioc-panel-summary"></span></summary>
+            <button id="ioc-panel-close" class="hidden"></button>
+          </details>
+          <div class="ioc-container">
+            <div id="ioc-results-content" class="ioc-results-content"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- TAB 4: Threat Enrichment -->
+      <div id="tab-enrichment" class="tab-pane" role="tabpanel">
+        <div class="pane-header">
+          <div class="pane-title-group">
+            <h2 class="pane-title">Threat Enrichment &amp; MITRE ATT&amp;CK</h2>
+          </div>
+          <div class="pane-actions">
+            <label class="toggle-option" id="bec-toggle-label" style="display: flex; align-items: center; gap: 6px; font-size: 12px; cursor: pointer;">
+              <input type="checkbox" id="include-bec-chk" checked />
+              <span>Include BEC &amp; Cloud rules</span>
+            </label>
+            <button id="suspicious-scan-btn" class="btn btn-primary btn-small" disabled>Run Threat Enrichment</button>
+            <button id="enrichment-maximize-btn" class="btn btn-small btn-expand-pane" title="Maximize Enrichment View">⛶ Expand</button>
+          </div>
+        </div>
+        <div class="enrichment-scroll-area" style="padding: 16px; overflow-y: auto;">
+          <p class="sidebar-note enrichment-intro" style="margin-bottom: 12px;">Scan imported evidence for known threat-technique matches, suspicious execution patterns, anomalies, and attack chains.</p>
           <div id="intel-scan-summary" class="scan-summary"></div>
+          <section id="report-summary-panel" class="intel-panel hidden" style="margin-top: 16px;">
+            <div class="intel-panel-header">
+              <strong>Report export</strong>
+              <button id="report-summary-close" class="btn btn-small" title="Dismiss report summary">&times;</button>
+            </div>
+            <div id="report-summary-text" class="intel-panel-body"></div>
+          </section>
         </div>
+      </div>
 
-        <div class="sidebar-section">
-          <h3>Ignore rules</h3>
-          <p class="sidebar-note">Suppress noisy rows (security agents, known-benign event IDs, etc.) from MITRE matching, anomaly scanning, activity classification, and AI search &mdash; specific to this file.</p>
-          <button id="manage-ignore-rules-btn" class="btn btn-small" disabled>Manage ignore rules</button>
+      <!-- TAB 5: Data Mapping & Rules -->
+      <div id="tab-rules" class="tab-pane" role="tabpanel">
+        <div class="pane-header">
+          <div class="pane-title-group">
+            <h2 class="pane-title">Data Mapping, Ignore Rules &amp; Timestamps</h2>
+          </div>
+          <div class="pane-actions">
+            <button id="review-roles-btn" class="btn btn-small" disabled style="display:none">Open data mapping</button>
+            <button id="manage-ignore-rules-btn" class="btn btn-small" disabled style="display:none">Manage ignore rules</button>
+            <button id="rules-maximize-btn" class="btn btn-small btn-expand-pane" title="Maximize Rules View">⛶ Expand</button>
+          </div>
         </div>
-      </aside>
+        <div class="rules-scroll-area" style="padding: 16px; overflow-y: auto;">
+          <!-- Data Mapping Details -->
+          <details id="role-review-panel" class="mapping-panel" open>
+            <summary>
+              <span class="mapping-summary-title">Data mapping <span class="automatic-badge">Automatic</span></span>
+              <span id="data-mapping-summary" class="mapping-summary-status">Waiting for a file</span>
+            </summary>
+            <div class="mapping-panel-content">
+              <p class="mapping-explainer">Mappings improve timeline ordering and optional threat enrichment. AI evidence search still searches every imported column when mappings are incomplete.</p>
+              <div id="role-list" class="role-list"></div>
+              <div id="role-panel-status" class="intel-panel-note"></div>
+              <div class="intel-panel-actions" style="display:none">
+                <button id="role-panel-close" class="btn btn-small">Collapse data mapping</button>
+              </div>
+            </div>
+          </details>
 
-      <section id="grid-area">
-        <div id="grid"></div>
-        <footer id="status-bar">
-          <span id="row-count-label">&mdash;</span>
-          <div class="toolbar-spacer"></div>
-          <button id="prev-page-btn" class="btn btn-small" disabled>&laquo; Prev</button>
-          <span id="page-label"></span>
-          <button id="next-page-btn" class="btn btn-small" disabled>Next &raquo;</button>
-        </footer>
-      </section>
-    </main>
+          <!-- Ignore Rules Details -->
+          <details id="ignore-rules-panel" class="mapping-panel" open style="margin-top: 16px;">
+            <summary>
+              <span class="mapping-summary-title">Ignore rules (Noise Suppression)</span>
+              <span id="ignore-rules-summary" class="mapping-summary-status">Loading&hellip;</span>
+            </summary>
+            <div class="mapping-panel-content">
+              <p class="mapping-explainer">Rows matching an enabled rule are excluded from MITRE matching, activity classification, anomaly scanning, and AI semantic search &mdash; they stay fully visible in the grid and in plain search. Rules are specific to this file: anything you add or toggle only affects this file's database.</p>
+              <div id="ignore-rule-list" class="role-list"></div>
+              <div id="ignore-rule-panel-status" class="intel-panel-note"></div>
+              <form id="add-ignore-rule-form" class="add-ignore-rule-form">
+                <input id="ignore-rule-name" type="text" placeholder="Rule name, e.g. Backup agent noise" maxlength="120" required />
+                <select id="ignore-rule-target-type" aria-label="Match by">
+                  <option value="role">Column role</option>
+                  <option value="header">Column header</option>
+                </select>
+                <select id="ignore-rule-role" aria-label="Column role"></select>
+                <input id="ignore-rule-header" type="text" placeholder="Column header, e.g. EventID" class="hidden" aria-label="Column header" />
+                <select id="ignore-rule-op" aria-label="Match operator">
+                  <option value="contains_any">contains</option>
+                  <option value="equals_any">equals</option>
+                  <option value="ends_with_any">ends with</option>
+                </select>
+                <input id="ignore-rule-values" type="text" placeholder="Value(s), comma-separated" required aria-label="Values to match" />
+                <button type="submit" class="btn btn-small">+ Add rule</button>
+              </form>
+              <div class="intel-panel-actions" style="display:none">
+                <button id="ignore-rules-panel-close" class="btn btn-small">Collapse ignore rules</button>
+              </div>
+            </div>
+          </details>
+
+          <!-- Timezone normalization Details -->
+          <section id="timezone-panel" class="intel-panel timezone-panel hidden" aria-live="polite" style="margin-top: 16px;">
+            <div class="intel-panel-header">
+              <strong>Timestamp details needed</strong>
+              <button id="timezone-panel-close" class="btn btn-small" title="Dismiss timezone prompt" aria-label="Dismiss timestamp timezone prompt">&times;</button>
+            </div>
+            <div id="timezone-summary" class="intel-panel-body"></div>
+            <div id="timezone-samples" class="intel-panel-note hidden"></div>
+            <div class="timezone-controls">
+              <input id="timezone-input" type="text" placeholder="UTC offset or IANA timezone, e.g. +02:00 or Europe/Bucharest" />
+              <label id="date-convention-wrap" class="hidden" for="date-convention-select">
+                Slash-date order
+                <select id="date-convention-select">
+                  <option value="">Choose date order&hellip;</option>
+                  <option value="month_first">MM/DD/YYYY (month first)</option>
+                  <option value="day_first">DD/MM/YYYY (day first)</option>
+                </select>
+              </label>
+              <button id="timezone-utc-btn" class="btn">Already UTC</button>
+              <button id="timezone-normalize-btn" class="btn btn-primary">Use timezone</button>
+            </div>
+          </section>
+        </div>
+      </div>
+    </div>
   </div>
 
   <template id="filter-row-template">

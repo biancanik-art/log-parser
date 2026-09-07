@@ -1,6 +1,6 @@
 [package]
 name = "log-parser"
-version = "0.2.6"
+version = "0.2.7"
 description = "Fast generic viewer/filter for large Excel exports (Sentinel, Taegis, Defender, etc.)"
 authors = ["log-parser contributors"]
 edition = "2021"
@@ -42,3 +42,8 @@ windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem"] }
 candle-core = { version = "0.11.0", features = ["accelerate"] }
 candle-nn = { version = "0.11.0", features = ["accelerate"] }
 candle-transformers = { version = "0.11.0", features = ["accelerate"] }
+
+# Optimize dependencies (especially candle ML matrix multiplication) even in dev builds
+[profile.dev.package."*"]
+opt-level = 3
+

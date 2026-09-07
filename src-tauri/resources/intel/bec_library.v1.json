@@ -1,0 +1,188 @@
+{
+  "schemaVersion": 1,
+  "libraryId": "bec_cloud_v1",
+  "techniques": [
+    {
+      "techniqueId": "T1114.002",
+      "name": "Email Collection: Remote Email Collection",
+      "tactics": [{"id": "TA0009", "name": "Collection"}],
+      "aliases": [],
+      "keywords": [
+        {"id": "t1114_002_set_mailbox", "pattern": "Set-Mailbox", "match": "substring", "columns": ["command_line", "text_evidence"], "score": 60},
+        {"id": "t1114_002_set_mailboxautoreplyconfiguration", "pattern": "Set-MailboxAutoReplyConfiguration", "match": "substring", "columns": ["command_line", "text_evidence"], "score": 70},
+        {"id": "t1114_002_get_mailbox", "pattern": "Get-Mailbox", "match": "substring", "columns": ["command_line", "text_evidence"], "score": 40},
+        {"id": "t1114_002_search_mailbox", "pattern": "Search-Mailbox", "match": "substring", "columns": ["command_line", "text_evidence"], "score": 70}
+      ]
+    },
+    {
+      "techniqueId": "T1114.003",
+      "name": "Email Forwarding Rule",
+      "tactics": [{"id": "TA0009", "name": "Collection"}, {"id": "TA0010", "name": "Exfiltration"}],
+      "aliases": [],
+      "keywords": [
+        {"id": "t1114_003_new_inboxrule", "pattern": "New-InboxRule", "match": "substring", "columns": ["command_line", "text_evidence"], "score": 75},
+        {"id": "t1114_003_set_inboxrule", "pattern": "Set-InboxRule", "match": "substring", "columns": ["command_line", "text_evidence"], "score": 70},
+        {"id": "t1114_003_forwardto", "pattern": "ForwardTo", "match": "substring", "columns": ["command_line", "text_evidence"], "score": 80},
+        {"id": "t1114_003_redirectto", "pattern": "RedirectTo", "match": "substring", "columns": ["command_line", "text_evidence"], "score": 80},
+        {"id": "t1114_003_forwardasattachmentto", "pattern": "ForwardAsAttachmentTo", "match": "substring", "columns": ["command_line", "text_evidence"], "score": 80},
+        {"id": "t1114_003_new_transportrule", "pattern": "New-TransportRule", "match": "substring", "columns": ["command_line", "text_evidence"], "score": 70},
+        {"id": "t1114_003_set_transportrule", "pattern": "Set-TransportRule", "match": "substring", "columns": ["command_line", "text_evidence"], "score": 70},
+        {"id": "t1114_003_delivertomailboxandforward", "pattern": "DeliverToMailboxAndForward", "match": "substring", "columns": ["command_line", "text_evidence"], "score": 85}
+      ]
+    },
+    {
+      "techniqueId": "T1098.002",
+      "name": "Account Manipulation: Additional Email Delegate Access",
+      "tactics": [{"id": "TA0003", "name": "Persistence"}],
+      "aliases": [],
+      "keywords": [
+        {"id": "t1098_002_add_mailboxpermission", "pattern": "Add-MailboxPermission", "match": "substring", "columns": ["command_line", "text_evidence"], "score": 80},
+        {"id": "t1098_002_add_recipientpermission", "pattern": "Add-RecipientPermission", "match": "substring", "columns": ["command_line", "text_evidence"], "score": 80},
+        {"id": "t1098_002_set_mailboxfolderpermission", "pattern": "Set-MailboxFolderPermission", "match": "substring", "columns": ["command_line", "text_evidence"], "score": 70},
+        {"id": "t1098_002_fullaccess", "pattern": "FullAccess", "match": "word", "columns": ["command_line", "text_evidence"], "score": 75},
+        {"id": "t1098_002_sendas", "pattern": "SendAs", "match": "word", "columns": ["command_line", "text_evidence"], "score": 75},
+        {"id": "t1098_002_sendonbehalf", "pattern": "SendOnBehalf", "match": "word", "columns": ["command_line", "text_evidence"], "score": 70}
+      ]
+    },
+    {
+      "techniqueId": "T1098.005",
+      "name": "Account Manipulation: Device Registration",
+      "tactics": [{"id": "TA0003", "name": "Persistence"}],
+      "aliases": [],
+      "keywords": [
+        {"id": "t1098_005_register_device", "pattern": "Register device", "match": "substring", "columns": ["command_line", "text_evidence"], "score": 60},
+        {"id": "t1098_005_add_registered_owner", "pattern": "Add registered owner", "match": "substring", "columns": ["command_line", "text_evidence"], "score": 65},
+        {"id": "t1098_005_device_registration", "pattern": "device registration", "match": "substring", "columns": ["command_line", "text_evidence"], "score": 60},
+        {"id": "t1098_005_mfa_method_registered", "pattern": "MFA method registered", "match": "substring", "columns": ["command_line", "text_evidence"], "score": 70},
+        {"id": "t1098_005_strongauthenticationmethod", "pattern": "StrongAuthenticationMethod", "match": "substring", "columns": ["command_line", "text_evidence"], "score": 70}
+      ]
+    },
+    {
+      "techniqueId": "T1078.004",
+      "name": "Valid Accounts: Cloud Accounts",
+      "tactics": [{"id": "TA0001", "name": "Initial Access"}, {"id": "TA0003", "name": "Persistence"}],
+      "aliases": [],
+      "keywords": [
+        {"id": "t1078_004_userloginfailed", "pattern": "UserLoginFailed", "match": "word", "columns": ["command_line", "text_evidence"], "score": 40},
+        {"id": "t1078_004_userloggedin", "pattern": "UserLoggedIn", "match": "word", "columns": ["command_line", "text_evidence"], "score": 40},
+        {"id": "t1078_004_signin_activity", "pattern": "Sign-in activity", "match": "substring", "columns": ["command_line", "text_evidence"], "score": 50},
+        {"id": "t1078_004_impossible_travel", "pattern": "Impossible travel", "match": "substring", "columns": ["command_line", "text_evidence"], "score": 85},
+        {"id": "t1078_004_unfamiliar_signin", "pattern": "Unfamiliar sign-in", "match": "substring", "columns": ["command_line", "text_evidence"], "score": 80},
+        {"id": "t1078_004_atypical_travel", "pattern": "Atypical travel", "match": "substring", "columns": ["command_line", "text_evidence"], "score": 80}
+      ]
+    },
+    {
+      "techniqueId": "T1550.001",
+      "name": "Use Alternate Authentication Material: Application Access Token",
+      "tactics": [{"id": "TA0008", "name": "Lateral Movement"}],
+      "aliases": [],
+      "keywords": [
+        {"id": "t1550_001_consent_application", "pattern": "Consent to application", "match": "substring", "columns": ["command_line", "text_evidence"], "score": 75},
+        {"id": "t1550_001_add_oauth2permissiongrant", "pattern": "Add OAuth2PermissionGrant", "match": "substring", "columns": ["command_line", "text_evidence"], "score": 85},
+        {"id": "t1550_001_add_app_role_assignment", "pattern": "Add app role assignment", "match": "substring", "columns": ["command_line", "text_evidence"], "score": 70},
+        {"id": "t1550_001_add_service_principal", "pattern": "Add service principal", "match": "substring", "columns": ["command_line", "text_evidence"], "score": 65},
+        {"id": "t1550_001_application_consent", "pattern": "application consent", "match": "substring", "columns": ["command_line", "text_evidence"], "score": 60}
+      ]
+    },
+    {
+      "techniqueId": "T1136.003",
+      "name": "Create Account: Cloud Account",
+      "tactics": [{"id": "TA0003", "name": "Persistence"}],
+      "aliases": [],
+      "keywords": [
+        {"id": "t1136_003_add_user", "pattern": "Add user", "match": "substring", "columns": ["command_line", "text_evidence"], "score": 60},
+        {"id": "t1136_003_invite_external_user", "pattern": "Invite external user", "match": "substring", "columns": ["command_line", "text_evidence"], "score": 70},
+        {"id": "t1136_003_add_member_to_role", "pattern": "Add member to role", "match": "substring", "columns": ["command_line", "text_evidence"], "score": 75},
+        {"id": "t1136_003_new_mailbox", "pattern": "New-Mailbox", "match": "substring", "columns": ["command_line", "text_evidence"], "score": 65}
+      ]
+    },
+    {
+      "techniqueId": "T1562.008",
+      "name": "Impair Defenses: Disable Cloud Logs",
+      "tactics": [{"id": "TA0005", "name": "Defense Evasion"}],
+      "aliases": [],
+      "keywords": [
+        {"id": "t1562_008_set_adminauditlogconfig", "pattern": "Set-AdminAuditLogConfig", "match": "substring", "columns": ["command_line", "text_evidence"], "score": 85},
+        {"id": "t1562_008_set_organizationconfig", "pattern": "Set-OrganizationConfig", "match": "substring", "columns": ["command_line", "text_evidence"], "score": 70},
+        {"id": "t1562_008_disable_mailboxauditing", "pattern": "Disable-MailboxAuditing", "match": "substring", "columns": ["command_line", "text_evidence"], "score": 85},
+        {"id": "t1562_008_unifiedauditlogingestionenabled", "pattern": "UnifiedAuditLogIngestionEnabled", "match": "substring", "columns": ["command_line", "text_evidence"], "score": 80}
+      ]
+    },
+    {
+      "techniqueId": "T1530",
+      "name": "Data from Cloud Storage",
+      "tactics": [{"id": "TA0009", "name": "Collection"}],
+      "aliases": [],
+      "keywords": [
+        {"id": "t1530_filedownloaded", "pattern": "FileDownloaded", "match": "word", "columns": ["command_line", "text_evidence"], "score": 40},
+        {"id": "t1530_filesyncdownloadedfull", "pattern": "FileSyncDownloadedFull", "match": "word", "columns": ["command_line", "text_evidence"], "score": 45},
+        {"id": "t1530_fileaccessed", "pattern": "FileAccessed", "match": "word", "columns": ["command_line", "text_evidence"], "score": 40},
+        {"id": "t1530_filepreviewed", "pattern": "FilePreviewed", "match": "word", "columns": ["command_line", "text_evidence"], "score": 40},
+        {"id": "t1530_sharingset", "pattern": "SharingSet", "match": "word", "columns": ["command_line", "text_evidence"], "score": 50},
+        {"id": "t1530_anonymouslinkcreated", "pattern": "AnonymousLinkCreated", "match": "word", "columns": ["command_line", "text_evidence"], "score": 60},
+        {"id": "t1530_companylinkcreated", "pattern": "CompanyLinkCreated", "match": "word", "columns": ["command_line", "text_evidence"], "score": 55},
+        {"id": "t1530_sharinginvitationcreated", "pattern": "SharingInvitationCreated", "match": "word", "columns": ["command_line", "text_evidence"], "score": 50}
+      ]
+    },
+    {
+      "techniqueId": "T1071.001",
+      "name": "Application Layer Protocol: Web Protocols",
+      "tactics": [{"id": "TA0011", "name": "Command and Control"}],
+      "aliases": [],
+      "keywords": [
+        {"id": "t1071_001_python_requests", "pattern": "python-requests", "match": "substring", "columns": ["command_line", "text_evidence"], "score": 60},
+        {"id": "t1071_001_powershell", "pattern": "PowerShell", "match": "word", "columns": ["command_line", "text_evidence"], "score": 55},
+        {"id": "t1071_001_go_http_client", "pattern": "Go-http-client", "match": "substring", "columns": ["command_line", "text_evidence"], "score": 60},
+        {"id": "t1071_001_axios", "pattern": "axios", "match": "word", "columns": ["command_line", "text_evidence"], "score": 50},
+        {"id": "t1071_001_postmanruntime", "pattern": "PostmanRuntime", "match": "word", "columns": ["command_line", "text_evidence"], "score": 55}
+      ]
+    }
+  ],
+  "behaviorRules": [
+    {
+      "id": "rule_inbox_rule_external_forwarding",
+      "name": "Inbox rule with external forwarding",
+      "techniqueId": "T1114.003",
+      "score": 85,
+      "conditions": [
+        {
+          "role": "operation",
+          "op": "contains_any",
+          "values": [
+            "New-InboxRule"
+          ]
+        },
+        {
+          "role": "text_evidence",
+          "op": "contains_any",
+          "values": [
+            "ForwardTo"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "rule_mailbox_delegation_added",
+      "name": "Mailbox delegation added",
+      "techniqueId": "T1098.002",
+      "score": 80,
+      "conditions": [
+        {
+          "role": "operation",
+          "op": "contains_any",
+          "values": [
+            "Add-MailboxPermission"
+          ]
+        },
+        {
+          "role": "text_evidence",
+          "op": "contains_any",
+          "values": [
+            "FullAccess",
+            "SendAs"
+          ]
+        }
+      ]
+    }
+  ]
+}

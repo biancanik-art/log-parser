@@ -23,6 +23,10 @@ pub fn run() {
                 .path()
                 .resolve("intel/mitre_core.v1.json", BaseDirectory::Resource)?;
             intel::library::configure_builtin_library_path(library_path)?;
+            let bec_library_path = app
+                .path()
+                .resolve("intel/bec_library.v1.json", BaseDirectory::Resource)?;
+            intel::library::configure_builtin_bec_library_path(bec_library_path)?;
             let ignore_rules_path = app
                 .path()
                 .resolve("intel/ignore_rules.v1.json", BaseDirectory::Resource)?;
@@ -52,6 +56,7 @@ pub fn run() {
             commands::export_data,
             commands::export_guided_data,
             commands::scan_intel_matches,
+            commands::extract_iocs,
             commands::ask_analyst,
             commands::export_report,
         ])

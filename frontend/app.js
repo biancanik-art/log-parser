@@ -83,6 +83,25 @@
   const clearBtn = document.getElementById("clear-btn");
   const filterRowTemplate = document.getElementById("filter-row-template");
   const suspiciousScanBtn = document.getElementById("suspicious-scan-btn");
+  const includeBecChk = document.getElementById("include-bec-chk");
+  const extractIocsBtn = document.getElementById("extract-iocs-btn");
+  const copyIocsBtn = document.getElementById("copy-iocs-btn");
+  const exportIocsBtn = document.getElementById("export-iocs-btn");
+  const iocSearchFilter = document.getElementById("ioc-search-filter");
+  const fileSwitcherWrap = document.getElementById("file-switcher-wrap");
+  const fileSwitcher = document.getElementById("file-switcher");
+  const sidebarToggleBtn = document.getElementById("sidebar-toggle-btn");
+  const sidebar = document.getElementById("sidebar");
+  const badgeGrid = document.getElementById("badge-grid");
+  const badgeAnalyst = document.getElementById("badge-analyst");
+  const badgeIocs = document.getElementById("badge-iocs");
+  const badgeEnrichment = document.getElementById("badge-enrichment");
+  const badgeRules = document.getElementById("badge-rules");
+  const iocPanel = document.getElementById("ioc-panel");
+  const iocPanelSummary = document.getElementById("ioc-panel-summary");
+  const iocStats = document.getElementById("ioc-stats");
+  const iocResultsContent = document.getElementById("ioc-results-content");
+  const iocPanelClose = document.getElementById("ioc-panel-close");
   const reviewRolesBtn = document.getElementById("review-roles-btn");
   const evidenceColumnsLabel = document.getElementById("evidence-columns-label");
   const intelScanSummary = document.getElementById("intel-scan-summary");
@@ -105,11 +124,22 @@
   let currentPath = null;
   let currentSheet = null;
 
+  // Multi-file tracking
+  let loadedFiles = []; // array of { path, sheet, name, rowCount, columns, summary }
+  let activeFileIndex = -1;
+
+  // IOC filtering state
+  let currentIocCategory = "all";
+  let currentIocFilterText = "";
+
   // Per-file, like columnRoleSuggestions: IgnoreRuleView[] from list_ignore_rules, reset on
   // file removal and refetched after each import.
   let ignoreRules = [];
   let ignoreRulesLoaded = false;
   let ignoreRulesInFlight = false;
+
+  let iocExtractionInFlight = false;
+  let iocExtractionSummaryResult = null;
 
   let spec = { search: null, filters: [], sort: null, expression: null, cursor: null, limit: PAGE_SIZE };
   let cursorStack = []; // for Prev navigation
@@ -205,6 +235,10 @@
     "host",
     "ip",
     "text_evidence",
+    "session_id",
+    "user_agent",
+    "operation",
+    "result",
   ];
 
   // Ignore-rule conditions can key off any data-mapping role except timestamp — matches the
@@ -251,8 +285,10 @@
     aiSearchAvailability.classList.toggle("ready", enabled);
     if (enabled) {
       updateEvidenceColumnsUi();
+      extractIocsBtn.disabled = iocExtractionInFlight;
     } else {
       suspiciousScanBtn.disabled = true;
+      extractIocsBtn.disabled = true;
     }
     updateGuidedInteractionControls();
   }
@@ -270,6 +306,7 @@
     clearBtn.disabled = inFlight || !controlsEnabled;
     reviewRolesBtn.disabled = inFlight || !controlsEnabled;
     suspiciousScanBtn.disabled = inFlight || !controlsEnabled;
+    extractIocsBtn.disabled = inFlight || !controlsEnabled || iocExtractionInFlight;
     manageIgnoreRulesBtn.disabled = inFlight || !controlsEnabled;
     if (inFlight) {
       prevPageBtn.disabled = true;
@@ -449,6 +486,34 @@
     reportSummaryText.textContent = "";
     reportSummaryPanel.classList.add("hidden");
 
+    iocExtractionInFlight = false;
+    iocExtractionSummaryResult = null;
+    currentIocCategory = "all";
+    currentIocFilterText = "";
+    if (iocSearchFilter) iocSearchFilter.value = "";
+    document.querySelectorAll(".ioc-cat-btn").forEach((btn) => {
+      btn.classList.toggle("active", btn.dataset.cat === "all");
+    });
+    if (badgeIocs) {
+      badgeIocs.textContent = "0";
+      badgeIocs.classList.add("hidden");
+    }
+    if (copyIocsBtn) copyIocsBtn.disabled = true;
+    if (exportIocsBtn) exportIocsBtn.disabled = true;
+    if (iocPanel) {
+      iocPanel.classList.add("hidden");
+      iocPanel.open = false;
+    }
+    if (iocPanelSummary) {
+      iocPanelSummary.textContent = "No IOCs extracted yet";
+    }
+    if (iocStats) {
+      iocStats.textContent = 'Click "Extract IOCs" to scan evidence rows for IPs, domains, URLs, emails, and user agents.';
+    }
+    if (iocResultsContent) {
+      iocResultsContent.innerHTML = "";
+    }
+
     renderScanSummary(null);
     updateEvidenceColumnsUi();
   }
@@ -560,6 +625,10 @@
       host: "Host / device",
       ip: "IP address",
       text_evidence: "Evidence text",
+      session_id: "Session / correlation ID",
+      user_agent: "User agent",
+      operation: "Operation / action",
+      result: "Result / status",
     };
     return labels[role] || role.replace(/_/g, " ");
   }
@@ -587,6 +656,16 @@
     ignoreRulesSummary.textContent = ignoreRules.length
       ? `${activeCount} of ${ignoreRules.length} active`
       : "No rules";
+
+    if (badgeRules) {
+      if (activeCount > 0) {
+        badgeRules.textContent = String(activeCount);
+        badgeRules.classList.remove("hidden");
+      } else {
+        badgeRules.textContent = "0";
+        badgeRules.classList.add("hidden");
+      }
+    }
 
     ignoreRules.forEach((rule) => {
       const row = document.createElement("div");
@@ -919,6 +998,15 @@
 
   function renderScanSummary(summary) {
     intelScanSummary.innerHTML = "";
+    if (badgeEnrichment) {
+      if (summary && summary.matchCount > 0) {
+        badgeEnrichment.textContent = summary.matchCount.toLocaleString();
+        badgeEnrichment.classList.remove("hidden");
+      } else {
+        badgeEnrichment.textContent = "0";
+        badgeEnrichment.classList.add("hidden");
+      }
+    }
     if (!summary) return;
 
     const header = document.createElement("div");
@@ -973,6 +1061,363 @@
         intelScanSummary.appendChild(row);
       });
     }
+  }
+
+  function renderIocResults(summary = iocExtractionSummaryResult) {
+    if (!iocResultsContent || !summary) return;
+    iocExtractionSummaryResult = summary;
+    iocResultsContent.innerHTML = "";
+
+    const rawIps = summary.ipIndicators || [];
+    const rawDomains = summary.domainIndicators || [];
+    const rawUrls = summary.urlIndicators || [];
+    const rawEmails = summary.emailIndicators || [];
+    const rawUas = summary.userAgentIndicators || [];
+
+    const totalRaw = rawIps.length + rawDomains.length + rawUrls.length + rawEmails.length + rawUas.length;
+
+    // Update tab badge
+    if (badgeIocs) {
+      if (totalRaw > 0) {
+        badgeIocs.textContent = totalRaw.toLocaleString();
+        badgeIocs.classList.remove("hidden");
+      } else {
+        badgeIocs.textContent = "0";
+        badgeIocs.classList.add("hidden");
+      }
+    }
+
+    if (copyIocsBtn) copyIocsBtn.disabled = totalRaw === 0;
+    if (exportIocsBtn) exportIocsBtn.disabled = totalRaw === 0;
+
+    // Filter by search text
+    const filterTerm = (currentIocFilterText || "").toLowerCase().trim();
+    const matchesFilter = (str) => !filterTerm || (typeof str === "string" && str.toLowerCase().includes(filterTerm));
+
+    const filteredIps = rawIps.filter((i) => matchesFilter(i.ip) || matchesFilter(i.vpnLabel) || (i.sourceColumns || []).some(matchesFilter));
+    const filteredDomains = rawDomains.filter((d) => matchesFilter(d.domain));
+    const filteredUrls = rawUrls.filter((u) => matchesFilter(u.url) || matchesFilter(u.domain));
+    const filteredEmails = rawEmails.filter((e) => matchesFilter(e.email));
+    const filteredUas = rawUas.filter((u) => matchesFilter(u.userAgent));
+
+    const totalFiltered = filteredIps.length + filteredDomains.length + filteredUrls.length + filteredEmails.length + filteredUas.length;
+
+    if (iocPanelSummary) {
+      iocPanelSummary.textContent = `${totalRaw.toLocaleString()} indicators (${rawIps.length} IPs, ${rawDomains.length} domains, ${rawUrls.length} URLs, ${rawEmails.length} emails, ${rawUas.length} user agents)`;
+    }
+
+    if (iocStats) {
+      const filterNote = filterTerm ? ` (showing ${totalFiltered.toLocaleString()} matching "${filterTerm}")` : "";
+      iocStats.textContent = `Scanned ${summary.rowsScanned.toLocaleString()} rows — found ${totalRaw.toLocaleString()} unique indicators across evidence columns${filterNote}. Click any indicator to filter the evidence grid.`;
+    }
+
+    function createClickableCell(text, queryValue = text) {
+      const td = document.createElement("td");
+      td.style.padding = "6px 8px";
+      const span = document.createElement("span");
+      span.textContent = text;
+      span.style.cursor = "pointer";
+      span.style.textDecoration = "underline";
+      span.title = `Click to filter evidence grid for "${queryValue}"`;
+      span.addEventListener("click", () => {
+        searchBox.value = queryValue;
+        switchTab("tab-grid");
+        applyControlsAndReload();
+      });
+      const copyIcon = document.createElement("span");
+      copyIcon.textContent = "📋";
+      copyIcon.className = "ioc-copy-mini";
+      copyIcon.title = "Copy indicator to clipboard";
+      copyIcon.addEventListener("click", (e) => {
+        e.stopPropagation();
+        navigator.clipboard.writeText(queryValue).then(() => {
+          copyIcon.textContent = "✓";
+          setTimeout(() => { copyIcon.textContent = "📋"; }, 1500);
+        });
+      });
+      td.appendChild(span);
+      td.appendChild(copyIcon);
+      return td;
+    }
+
+    function createIocSection(title, count, items, renderRowFn, headers) {
+      const section = document.createElement("div");
+      section.className = "ioc-group-card";
+
+      const sectionHeader = document.createElement("div");
+      sectionHeader.className = "ioc-group-header";
+
+      const sectionTitle = document.createElement("strong");
+      sectionTitle.textContent = `${title} (${count.toLocaleString()})`;
+      sectionHeader.appendChild(sectionTitle);
+
+      const sectionCopy = document.createElement("button");
+      sectionCopy.className = "btn btn-small";
+      sectionCopy.textContent = "Copy Group";
+      sectionCopy.addEventListener("click", () => {
+        const textLines = items.map((it) => it.ip || it.domain || it.url || it.email || it.userAgent).join("\n");
+        navigator.clipboard.writeText(textLines).then(() => {
+          sectionCopy.textContent = "✓ Copied!";
+          setTimeout(() => { sectionCopy.textContent = "Copy Group"; }, 1500);
+        });
+      });
+      sectionHeader.appendChild(sectionCopy);
+      section.appendChild(sectionHeader);
+
+      if (!items || items.length === 0) {
+        const empty = document.createElement("div");
+        empty.style.color = "var(--text-muted)";
+        empty.style.fontStyle = "italic";
+        empty.style.padding = "10px 14px";
+        empty.textContent = "None detected.";
+        section.appendChild(empty);
+        return section;
+      }
+
+      const tableEl = document.createElement("table");
+      tableEl.style.width = "100%";
+      tableEl.style.borderCollapse = "collapse";
+      tableEl.style.fontSize = "12px";
+
+      const thead = document.createElement("thead");
+      const headRow = document.createElement("tr");
+      headRow.style.borderBottom = "1px solid var(--border-strong)";
+      headRow.style.textAlign = "left";
+      headers.forEach((h) => {
+        const th = document.createElement("th");
+        th.style.padding = "6px 8px";
+        th.style.color = "var(--text-muted)";
+        th.style.fontWeight = "600";
+        th.textContent = h;
+        headRow.appendChild(th);
+      });
+      thead.appendChild(headRow);
+      tableEl.appendChild(thead);
+
+      const tbody = document.createElement("tbody");
+      items.forEach((item, idx) => {
+        const tr = document.createElement("tr");
+        tr.style.borderBottom = "1px solid var(--border)";
+        if (idx % 2 === 1) {
+          tr.style.backgroundColor = "var(--panel-subtle)";
+        }
+        renderRowFn(tr, item);
+        tbody.appendChild(tr);
+      });
+      tableEl.appendChild(tbody);
+      section.appendChild(tableEl);
+
+      return section;
+    }
+
+    const showAll = currentIocCategory === "all";
+
+    if (showAll || currentIocCategory === "ip") {
+      iocResultsContent.appendChild(
+        createIocSection(
+          "IP Addresses",
+          filteredIps.length,
+          filteredIps,
+          (tr, item) => {
+            tr.appendChild(createClickableCell(item.ip));
+            const tdType = document.createElement("td");
+            tdType.style.padding = "6px 8px";
+            const badge = document.createElement("span");
+            badge.className = "role-badge";
+            if (item.vpnLabel) {
+              badge.style.background = "var(--warning)";
+              badge.style.color = "#fff";
+              badge.textContent = item.vpnLabel;
+            } else if (item.isPrivate) {
+              badge.style.background = "var(--text-muted)";
+              badge.style.color = "#fff";
+              badge.textContent = "Private IP";
+            } else {
+              badge.style.background = "var(--success)";
+              badge.style.color = "#fff";
+              badge.textContent = "Public";
+            }
+            tdType.appendChild(badge);
+            tr.appendChild(tdType);
+
+            const tdCount = document.createElement("td");
+            tdCount.style.padding = "6px 8px";
+            tdCount.textContent = item.occurrenceCount.toLocaleString();
+            tr.appendChild(tdCount);
+
+            const tdRow = document.createElement("td");
+            tdRow.style.padding = "6px 8px";
+            tdRow.textContent = `Row ${item.firstRow.toLocaleString()}`;
+            tr.appendChild(tdRow);
+
+            const tdCols = document.createElement("td");
+            tdCols.style.padding = "6px 8px";
+            tdCols.textContent = (item.sourceColumns || []).join(", ") || "—";
+            tr.appendChild(tdCols);
+          },
+          ["IP Address", "Scope / Hosting", "Count", "First Seen", "Column(s)"]
+        )
+      );
+    }
+
+    if (showAll || currentIocCategory === "domain") {
+      iocResultsContent.appendChild(
+        createIocSection(
+          "Domains",
+          filteredDomains.length,
+          filteredDomains,
+          (tr, item) => {
+            tr.appendChild(createClickableCell(item.domain));
+            const tdCount = document.createElement("td");
+            tdCount.style.padding = "6px 8px";
+            tdCount.textContent = item.occurrenceCount.toLocaleString();
+            tr.appendChild(tdCount);
+            const tdRow = document.createElement("td");
+            tdRow.style.padding = "6px 8px";
+            tdRow.textContent = `Row ${item.firstRow.toLocaleString()}`;
+            tr.appendChild(tdRow);
+          },
+          ["Domain", "Count", "First Seen"]
+        )
+      );
+    }
+
+    if (showAll || currentIocCategory === "url") {
+      iocResultsContent.appendChild(
+        createIocSection(
+          "URLs",
+          filteredUrls.length,
+          filteredUrls,
+          (tr, item) => {
+            tr.appendChild(createClickableCell(item.url));
+            const tdDomain = document.createElement("td");
+            tdDomain.style.padding = "6px 8px";
+            tdDomain.textContent = item.domain;
+            tr.appendChild(tdDomain);
+            const tdCount = document.createElement("td");
+            tdCount.style.padding = "6px 8px";
+            tdCount.textContent = item.occurrenceCount.toLocaleString();
+            tr.appendChild(tdCount);
+            const tdRow = document.createElement("td");
+            tdRow.style.padding = "6px 8px";
+            tdRow.textContent = `Row ${item.firstRow.toLocaleString()}`;
+            tr.appendChild(tdRow);
+          },
+          ["URL", "Domain", "Count", "First Seen"]
+        )
+      );
+    }
+
+    if (showAll || currentIocCategory === "email") {
+      iocResultsContent.appendChild(
+        createIocSection(
+          "Email Addresses",
+          filteredEmails.length,
+          filteredEmails,
+          (tr, item) => {
+            tr.appendChild(createClickableCell(item.email));
+            const tdCount = document.createElement("td");
+            tdCount.style.padding = "6px 8px";
+            tdCount.textContent = item.occurrenceCount.toLocaleString();
+            tr.appendChild(tdCount);
+            const tdRow = document.createElement("td");
+            tdRow.style.padding = "6px 8px";
+            tdRow.textContent = `Row ${item.firstRow.toLocaleString()}`;
+            tr.appendChild(tdRow);
+          },
+          ["Email Address", "Count", "First Seen"]
+        )
+      );
+    }
+
+    if (showAll || currentIocCategory === "ua") {
+      iocResultsContent.appendChild(
+        createIocSection(
+          "User Agents",
+          filteredUas.length,
+          filteredUas,
+          (tr, item) => {
+            tr.appendChild(createClickableCell(item.userAgent));
+            const tdCount = document.createElement("td");
+            tdCount.style.padding = "6px 8px";
+            tdCount.textContent = item.occurrenceCount.toLocaleString();
+            tr.appendChild(tdCount);
+            const tdRow = document.createElement("td");
+            tdRow.style.padding = "6px 8px";
+            tdRow.textContent = `Row ${item.firstRow.toLocaleString()}`;
+            tr.appendChild(tdRow);
+          },
+          ["User Agent", "Count", "First Seen"]
+        )
+      );
+    }
+  }
+
+  function copyAllIocs() {
+    if (!iocExtractionSummaryResult) return;
+    const s = iocExtractionSummaryResult;
+    const lines = [];
+
+    const ips = s.ipIndicators || [];
+    if (ips.length > 0) {
+      lines.push(`=== IP ADDRESSES (${ips.length}) ===`);
+      ips.forEach((i) => lines.push(`${i.ip}\t${i.vpnLabel || (i.isPrivate ? "Private" : "Public")}\tCount: ${i.occurrenceCount}`));
+      lines.push("");
+    }
+
+    const domains = s.domainIndicators || [];
+    if (domains.length > 0) {
+      lines.push(`=== DOMAINS (${domains.length}) ===`);
+      domains.forEach((d) => lines.push(`${d.domain}\tCount: ${d.occurrenceCount}`));
+      lines.push("");
+    }
+
+    const urls = s.urlIndicators || [];
+    if (urls.length > 0) {
+      lines.push(`=== URLS (${urls.length}) ===`);
+      urls.forEach((u) => lines.push(`${u.url}\tCount: ${u.occurrenceCount}`));
+      lines.push("");
+    }
+
+    const emails = s.emailIndicators || [];
+    if (emails.length > 0) {
+      lines.push(`=== EMAILS (${emails.length}) ===`);
+      emails.forEach((e) => lines.push(`${e.email}\tCount: ${e.occurrenceCount}`));
+      lines.push("");
+    }
+
+    const uas = s.userAgentIndicators || [];
+    if (uas.length > 0) {
+      lines.push(`=== USER AGENTS (${uas.length}) ===`);
+      uas.forEach((u) => lines.push(`${u.userAgent}\tCount: ${u.occurrenceCount}`));
+      lines.push("");
+    }
+
+    navigator.clipboard.writeText(lines.join("\n")).then(() => {
+      if (copyIocsBtn) {
+        copyIocsBtn.textContent = "✓ Copied!";
+        setTimeout(() => { copyIocsBtn.textContent = "📋 Copy All"; }, 2000);
+      }
+    });
+  }
+
+  function exportIocsJson() {
+    if (!iocExtractionSummaryResult) return;
+    const payload = {
+      exportedAt: new Date().toISOString(),
+      file: currentPath,
+      sheet: currentSheet,
+      summary: iocExtractionSummaryResult,
+    };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `iocs_${(currentPath ? currentPath.split(/[\\/]/).pop() : "evidence").replace(/\.[^.]+$/, "")}.json`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
   }
 
   function normalizeQueryExpression(expression, depth = 0, state = { nodes: 0 }) {
@@ -1373,6 +1818,18 @@
       rowCountLabel.textContent = `${totalCount.toLocaleString()} ${["guided", "querySpec"].includes(queryMode) ? "evidence" : "matching"} rows`;
     }
     pageLabel.textContent = `page ${pageIndex}`;
+    if (badgeGrid) {
+      if (totalCount !== null) {
+        badgeGrid.textContent = totalCount.toLocaleString();
+        badgeGrid.classList.remove("hidden");
+      } else if (shown > 0) {
+        badgeGrid.textContent = shown.toLocaleString();
+        badgeGrid.classList.remove("hidden");
+      } else {
+        badgeGrid.textContent = "0";
+        badgeGrid.classList.add("hidden");
+      }
+    }
   }
 
   function setAiMatchColumnVisible(visible) {
@@ -2053,11 +2510,12 @@
       throw new Error("no evidence columns were inferred; choose columns in Data mapping first");
     }
 
+    const includeBec = includeBecChk ? includeBecChk.checked : true;
     intelScanInFlight = true;
     updateEvidenceColumnsUi();
     showProgress("Running optional threat enrichment...", 0);
     try {
-      const summary = await invoke("scan_intel_matches", { evidenceColumns });
+      const summary = await invoke("scan_intel_matches", { evidenceColumns, includeBec });
       intelScanSummaryResult = summary;
       renderScanSummary(summary);
       return summary;
@@ -2068,6 +2526,37 @@
       hideProgress();
       intelScanInFlight = false;
       updateEvidenceColumnsUi();
+    }
+  }
+
+  async function runIocExtraction() {
+    if (columns.length === 0) {
+      throw new Error("no file is currently loaded; import a file first");
+    }
+    if (iocExtractionInFlight || sheetLoadInFlight) return null;
+
+    iocExtractionInFlight = true;
+    extractIocsBtn.disabled = true;
+    showProgress("Extracting Indicators of Compromise...", 0);
+    try {
+      const summary = await invoke("extract_iocs");
+      iocExtractionSummaryResult = summary;
+      renderIocResults(summary);
+      if (iocPanel) {
+        iocPanel.classList.remove("hidden");
+        iocPanel.open = true;
+      }
+      return summary;
+    } catch (err) {
+      console.error("extract_iocs failed", err);
+      if (iocPanelSummary) {
+        iocPanelSummary.textContent = `Extraction failed: ${err}`;
+      }
+      throw err;
+    } finally {
+      hideProgress();
+      iocExtractionInFlight = false;
+      extractIocsBtn.disabled = !controlsEnabled || sheetLoadInFlight;
     }
   }
 
@@ -2447,27 +2936,42 @@
     const previousSheet = currentSheet;
     let sourceRequest = null;
     try {
-      const path = await invoke("plugin:dialog|open", {
+      const selected = await invoke("plugin:dialog|open", {
         options: {
-          multiple: false,
+          multiple: true,
           filters: [{ name: "Tabular files", extensions: ["xlsx", "xls", "xlsb", "ods", "csv"] }],
         },
       });
-      if (!path) {
+      if (!selected) {
+        setSourceLoadInFlight(false);
+        return null;
+      }
+      const paths = Array.isArray(selected) ? selected : [selected];
+      if (paths.length === 0) {
         setSourceLoadInFlight(false);
         return null;
       }
 
+      // Track all picked files
+      paths.forEach((p) => {
+        const name = p.split(/[\\/]/).pop();
+        if (!loadedFiles.some((f) => f.path === p)) {
+          loadedFiles.push({ path: p, sheet: null, name, rowCount: null });
+        }
+      });
+      updateFileSwitcherUi();
+
+      const targetPath = paths[0];
       sourceRequest = {
         id: ++sourceLoadSequence,
-        path,
+        path: targetPath,
         previousPath,
         previousSheet,
       };
       activeSourceLoad = sourceRequest;
       sheetPicker.classList.add("hidden");
       hideProgress();
-      const sheets = await invoke("list_sheets", { path });
+      const sheets = await invoke("list_sheets", { path: targetPath });
       if (activeSourceLoad !== sourceRequest) return null;
 
       if (sheets.length === 1) {
@@ -2494,6 +2998,55 @@
       setSourceLoadInFlight(false);
       alert(`Could not read workbook: ${err}`);
       return null;
+    }
+  }
+
+  function updateFileSwitcherUi() {
+    if (!fileSwitcher || !fileSwitcherWrap) return;
+    if (loadedFiles.length > 1) {
+      fileSwitcherWrap.classList.remove("hidden");
+      fileSwitcher.innerHTML = "";
+      loadedFiles.forEach((file, idx) => {
+        const opt = document.createElement("option");
+        opt.value = String(idx);
+        opt.textContent = file.rowCount != null
+          ? `${file.name} (${file.rowCount.toLocaleString()} rows)`
+          : file.name;
+        if (file.path === currentPath) {
+          opt.selected = true;
+          activeFileIndex = idx;
+        }
+        fileSwitcher.appendChild(opt);
+      });
+    } else {
+      fileSwitcherWrap.classList.add("hidden");
+    }
+  }
+
+  async function switchLoadedFile(index) {
+    if (index < 0 || index >= loadedFiles.length) return;
+    const fileEntry = loadedFiles[index];
+    if (fileEntry.path === currentPath && fileEntry.sheet === currentSheet) return;
+    if (sheetLoadInFlight) return;
+    setSourceLoadInFlight(true);
+    const sourceRequest = {
+      id: ++sourceLoadSequence,
+      path: fileEntry.path,
+      previousPath: currentPath,
+      previousSheet: currentSheet,
+    };
+    activeSourceLoad = sourceRequest;
+    hideProgress();
+    try {
+      let sheetToLoad = fileEntry.sheet;
+      if (!sheetToLoad) {
+        const sheets = await invoke("list_sheets", { path: fileEntry.path });
+        sheetToLoad = sheets[0];
+      }
+      await loadSheet(sheetToLoad, sourceRequest);
+    } catch (err) {
+      console.error("switchLoadedFile failed", err);
+      alert(`Could not switch file: ${err}`);
     }
   }
 
@@ -2547,7 +3100,32 @@
     currentPath = importedPath;
     currentSheet = importedSheet;
     columns = summary.columns;
-    fileInfo.textContent = `${importedPath.split(/[\\/]/).pop()} — ${summary.rowCount.toLocaleString()} rows, ${columns.length} columns${summary.fromCache ? " (cached)" : ""}`;
+
+    // Update loadedFiles tracking
+    const existingEntry = loadedFiles.find((f) => f.path === importedPath);
+    if (existingEntry) {
+      existingEntry.sheet = importedSheet;
+      existingEntry.rowCount = summary.rowCount;
+      existingEntry.columns = summary.columns;
+      existingEntry.summary = summary;
+      activeFileIndex = loadedFiles.indexOf(existingEntry);
+    } else {
+      loadedFiles.push({
+        path: importedPath,
+        sheet: importedSheet,
+        name: importedPath.split(/[\\/]/).pop(),
+        rowCount: summary.rowCount,
+        columns: summary.columns,
+        summary,
+      });
+      activeFileIndex = loadedFiles.length - 1;
+    }
+    updateFileSwitcherUi();
+
+    const fileName = importedPath.split(/[\\/]/).pop();
+    const fileCountBadge = loadedFiles.length > 1 ? ` [${activeFileIndex + 1}/${loadedFiles.length} files]` : "";
+    fileInfo.textContent = `${fileName}${fileCountBadge} — ${summary.rowCount.toLocaleString()} rows, ${columns.length} columns${summary.fromCache ? " (cached)" : ""}`;
+    fileInfo.title = importedPath;
 
     // reset controls
     resetIntelUiState();
@@ -2646,6 +3224,23 @@
     activeSheetImport = null;
     setSourceLoadInFlight(false);
     sheetPicker.classList.add("hidden");
+
+    if (currentPath && loadedFiles.length > 1) {
+      const remIdx = loadedFiles.findIndex((f) => f.path === currentPath);
+      if (remIdx !== -1) {
+        loadedFiles.splice(remIdx, 1);
+      }
+      updateFileSwitcherUi();
+      if (loadedFiles.length > 0) {
+        const nextIdx = Math.min(remIdx, loadedFiles.length - 1);
+        return switchLoadedFile(nextIdx);
+      }
+    }
+
+    loadedFiles = [];
+    activeFileIndex = -1;
+    updateFileSwitcherUi();
+
     if (table) {
       table.destroy();
       table = null;
@@ -2654,6 +3249,7 @@
     currentPath = null;
     currentSheet = null;
     fileInfo.textContent = "No file loaded";
+    fileInfo.title = "";
     sortColumn.innerHTML = '<option value="">(row order)</option>';
     filterList.innerHTML = "";
     searchBox.value = "";
@@ -2867,6 +3463,7 @@
           chip.textContent = `row ${rowNum}`;
           chip.title = "Scroll the grid to this source row (when it is on the current page)";
           chip.addEventListener("click", () => {
+            switchTab("tab-grid");
             if (!scrollGridToRow(rowNum)) {
               aiSearchAvailability.textContent = `Row ${rowNum} is not on the current grid page. Clear filters or page to it; the row number always refers to the imported sheet.`;
               aiSearchAvailability.classList.remove("ready");
@@ -2953,6 +3550,7 @@
     if (answer.useGuidedSearch) {
       // Filter-shaped asks keep the existing audited preview/run search flow.
       hideAnalystPanel();
+      switchTab("tab-grid");
       await searchGuidedQuery();
       return;
     }
@@ -2968,6 +3566,144 @@
 
   // -- event wiring --------------------------------------------------------------
 
+  // Tab navigation
+  function switchTab(tabId) {
+    const navTabs = document.querySelectorAll(".nav-tab");
+    const tabPanes = document.querySelectorAll(".tab-pane");
+
+    navTabs.forEach((tab) => {
+      const isActive = tab.dataset.tab === tabId;
+      tab.classList.toggle("active", isActive);
+      tab.setAttribute("aria-selected", isActive ? "true" : "false");
+    });
+
+    tabPanes.forEach((pane) => {
+      const isActive = pane.id === tabId;
+      pane.classList.toggle("active", isActive);
+    });
+
+    if (tabId === "tab-grid" && table) {
+      setTimeout(() => {
+        try { table.redraw(true); } catch (_) {}
+      }, 30);
+    }
+  }
+
+  if (typeof document.querySelectorAll === "function") {
+    document.querySelectorAll(".nav-tab").forEach((tab) => {
+      tab.addEventListener("click", () => {
+        const tabId = tab.dataset.tab;
+        if (tabId) switchTab(tabId);
+      });
+    });
+  }
+
+  // Fullscreen / Maximize toggle
+  function togglePaneFullscreen(pane) {
+    if (!pane) return;
+    const isFullscreen = pane.classList.toggle("fullscreen-pane");
+    const expandBtn = pane.querySelector ? pane.querySelector(".btn-expand-pane") : null;
+    if (expandBtn) {
+      expandBtn.textContent = isFullscreen ? "✕ Minimize" : "⛶ Expand";
+      expandBtn.title = isFullscreen ? "Minimize view (Esc)" : "Maximize view";
+    }
+    if (pane.id === "tab-grid" && table) {
+      setTimeout(() => {
+        try { table.redraw(true); } catch (_) {}
+      }, 50);
+    }
+  }
+
+  if (typeof document.querySelectorAll === "function") {
+    document.querySelectorAll(".btn-expand-pane").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const pane = btn.closest ? btn.closest(".tab-pane") : null;
+        if (pane) togglePaneFullscreen(pane);
+      });
+    });
+  }
+
+  if (typeof document.addEventListener === "function") {
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape") {
+        const activeFullscreen = typeof document.querySelector === "function" ? document.querySelector(".tab-pane.fullscreen-pane") : null;
+        if (activeFullscreen) {
+          togglePaneFullscreen(activeFullscreen);
+        }
+      }
+    });
+  }
+
+  // Sidebar toggle
+  if (sidebarToggleBtn && sidebar) {
+    sidebarToggleBtn.addEventListener("click", () => {
+      sidebar.classList.toggle("collapsed");
+      if (table) {
+        setTimeout(() => {
+          try { table.redraw(true); } catch (_) {}
+        }, 50);
+      }
+    });
+  }
+
+  // File switcher dropdown
+  if (fileSwitcher) {
+    fileSwitcher.addEventListener("change", () => {
+      const idx = parseInt(fileSwitcher.value, 10);
+      if (!isNaN(idx)) {
+        switchLoadedFile(idx);
+      }
+    });
+  }
+
+  // Quick prompts in AI Analyst
+  if (typeof document.querySelectorAll === "function") {
+    document.querySelectorAll(".prompt-chip").forEach((chip) => {
+      chip.addEventListener("click", () => {
+        const prompt = chip.dataset.prompt;
+        if (!prompt) return;
+        guidedSearchBox.value = prompt;
+        routeAnalystAsk().catch((err) => alert(`AI analyst failed: ${err}`));
+      });
+    });
+  }
+
+  // IOC category buttons
+  if (typeof document.querySelectorAll === "function") {
+    document.querySelectorAll(".ioc-cat-btn").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        document.querySelectorAll(".ioc-cat-btn").forEach((b) => b.classList.remove("active"));
+        btn.classList.add("active");
+        currentIocCategory = btn.dataset.cat || "all";
+        if (iocExtractionSummaryResult) {
+          renderIocResults(iocExtractionSummaryResult);
+        }
+      });
+    });
+  }
+
+  // IOC search filter
+  if (iocSearchFilter) {
+    let filterDebounce = null;
+    iocSearchFilter.addEventListener("input", () => {
+      clearTimeout(filterDebounce);
+      filterDebounce = setTimeout(() => {
+        currentIocFilterText = iocSearchFilter.value;
+        if (iocExtractionSummaryResult) {
+          renderIocResults(iocExtractionSummaryResult);
+        }
+      }, 150);
+    });
+  }
+
+  // IOC action buttons
+  if (copyIocsBtn) {
+    copyIocsBtn.addEventListener("click", copyAllIocs);
+  }
+  if (exportIocsBtn) {
+    exportIocsBtn.addEventListener("click", exportIocsJson);
+  }
+
   openFileBtn.addEventListener("click", () => {
     pickAndOpenFile().catch((err) => alert(`Error: ${err}`));
   });
@@ -2977,11 +3713,13 @@
   });
 
   reviewRolesBtn.addEventListener("click", () => {
+    switchTab("tab-rules");
     roleReviewPanel.classList.remove("hidden");
     roleReviewPanel.open = true;
   });
 
   manageIgnoreRulesBtn.addEventListener("click", () => {
+    switchTab("tab-rules");
     ignoreRulesPanel.classList.remove("hidden");
     ignoreRulesPanel.open = true;
     if (!ignoreRulesLoaded) loadIgnoreRules();
@@ -3058,6 +3796,14 @@
 
   suspiciousScanBtn.addEventListener("click", () => {
     runIntelScan().catch((err) => alert(`Threat enrichment failed: ${err}`));
+  });
+
+  extractIocsBtn.addEventListener("click", () => {
+    runIocExtraction().catch((err) => alert(`IOC extraction failed: ${err}`));
+  });
+
+  iocPanelClose.addEventListener("click", () => {
+    iocPanel.open = false;
   });
 
   rolePanelClose.addEventListener("click", () => {
@@ -3178,6 +3924,16 @@
       phase === "complete"
         ? "Optional threat enrichment complete"
         : `Enriching threat matches... ${rowsDone.toLocaleString()} / ${rowsTotal.toLocaleString()}`;
+    showProgress(label, fraction);
+  });
+
+  listen("ioc-extraction-progress", (event) => {
+    const { rowsDone, rowsTotal, phase } = event.payload;
+    const fraction = rowsTotal > 0 ? rowsDone / rowsTotal : 0;
+    const label =
+      phase === "complete"
+        ? "IOC extraction complete"
+        : `Extracting IOCs... ${rowsDone.toLocaleString()} / ${rowsTotal.toLocaleString()}`;
     showProgress(label, fraction);
   });
 
@@ -3398,6 +4154,9 @@
     },
     generateReportForTest(destPath) {
       return generateReport(destPath);
+    },
+    extractIocsForTest() {
+      return runIocExtraction();
     },
     removeFileForTest() {
       removeFile();

@@ -3,6 +3,7 @@ pub mod analyst;
 pub mod anomaly;
 pub mod chains;
 pub mod ignore_rules;
+pub mod ioc;
 pub mod library;
 pub mod llm_parser;
 pub mod matcher;

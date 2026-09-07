@@ -6521,6 +6521,14 @@ mod tests {
             [],
         )
         .unwrap();
+        crate::db::create_ignore_rule_state_schema(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO _custom_ignore_rules (id, name, enabled, conditions_json)
+             VALUES ('qualys-agent-activity', 'Qualys Cloud Agent process activity', 1,
+                     '[{\"role\":\"process_name\",\"op\":\"contains_any\",\"values\":[\"qualys\"]}]')",
+            [],
+        )
+        .unwrap();
         let tx = conn.transaction().unwrap();
         {
             let mut insert = tx
@@ -6599,6 +6607,14 @@ mod tests {
         conn.execute(
             "INSERT INTO _column_roles (role, sql_name, confidence, status, reasons_json)
              VALUES ('process_name', 'processname', 1.0, 'confirmed', '[]')",
+            [],
+        )
+        .unwrap();
+        crate::db::create_ignore_rule_state_schema(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO _custom_ignore_rules (id, name, enabled, conditions_json)
+             VALUES ('qualys-agent-activity', 'Qualys Cloud Agent process activity', 1,
+                     '[{\"role\":\"process_name\",\"op\":\"contains_any\",\"values\":[\"qualys\"]}]')",
             [],
         )
         .unwrap();

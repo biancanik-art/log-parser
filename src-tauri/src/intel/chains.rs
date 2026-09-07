@@ -19,6 +19,7 @@ const MAX_PUBLISHED_CHAINS: usize = 200;
 pub struct IntelChainSummary {
     pub chain_id: i64,
     pub host: Option<String>,
+    pub user: Option<String>,
     pub start_epoch_ms: Option<i64>,
     pub end_epoch_ms: Option<i64>,
     pub first_row: i64,
@@ -36,6 +37,7 @@ pub struct IntelChainSummary {
 struct ChainEvent {
     row_num: i64,
     host: Option<String>,
+    user: Option<String>,
     epoch_ms: Option<i64>,
     tactic_id: String,
     tactic_name: String,
@@ -51,9 +53,14 @@ struct ChainEvent {
 /// claim — each host group is one window and `startEpochMs`/`endEpochMs` stay null.
 pub fn compute_chains(conn: &Connection, match_table: &str) -> Result<Vec<IntelChainSummary>> {
     let host_column = detect_host_column(conn)?;
+    let user_column = detect_user_column(conn)?;
     let has_row_time = table_exists(conn, "_row_time")?;
 
     let host_select = match &host_column {
+        Some(column) => format!(", r.{}", crate::db::quote_ident(column)),
+        None => ", NULL".to_string(),
+    };
+    let user_select = match &user_column {
         Some(column) => format!(", r.{}", crate::db::quote_ident(column)),
         None => ", NULL".to_string(),
     };
@@ -67,7 +74,7 @@ pub fn compute_chains(conn: &Connection, match_table: &str) -> Result<Vec<IntelC
     };
     let sql = format!(
         "SELECT m.row_num, m.tactic_id, m.tactic_name, m.technique_name, MAX(m.score)
-                {host_select}{time_select}
+                {host_select}{user_select}{time_select}
          FROM {match_table} m
          JOIN rows r ON r.row_num = m.row_num
          {time_join}
@@ -91,7 +98,11 @@ pub fn compute_chains(conn: &Connection, match_table: &str) -> Result<Vec<IntelC
                     .get::<_, Option<String>>(5)?
                     .map(|value| value.trim().to_string())
                     .filter(|value| !value.is_empty()),
-                epoch_ms: row.get(6)?,
+                user: row
+                    .get::<_, Option<String>>(6)?
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty()),
+                epoch_ms: row.get(7)?,
             });
         }
     }
@@ -102,7 +113,13 @@ pub fn compute_chains(conn: &Connection, match_table: &str) -> Result<Vec<IntelC
         if has_row_time && event.epoch_ms.is_none() {
             continue;
         }
-        groups.entry(event.host.clone()).or_default().push(event);
+        let group_key = match (&event.user, &event.host) {
+            (Some(u), Some(h)) => Some(format!("{}@{}", u, h)),
+            (Some(u), None) => Some(u.clone()),
+            (None, Some(h)) => Some(h.clone()),
+            (None, None) => None,
+        };
+        groups.entry(group_key).or_default().push(event);
     }
 
     let mut chains = Vec::new();
@@ -177,6 +194,7 @@ fn build_chain(window: &[ChainEvent]) -> Option<IntelChainSummary> {
     Some(IntelChainSummary {
         chain_id: 0,
         host: window[0].host.clone(),
+        user: window[0].user.clone(),
         start_epoch_ms: window.iter().filter_map(|event| event.epoch_ms).min(),
         end_epoch_ms: window.iter().filter_map(|event| event.epoch_ms).max(),
         first_row: distinct_rows.first().copied().unwrap_or(0),
@@ -199,15 +217,16 @@ pub fn publish_chains(conn: &Connection, chains: &[IntelChainSummary]) -> Result
     conn.execute("DELETE FROM _intel_chain", [])?;
     let mut stmt = conn.prepare(
         "INSERT INTO _intel_chain (
-            chain_id, host, start_epoch_ms, end_epoch_ms, first_row, last_row,
+            chain_id, host, user, start_epoch_ms, end_epoch_ms, first_row, last_row,
             tactic_count, event_count, row_count, score,
             tactic_names, technique_names, sample_rows
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
     )?;
     for chain in chains {
         stmt.execute(rusqlite::params![
             chain.chain_id,
             chain.host,
+            chain.user,
             chain.start_epoch_ms,
             chain.end_epoch_ms,
             chain.first_row,
@@ -235,6 +254,21 @@ pub fn detect_host_column(conn: &Connection) -> Result<Option<String>> {
         .query_row(
             "SELECT sql_name FROM _column_roles
              WHERE role = 'host' AND status IN ('suggested', 'confirmed')",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    Ok(column)
+}
+
+pub fn detect_user_column(conn: &Connection) -> Result<Option<String>> {
+    if !table_exists(conn, "_column_roles")? {
+        return Ok(None);
+    }
+    let column = conn
+        .query_row(
+            "SELECT sql_name FROM _column_roles
+             WHERE role = 'user' AND status IN ('suggested', 'confirmed')",
             [],
             |row| row.get::<_, String>(0),
         )

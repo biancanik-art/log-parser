@@ -18,7 +18,7 @@ const WIDE_FILE_SAMPLE_LIMIT: i64 = 120;
 /// Hard cap on characters considered per sampled cell, mirroring semantic.rs's
 /// `V2_MAX_CELL_INPUT_CHARS` precedent for the same class of problem.
 const MAX_SAMPLE_VALUE_CHARS: usize = 4_000;
-const ROLES: [&str; 8] = [
+const ROLES: [&str; 12] = [
     "timestamp",
     "user",
     "command_line",
@@ -27,6 +27,10 @@ const ROLES: [&str; 8] = [
     "host",
     "ip",
     "text_evidence",
+    "session_id",
+    "user_agent",
+    "operation",
+    "result",
 ];
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -384,6 +388,10 @@ fn score_column(role: &'static str, column: &ColumnMeta, values: &[String]) -> O
         "host" => score_host(&header, values),
         "ip" => score_ip(&header, values),
         "text_evidence" => score_text_evidence(&header, values),
+        "session_id" => score_session_id(&header, values),
+        "user_agent" => score_user_agent(&header, values),
+        "operation" => score_operation(&header, values),
+        "result" => score_result(&header, values),
         _ => return None,
     };
 
@@ -711,10 +719,189 @@ fn score_text_evidence(header: &HeaderProfile, values: &[String]) -> (f64, Vec<S
     (score, reasons)
 }
 
+fn score_session_id(header: &HeaderProfile, values: &[String]) -> (f64, Vec<String>) {
+    let mut score = 0.0;
+    let mut reasons = Vec::new();
+    if let Some(keyword) = header.contains_any(&[
+        "sessionid",
+        "correlationid",
+        "requestid",
+        "activityid",
+        "transactionid",
+    ]) {
+        score += 0.5;
+        reasons.push(format!("header contains session-id keyword '{keyword}'"));
+    } else if let Some(keyword) = header.contains_any(&["session", "correlation", "request"]) {
+        score += 0.25;
+        reasons.push(format!("header contains weak session-id keyword '{keyword}'"));
+    }
+
+    let total = values.len();
+    if total > 0 {
+        let match_count = values
+            .iter()
+            .filter(|value| {
+                let v = value.trim();
+                let len = v.len();
+                if len == 36 && v.chars().filter(|&c| c == '-').count() == 4 {
+                    true
+                } else if len >= 16 && v.chars().all(|c| c.is_ascii_alphanumeric()) {
+                    true
+                } else {
+                    false
+                }
+            })
+            .count();
+        let ratio = match_count as f64 / total as f64;
+        if ratio >= 0.35 {
+            score += ratio * 0.45;
+            reasons.push(format!(
+                "{match_count}/{total} sampled values look like UUIDs or long alphanumeric session IDs"
+            ));
+        }
+    }
+
+    (score, reasons)
+}
+
+fn score_user_agent(header: &HeaderProfile, values: &[String]) -> (f64, Vec<String>) {
+    let mut score = 0.0;
+    let mut reasons = Vec::new();
+    if (header.compact == "user" || header.has_token("user")) && !header.compact.contains("agent") {
+        return (0.0, reasons);
+    }
+    
+    if let Some(keyword) = header.contains_any(&[
+        "useragent",
+        "user_agent",
+        "httpuseragent",
+        "clientinfo",
+        "browser",
+    ]) {
+        score += 0.5;
+        reasons.push(format!("header contains user-agent keyword '{keyword}'"));
+    } else if let Some(keyword) = header.contains_any(&["agent", "client"]) {
+        score += 0.25;
+        reasons.push(format!("header contains weak user-agent keyword '{keyword}'"));
+    }
+
+    let total = values.len();
+    if total > 0 {
+        let match_count = values
+            .iter()
+            .filter(|value| {
+                let v = value.trim();
+                v.contains("Mozilla/")
+                    || v.contains("Chrome/")
+                    || v.contains("Safari/")
+                    || v.contains("Edge/")
+                    || v.contains("python-requests")
+            })
+            .count();
+        let ratio = match_count as f64 / total as f64;
+        if ratio >= 0.3 {
+            score += ratio * 0.45;
+            reasons.push(format!(
+                "{match_count}/{total} sampled values look like browser or HTTP client user agents"
+            ));
+        }
+    }
+
+    (score, reasons)
+}
+
+fn score_operation(header: &HeaderProfile, values: &[String]) -> (f64, Vec<String>) {
+    let mut score = 0.0;
+    let mut reasons = Vec::new();
+    if let Some(keyword) = header.contains_any(&[
+        "operationname",
+        "operation",
+        "actiontype",
+        "eventtype",
+        "activity",
+        "action",
+    ]) {
+        score += 0.5;
+        reasons.push(format!("header contains operation keyword '{keyword}'"));
+    } else if let Some(keyword) = header.contains_any(&["type", "category"]) {
+        score += 0.25;
+        reasons.push(format!("header contains weak operation keyword '{keyword}'"));
+    }
+
+    let total = values.len();
+    if total > 0 {
+        let match_count = values
+            .iter()
+            .filter(|value| {
+                let v = value.trim();
+                if v.is_empty() || v.len() > 64 {
+                    false
+                } else {
+                    v.contains(':')
+                        || v.contains('.')
+                        || (v.chars().any(|c| c.is_ascii_lowercase())
+                            && v.chars().any(|c| c.is_ascii_uppercase())
+                            && !v.contains(' '))
+                }
+            })
+            .count();
+        let ratio = match_count as f64 / total as f64;
+        if ratio >= 0.4 {
+            score += ratio * 0.4;
+            reasons.push(format!(
+                "{match_count}/{total} sampled values look like structured operation names"
+            ));
+        }
+    }
+
+    (score, reasons)
+}
+
+fn score_result(header: &HeaderProfile, values: &[String]) -> (f64, Vec<String>) {
+    let mut score = 0.0;
+    let mut reasons = Vec::new();
+    if let Some(keyword) = header.contains_any(&[
+        "resultstatus",
+        "result",
+        "status",
+        "outcome",
+        "authenticationresult",
+    ]) {
+        score += 0.5;
+        reasons.push(format!("header contains result keyword '{keyword}'"));
+    } else if let Some(keyword) = header.contains_any(&["success", "failure"]) {
+        score += 0.25;
+        reasons.push(format!("header contains weak result keyword '{keyword}'"));
+    }
+
+    let total = values.len();
+    if total > 0 {
+        let match_count = values
+            .iter()
+            .filter(|value| {
+                let v = value.trim().to_ascii_lowercase();
+                matches!(
+                    v.as_str(),
+                    "success" | "failure" | "failed" | "0" | "true" | "false" | "allowed" | "blocked"
+                )
+            })
+            .count();
+        let ratio = match_count as f64 / total as f64;
+        if ratio >= 0.4 {
+            score += ratio * 0.4;
+            reasons.push(format!(
+                "{match_count}/{total} sampled values look like typical result statuses"
+            ));
+        }
+    }
+
+    (score, reasons)
+}
+
 fn threshold_for(role: &str) -> f64 {
     match role {
-        "timestamp" | "user" | "command_line" | "ip" => 0.3,
-        "process_name" | "file_name" | "host" | "text_evidence" => 0.25,
+        "timestamp" | "user" | "command_line" | "ip" | "session_id" | "user_agent" => 0.3,
+        "process_name" | "file_name" | "host" | "text_evidence" | "operation" | "result" => 0.25,
         _ => 1.0,
     }
 }

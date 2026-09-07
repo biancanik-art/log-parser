@@ -996,6 +996,14 @@ mod tests {
         add_role(&conn, "process_name", "proc");
         add_role(&conn, "user", "acct");
         add_role(&conn, "host", "box");
+        crate::db::create_ignore_rule_state_schema(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO _custom_ignore_rules (id, name, enabled, conditions_json)
+             VALUES ('qualys-agent-activity', 'Qualys Cloud Agent process activity', 1,
+                     '[{\"role\":\"process_name\",\"op\":\"contains_any\",\"values\":[\"qualys\"]}]')",
+            [],
+        )
+        .unwrap();
         // 120 ordinary rows keep alice "active" and WS-1 her common host.
         for row_num in 1..=120 {
             conn.execute(
@@ -1061,6 +1069,14 @@ mod tests {
     fn off_hours_ratio_excludes_ignored_rows_from_numerator_and_denominator() {
         let mut conn = test_conn(&["msg", "proc"]);
         add_role(&conn, "process_name", "proc");
+        crate::db::create_ignore_rule_state_schema(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO _custom_ignore_rules (id, name, enabled, conditions_json)
+             VALUES ('qualys-agent-activity', 'Qualys Cloud Agent process activity', 1,
+                     '[{\"role\":\"process_name\",\"op\":\"contains_any\",\"values\":[\"qualys\"]}]')",
+            [],
+        )
+        .unwrap();
         db::create_row_time_table(&conn).unwrap();
         // 99 business-hours rows + 1 real off-hours row (row 50): a business-hours dataset
         // with one genuine outlier, same shape as off_hours_only_fires_in_business_hours_datasets.

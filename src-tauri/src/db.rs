@@ -795,6 +795,7 @@ pub fn create_intel_schema(conn: &Connection) -> rusqlite::Result<()> {
          CREATE TABLE IF NOT EXISTS _intel_chain (
             chain_id INTEGER NOT NULL,
             host TEXT,
+            user TEXT,
             start_epoch_ms INTEGER,
             end_epoch_ms INTEGER,
             first_row INTEGER NOT NULL,

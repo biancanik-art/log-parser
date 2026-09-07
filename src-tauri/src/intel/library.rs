@@ -9,6 +9,10 @@ static BUILTIN_LIBRARY_PATH: OnceLock<PathBuf> = OnceLock::new();
 const BUILTIN_LIBRARY_SHA256: &str =
     "3a2164e918aa61f0bacfe3ed909ac153198b3c04761454cf9caf004a91cde7e4";
 
+static BUILTIN_BEC_LIBRARY_PATH: OnceLock<PathBuf> = OnceLock::new();
+const BUILTIN_BEC_LIBRARY_SHA256: &str =
+    "4892b867a81ad1b92c99f75a55e904366e32e8f785da627015d959955ed20c50";
+
 /// Configures the immutable intelligence-library resource bundled with the app.
 ///
 /// Keeping the signature corpus out of the PE/Mach-O/ELF binary is intentional:
@@ -27,6 +31,19 @@ pub fn configure_builtin_library_path(path: PathBuf) -> Result<()> {
     BUILTIN_LIBRARY_PATH
         .set(path)
         .map_err(|_| anyhow!("built-in intelligence library path was already configured"))
+}
+
+pub fn configure_builtin_bec_library_path(path: PathBuf) -> Result<()> {
+    if !path.is_file() {
+        bail!(
+            "bundled BEC intelligence library was not found at {}",
+            path.display()
+        );
+    }
+    let _ = read_verified_builtin_bec_library(&path)?;
+    BUILTIN_BEC_LIBRARY_PATH
+        .set(path)
+        .map_err(|_| anyhow!("built-in BEC intelligence library path was already configured"))
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -114,7 +131,7 @@ pub enum ConditionOp {
     EndsWithAny,
 }
 
-pub const RULE_CONDITION_ROLES: [&str; 7] = [
+pub const RULE_CONDITION_ROLES: [&str; 11] = [
     "command_line",
     "process_name",
     "file_name",
@@ -122,6 +139,10 @@ pub const RULE_CONDITION_ROLES: [&str; 7] = [
     "text_evidence",
     "user",
     "ip",
+    "session_id",
+    "user_agent",
+    "operation",
+    "result",
 ];
 const MAX_RULE_CONDITIONS: usize = 8;
 const MAX_RULE_VALUES: usize = 64;
@@ -167,6 +188,10 @@ pub fn load_builtin_library() -> Result<LoadedLibrary> {
 }
 
 pub fn load_merged_library() -> Result<LoadedLibrary> {
+    load_merged_library_with_options(true)
+}
+
+pub fn load_merged_library_with_options(include_bec: bool) -> Result<LoadedLibrary> {
     let builtin_raw = builtin_library_json()?;
     let builtin = parse_library("built-in MITRE core", builtin_raw.as_ref())?;
     let mut library_ids = vec![builtin.library_id];
@@ -174,6 +199,23 @@ pub fn load_merged_library() -> Result<LoadedLibrary> {
     let mut behavior_rules = builtin.behavior_rules;
     let mut hash_sources = vec![builtin_raw.into_owned()];
     let mut custom_library_error = None;
+
+    if include_bec {
+        match builtin_bec_library_json().and_then(|raw| {
+            let bec = parse_library("built-in BEC library", raw.as_ref())?;
+            Ok((raw, bec))
+        }) {
+            Ok((raw, bec)) => {
+                library_ids.push(bec.library_id);
+                techniques.extend(bec.techniques);
+                behavior_rules.extend(bec.behavior_rules);
+                hash_sources.push(raw.into_owned());
+            }
+            Err(err) => {
+                eprintln!("Warning: failed to load BEC library: {err:#}");
+            }
+        }
+    }
 
     let custom_path = custom_library_path();
     if custom_path.is_file() {
@@ -246,6 +288,47 @@ fn verify_builtin_library_checksum(path: &Path, raw: &str) -> Result<()> {
             "bundled intelligence library checksum mismatch for {}: expected {}, got {}",
             path.display(),
             BUILTIN_LIBRARY_SHA256,
+            actual
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(test))]
+fn builtin_bec_library_json() -> Result<Cow<'static, str>> {
+    let path = BUILTIN_BEC_LIBRARY_PATH.get().cloned().unwrap_or_else(|| {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("resources")
+            .join("intel")
+            .join("bec_library.v1.json")
+    });
+    read_verified_builtin_bec_library(&path).map(Cow::Owned)
+}
+
+#[cfg(test)]
+fn builtin_bec_library_json() -> Result<Cow<'static, str>> {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("resources")
+        .join("intel")
+        .join("bec_library.v1.json");
+    read_verified_builtin_bec_library(&path).map(Cow::Owned)
+}
+
+fn read_verified_builtin_bec_library(path: &Path) -> Result<String> {
+    let raw =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    verify_builtin_bec_library_checksum(path, &raw)?;
+    Ok(raw)
+}
+
+fn verify_builtin_bec_library_checksum(path: &Path, raw: &str) -> Result<()> {
+    let normalized = normalize_line_endings(raw);
+    let actual = sha256_hex(normalized.as_bytes());
+    if actual != BUILTIN_BEC_LIBRARY_SHA256 {
+        bail!(
+            "bundled BEC intelligence library checksum mismatch for {}: expected {}, got {}",
+            path.display(),
+            BUILTIN_BEC_LIBRARY_SHA256,
             actual
         );
     }
@@ -505,5 +588,21 @@ mod tests {
             hash_library_sources(&["alpha\r\n", "beta"]),
             hash_library_sources(&["alpha\n", "beta"])
         );
+    }
+
+    #[test]
+    fn bec_library_loads_and_toggles() {
+        let raw = builtin_bec_library_json().unwrap();
+        let bec = parse_library("built-in BEC library", raw.as_ref()).unwrap();
+        assert_eq!(bec.library_id, "bec_cloud_v1");
+
+        let merged_with_bec = load_merged_library_with_options(true).unwrap();
+        assert!(merged_with_bec.library_ids.contains(&"bec_cloud_v1".to_string()));
+        assert!(merged_with_bec.library_ids.contains(&"mitre_core_v1".to_string()));
+
+        let merged_without_bec = load_merged_library_with_options(false).unwrap();
+        assert!(!merged_without_bec.library_ids.contains(&"bec_cloud_v1".to_string()));
+        assert!(merged_without_bec.library_ids.contains(&"mitre_core_v1".to_string()));
+        assert_ne!(merged_with_bec.library_hash, merged_without_bec.library_hash);
     }
 }

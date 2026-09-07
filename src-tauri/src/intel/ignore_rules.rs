@@ -28,7 +28,7 @@ fn bounded_match_value(value: &str) -> String {
 
 static BUILTIN_IGNORE_RULES_PATH: OnceLock<PathBuf> = OnceLock::new();
 const BUILTIN_IGNORE_RULES_SHA256: &str =
-    "455490e5628c7a221ae945fe9a756d76400b5f0dba576fafdc647176eef2bd43";
+    "1524b2cd73746b020e903c75b4430db770739f40349a79bebbe2588b8f7a1352";
 
 const MAX_RULE_CONDITIONS: usize = 8;
 const MAX_RULE_VALUES: usize = 64;
@@ -756,13 +756,7 @@ mod tests {
     fn builtin_ignore_rules_loads_real_resource() {
         let file = load_builtin_ignore_rules().unwrap();
         assert_eq!(file.rule_set_id, "builtin_ignore_rules_v1");
-        assert_eq!(file.rules.len(), 2);
-        assert!(file.rules.iter().any(|r| r.id == "qualys-agent-activity"));
-        assert!(file
-            .rules
-            .iter()
-            .any(|r| r.id == "msedge-crashpad-handler"));
-        assert!(file.rules.iter().all(|r| r.enabled));
+        assert_eq!(file.rules.len(), 0);
     }
 
     fn unique_temp_dir(label: &str) -> PathBuf {
@@ -791,6 +785,7 @@ mod tests {
         .unwrap();
     }
 
+    #[allow(dead_code)]
     fn insert_override(conn: &Connection, rule_id: &str, enabled: bool) {
         conn.execute(
             "INSERT INTO _ignore_rule_overrides (rule_id, enabled) VALUES (?1, ?2)",
@@ -822,17 +817,9 @@ mod tests {
             true,
             r#"[{"headerAnyOf": ["EventID"], "op": "equals_any", "values": ["9999"]}]"#,
         );
-        insert_override(&conn, "msedge-crashpad-handler", false);
 
         let merged = load_merged_ignore_rules(&conn).unwrap();
         assert!(merged.custom_rules_error.is_none());
-
-        let msedge = merged
-            .rules
-            .iter()
-            .find(|r| r.id == "msedge-crashpad-handler")
-            .unwrap();
-        assert!(!msedge.enabled, "override should disable the built-in rule");
 
         let custom = merged
             .rules
@@ -841,13 +828,6 @@ mod tests {
             .unwrap();
         assert!(custom.enabled);
         assert_eq!(custom.source, RuleSource::Custom);
-
-        let qualys = merged
-            .rules
-            .iter()
-            .find(|r| r.id == "qualys-agent-activity")
-            .unwrap();
-        assert!(qualys.enabled, "rules without an override keep their default");
     }
 
     #[test]
@@ -857,8 +837,7 @@ mod tests {
 
         let merged = load_merged_ignore_rules(&conn).unwrap();
         assert!(merged.custom_rules_error.is_some());
-        // Built-ins still load even though the one bad row was rejected.
-        assert_eq!(merged.rules.len(), 2);
+        assert_eq!(merged.rules.len(), 0);
     }
 
     #[test]
@@ -867,27 +846,26 @@ mod tests {
 
         let merged = load_merged_ignore_rules(&conn).unwrap();
         assert!(merged.custom_rules_error.is_none());
-        assert_eq!(merged.rules.len(), 2);
+        assert_eq!(merged.rules.len(), 0);
     }
 
     #[test]
     fn custom_rule_id_colliding_with_builtin_is_rejected() {
-        let conn = custom_rules_conn();
-        // Bypasses `add_custom_ignore_rule`'s own collision check, simulating state that
-        // somehow ended up bad — `load_merged_ignore_rules` must still catch it on read.
-        insert_custom_rule(
-            &conn,
-            "qualys-agent-activity",
-            "Collides with builtin",
-            true,
-            r#"[{"role": "host", "op": "equals_any", "values": ["x"]}]"#,
-        );
-
-        let merged = load_merged_ignore_rules(&conn).unwrap();
-        assert!(merged
-            .custom_rules_error
-            .as_ref()
-            .is_some_and(|err| err.contains("collides")));
+        let mut reserved = HashSet::new();
+        reserved.insert("builtin-rule");
+        let rule = IgnoreRule {
+            id: "builtin-rule".to_string(),
+            name: "Collision".to_string(),
+            enabled: true,
+            conditions: vec![RuleCondition {
+                role: Some("process_name".to_string()),
+                header_any_of: vec![],
+                op: ConditionOp::ContainsAny,
+                values: vec!["test".to_string()],
+            }],
+        };
+        let err = validate_ignore_rules("custom ignore rules", &[rule], &reserved).unwrap_err();
+        assert!(err.to_string().contains("collides"));
     }
 
     #[test]
@@ -917,6 +895,7 @@ mod tests {
     fn ignore_rule_state_is_isolated_per_connection() {
         let conn_a = custom_rules_conn();
         let conn_b = custom_rules_conn();
+
         insert_custom_rule(
             &conn_a,
             "file-a-only-rule",
@@ -924,7 +903,6 @@ mod tests {
             true,
             r#"[{"headerAnyOf": ["EventID"], "op": "equals_any", "values": ["1"]}]"#,
         );
-        insert_override(&conn_a, "qualys-agent-activity", false);
 
         let listing_a = list_ignore_rules(&conn_a).unwrap();
         let listing_b = list_ignore_rules(&conn_b).unwrap();
@@ -933,22 +911,6 @@ mod tests {
         assert!(
             !listing_b.rules.iter().any(|r| r.id == "file-a-only-rule"),
             "a custom rule added to one file's database must not appear in another's"
-        );
-
-        let qualys_a = listing_a
-            .rules
-            .iter()
-            .find(|r| r.id == "qualys-agent-activity")
-            .unwrap();
-        let qualys_b = listing_b
-            .rules
-            .iter()
-            .find(|r| r.id == "qualys-agent-activity")
-            .unwrap();
-        assert!(!qualys_a.enabled, "file A disabled Qualys for itself");
-        assert!(
-            qualys_b.enabled,
-            "disabling a built-in rule in file A must not affect file B's default-enabled state"
         );
     }
 
@@ -978,6 +940,14 @@ mod tests {
             inferred_type: "text".into(),
         }];
         db::create_schema(&conn, &columns).unwrap();
+        db::create_ignore_rule_state_schema(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO _custom_ignore_rules (id, name, enabled, conditions_json)
+             VALUES ('qualys-agent-activity', 'Qualys Cloud Agent process activity', 1,
+                     '[{\"role\":\"process_name\",\"op\":\"contains_any\",\"values\":[\"qualys\"]}]')",
+            [],
+        )
+        .unwrap();
         for (row_num, process_name) in rows {
             conn.execute(
                 "INSERT INTO rows (row_num, processname) VALUES (?1, ?2)",
@@ -1092,31 +1062,29 @@ mod tests {
         assert_eq!(added.id, "noisy-event-id");
         assert_eq!(added.source, RuleSource::Custom);
         assert!(added.enabled);
-        // Built-ins are still present alongside the new custom rule.
-        assert_eq!(listing.rules.len(), 3);
+        assert_eq!(listing.rules.len(), 1);
     }
 
     #[test]
     fn add_custom_rule_disambiguates_id_collision_with_builtin() {
         let conn = custom_rules_conn();
-        // Slugifies to "qualys-agent-activity", identical to the built-in rule's id.
+        let _ = add_custom_ignore_rule(
+            &conn,
+            header_input("Noisy Event ID", "EventID", ConditionOp::EqualsAny, "1"),
+        )
+        .unwrap();
         let listing = add_custom_ignore_rule(
             &conn,
-            header_input(
-                "Qualys Agent Activity",
-                "EventID",
-                ConditionOp::EqualsAny,
-                "1",
-            ),
+            header_input("Noisy Event ID", "EventID", ConditionOp::EqualsAny, "2"),
         )
         .unwrap();
 
-        let custom_rule = listing
+        let second = listing
             .rules
             .iter()
-            .find(|rule| rule.source == RuleSource::Custom)
+            .find(|rule| rule.id == "noisy-event-id-2")
             .unwrap();
-        assert_eq!(custom_rule.id, "qualys-agent-activity-2");
+        assert_eq!(second.name, "Noisy Event ID");
     }
 
     #[test]
@@ -1140,10 +1108,10 @@ mod tests {
         .unwrap();
 
         let listing = delete_custom_ignore_rule(&conn, "temp-rule").unwrap();
-        assert_eq!(listing.rules.len(), 2);
+        assert_eq!(listing.rules.len(), 0);
         assert!(listing.rules.iter().all(|rule| rule.id != "temp-rule"));
 
-        let err = delete_custom_ignore_rule(&conn, "qualys-agent-activity").unwrap_err();
+        let err = delete_custom_ignore_rule(&conn, "nonexistent-rule").unwrap_err();
         assert!(err.to_string().contains("no custom ignore rule"));
     }
 
@@ -1155,15 +1123,6 @@ mod tests {
             header_input("Temp Rule", "EventID", ConditionOp::EqualsAny, "1"),
         )
         .unwrap();
-
-        let listing = set_ignore_rule_enabled(&conn, "qualys-agent-activity", false).unwrap();
-        let qualys = listing
-            .rules
-            .iter()
-            .find(|rule| rule.id == "qualys-agent-activity")
-            .unwrap();
-        assert!(!qualys.enabled);
-        assert_eq!(qualys.source, RuleSource::Builtin);
 
         let listing = set_ignore_rule_enabled(&conn, "temp-rule", false).unwrap();
         let temp = listing.rules.iter().find(|rule| rule.id == "temp-rule").unwrap();
@@ -1179,6 +1138,6 @@ mod tests {
         insert_custom_rule(&conn, "broken", "Broken Rule", true, "not valid json");
         let listing = list_ignore_rules(&conn).unwrap();
         assert!(listing.custom_rules_error.is_some());
-        assert_eq!(listing.rules.len(), 2, "built-ins still load");
+        assert_eq!(listing.rules.len(), 0);
     }
 }

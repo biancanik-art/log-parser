@@ -1551,6 +1551,7 @@ pub async fn scan_intel_matches(
     app: AppHandle,
     state: State<'_, AppState>,
     evidence_columns: Vec<String>,
+    include_bec: Option<bool>,
 ) -> Result<IntelScanSummary, String> {
     let (db_path, columns, _) = state_snapshot(&state)?;
     if evidence_columns.is_empty() {
@@ -1563,6 +1564,7 @@ pub async fn scan_intel_matches(
         }
     }
 
+    let include_bec = include_bec.unwrap_or(true);
     let app_for_task = app.clone();
     tauri::async_runtime::spawn_blocking(move || -> Result<IntelScanSummary, String> {
         let mut conn = db::open(&db_path).map_err(|e| e.to_string())?;
@@ -1579,9 +1581,10 @@ pub async fn scan_intel_matches(
                     .to_string(),
             );
         }
-        matcher::scan_connection(
+        matcher::scan_connection_with_options(
             &mut conn,
             &evidence_columns,
+            include_bec,
             |rows_done, rows_total, phase| {
                 let _ = app_for_task.emit(
                     "intel-scan-progress",
@@ -1597,6 +1600,35 @@ pub async fn scan_intel_matches(
     })
     .await
     .map_err(|e| format!("intel scan task join error: {e}"))?
+}
+
+#[tauri::command]
+pub async fn extract_iocs(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<crate::intel::ioc::IocExtractionSummary, String> {
+    let (db_path, columns, _) = state_snapshot(&state)?;
+    let app_for_task = app.clone();
+    tauri::async_runtime::spawn_blocking(move || -> Result<crate::intel::ioc::IocExtractionSummary, String> {
+        let conn = db::open(&db_path).map_err(|e| e.to_string())?;
+        crate::intel::ioc::extract_iocs(
+            &conn,
+            &columns,
+            |rows_done, rows_total, phase| {
+                let _ = app_for_task.emit(
+                    "ioc-extraction-progress",
+                    IntelScanProgressPayload {
+                        rows_done,
+                        rows_total,
+                        phase: phase.to_string(),
+                    },
+                );
+            },
+        )
+        .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("ioc extraction task join error: {e}"))?
 }
 
 #[derive(Clone, Serialize)]

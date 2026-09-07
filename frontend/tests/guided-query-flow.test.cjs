@@ -171,6 +171,21 @@ class FakeDocument {
   createElement(tagName) {
     return new FakeElement(tagName);
   }
+
+  querySelector(selector) {
+    return this.querySelectorAll(selector)[0] || null;
+  }
+
+  querySelectorAll(selector) {
+    const matches = [];
+    for (const el of this.elements.values()) {
+      matches.push(...el.querySelectorAll(selector));
+    }
+    return matches;
+  }
+
+  addEventListener() {}
+  removeEventListener() {}
 }
 
 class FakeTabulatorColumn {

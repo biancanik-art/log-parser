@@ -591,6 +591,14 @@ mod tests {
     fn ignored_row_is_excluded_from_classification_entirely() {
         let mut conn = test_conn(&["event_id", "processname"]);
         add_role(&conn, "process_name", "processname");
+        crate::db::create_ignore_rule_state_schema(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO _custom_ignore_rules (id, name, enabled, conditions_json)
+             VALUES ('qualys-agent-activity', 'Qualys Cloud Agent process activity', 1,
+                     '[{\"role\":\"process_name\",\"op\":\"contains_any\",\"values\":[\"qualys\"]}]')",
+            [],
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO rows (row_num, event_id, processname) VALUES
              (1, '4624', 'QualysAgent.exe'),

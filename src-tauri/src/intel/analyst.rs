@@ -948,6 +948,14 @@ mod tests {
             [],
         )
         .unwrap();
+        crate::db::create_ignore_rule_state_schema(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO _custom_ignore_rules (id, name, enabled, conditions_json)
+             VALUES ('qualys-agent-activity', 'Qualys Cloud Agent process activity', 1,
+                     '[{\"role\":\"process_name\",\"op\":\"contains_any\",\"values\":[\"qualys\"]}]')",
+            [],
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO rows (row_num, processname) VALUES
              (1, 'QualysAgent.exe'), (2, 'winlogon.exe'), (3, 'explorer.exe')",

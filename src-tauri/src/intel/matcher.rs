@@ -76,9 +76,18 @@ struct CompiledRule {
 pub fn scan_connection(
     conn: &mut Connection,
     evidence_columns: &[String],
+    on_progress: impl FnMut(i64, i64, &str),
+) -> Result<IntelScanSummary> {
+    scan_connection_with_options(conn, evidence_columns, true, on_progress)
+}
+
+pub fn scan_connection_with_options(
+    conn: &mut Connection,
+    evidence_columns: &[String],
+    include_bec: bool,
     mut on_progress: impl FnMut(i64, i64, &str),
 ) -> Result<IntelScanSummary> {
-    let library = library::load_merged_library()?;
+    let library = library::load_merged_library_with_options(include_bec)?;
     scan_connection_with_library(conn, evidence_columns, library, &mut on_progress)
 }
 
@@ -853,6 +862,14 @@ mod tests {
         )
         .unwrap();
         db::create_column_roles_table(&conn).unwrap();
+        crate::db::create_ignore_rule_state_schema(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO _custom_ignore_rules (id, name, enabled, conditions_json)
+             VALUES ('qualys-agent-activity', 'Qualys Cloud Agent process activity', 1,
+                     '[{\"role\":\"process_name\",\"op\":\"contains_any\",\"values\":[\"qualys\"]}]')",
+            [],
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO _column_roles (role, sql_name, confidence, status, reasons_json)
              VALUES ('process_name', 'processname', 1.0, 'confirmed', '[]')",

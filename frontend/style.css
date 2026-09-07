@@ -721,3 +721,331 @@ select { font: inherit; }
   outline-offset: -2px;
   transition: outline 0.3s ease;
 }
+
+/* -- File Switcher in toolbar --------------------------------------------- */
+.file-switcher-wrap {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 4px;
+}
+
+.file-switcher-label {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-muted);
+  text-transform: uppercase;
+}
+
+.file-switcher {
+  max-width: 220px;
+  padding: 4px 8px;
+  border: 1px solid var(--border-strong);
+  border-radius: 4px;
+  background: var(--bg);
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 500;
+}
+
+/* -- App Navigation Tabs -------------------------------------------------- */
+.app-nav-tabs {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 0 12px;
+  background: var(--panel-subtle);
+  border-bottom: 1px solid var(--border);
+  user-select: none;
+  flex-shrink: 0;
+}
+
+.nav-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 9px 15px;
+  border: none;
+  border-bottom: 2px solid transparent;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 12.5px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.nav-tab:hover {
+  color: var(--text);
+  background: color-mix(in srgb, var(--accent-soft) 40%, transparent);
+}
+
+.nav-tab.active {
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+  background: var(--panel-bg);
+}
+
+.tab-icon {
+  font-size: 14px;
+}
+
+.nav-tab-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1.2;
+}
+
+/* -- Tab Container & Panes ------------------------------------------------ */
+.tab-content-container {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  position: relative;
+  overflow: hidden;
+}
+
+.tab-pane {
+  display: none;
+  height: 100%;
+  flex-direction: column;
+  min-height: 0;
+  position: relative;
+  background: var(--bg);
+}
+
+.tab-pane.active {
+  display: flex;
+}
+
+/* -- Fullscreen / Maximize Support ---------------------------------------- */
+.tab-pane.fullscreen-pane {
+  position: fixed !important;
+  top: 0 !important;
+  left: 0 !important;
+  right: 0 !important;
+  bottom: 0 !important;
+  width: 100vw !important;
+  height: 100vh !important;
+  z-index: 10000 !important;
+  background: var(--bg) !important;
+  box-shadow: 0 0 24px rgb(0 0 0 / 40%);
+}
+
+/* -- Pane Header ---------------------------------------------------------- */
+.pane-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 14px;
+  background: var(--panel-bg);
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.pane-title-group {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.pane-title {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--text);
+}
+
+.pane-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.btn-expand-pane {
+  font-size: 12px;
+  font-weight: 600;
+  background: var(--panel-subtle);
+}
+
+.btn-expand-pane:hover {
+  background: var(--accent-soft);
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+/* Quick prompt chips in AI Analyst */
+.quick-prompts-bar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  max-width: 1120px;
+  margin: 10px auto 0;
+}
+
+.prompt-chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 4px 11px;
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  background: var(--panel-bg);
+  color: var(--text);
+  font-size: 11.5px;
+  cursor: pointer;
+  transition: all 0.12s ease;
+}
+
+.prompt-chip:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.analyst-scroll-area {
+  flex: 1;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+}
+
+/* -- IOC Workspace & View ------------------------------------------------- */
+.ioc-workspace {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  padding: 14px;
+  overflow: hidden;
+  gap: 10px;
+}
+
+.ioc-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.ioc-filter-input {
+  flex: 1;
+  min-width: 240px;
+  max-width: 480px;
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: var(--panel-bg);
+  color: var(--text);
+}
+
+.ioc-category-tabs {
+  display: flex;
+  gap: 4px;
+}
+
+.ioc-cat-btn {
+  padding: 5px 10px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--panel-bg);
+  color: var(--text-muted);
+  font-size: 12px;
+  cursor: pointer;
+  font-weight: 500;
+}
+
+.ioc-cat-btn:hover {
+  background: var(--panel-subtle);
+  color: var(--text);
+}
+
+.ioc-cat-btn.active {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: #fff;
+  font-weight: 600;
+}
+
+.ioc-container {
+  flex: 1;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel-bg);
+  padding: 12px;
+}
+
+.ioc-group-card {
+  margin-bottom: 16px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+  background: var(--panel-subtle);
+}
+
+.ioc-group-card:last-child {
+  margin-bottom: 0;
+}
+
+.ioc-group-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 12px;
+  background: var(--panel-bg);
+  border-bottom: 1px solid var(--border);
+  font-weight: 700;
+  font-size: 12.5px;
+}
+
+.ioc-group-items {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 10px;
+  max-height: 320px;
+  overflow-y: auto;
+}
+
+.ioc-item-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 8px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--panel-bg);
+  font-family: ui-monospace, SFMono-Regular, Consolas, Menlo, monospace;
+  font-size: 11.5px;
+  color: var(--text);
+  user-select: all;
+}
+
+.ioc-item-chip:hover {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.ioc-copy-mini {
+  cursor: pointer;
+  opacity: 0.6;
+  font-size: 10px;
+  margin-left: 2px;
+}
+.ioc-copy-mini:hover {
+  opacity: 1;
+  color: var(--accent);
+}
+
+/* Sidebar toggle */
+#sidebar.collapsed {
+  display: none;
+}
