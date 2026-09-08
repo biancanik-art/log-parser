@@ -1391,3 +1391,35 @@ test("an active ordinary page request blocks parsing until its table publication
   assert.equal(state.rows.length, 1);
   assert.equal(state.rows[0].row_num, EVIDENCE_ROW.row_num);
 });
+
+test("active filter bar appears on filter and clearAllTableFilters resets all query modes", async () => {
+  const app = bootApp({
+    commandHandlers: {
+      parse_guided_query: async () => validAiPreview(),
+    },
+  });
+  await loadFixture(app);
+
+  const filterBar = app.document.getElementById("grid-active-filter-bar");
+  const clearBtn = app.document.getElementById("grid-clear-filter-btn");
+
+  assert.equal(app.debug.isTableFilteredForTest(), false);
+  assert.equal(filterBar.classList.contains("hidden"), true);
+
+  // Apply a search box filter
+  app.document.getElementById("search-box").value = "test search";
+  app.document.getElementById("apply-btn").dispatchEvent({ type: "click" });
+  await settleFrontend();
+
+  assert.equal(app.debug.isTableFilteredForTest(), true);
+  assert.equal(filterBar.classList.contains("hidden"), false);
+
+  // Clear filters via debug method (same as clicking clearBtn or Escape)
+  app.debug.clearAllTableFiltersForTest();
+  await settleFrontend();
+
+  assert.equal(app.debug.isTableFilteredForTest(), false);
+  assert.equal(filterBar.classList.contains("hidden"), true);
+  assert.equal(app.document.getElementById("search-box").value, "");
+});
+

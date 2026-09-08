@@ -1,4 +1,4 @@
-mod commands;
+pub mod commands;
 pub mod csv_import;
 pub mod db;
 pub mod excel_import;

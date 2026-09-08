@@ -777,8 +777,8 @@ mod tests {
         );
         assert!(ua_ips.is_empty(), "Chrome/151.0.0.0 must not be treated as an IP: {ua_ips:?}");
 
-        let normal = extract_ipv4_addresses("client 45.33.32.156 connected to 10.0.0.1");
-        assert_eq!(normal, vec!["45.33.32.156", "10.0.0.1"]);
+        let normal = extract_ipv4_addresses("client 198.51.100.156 connected to 10.0.0.1");
+        assert_eq!(normal, vec!["198.51.100.156", "10.0.0.1"]);
     }
 
     #[test]

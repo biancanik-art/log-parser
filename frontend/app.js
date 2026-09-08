@@ -99,6 +99,9 @@
   const badgeEnrichment = document.getElementById("badge-enrichment");
   const badgeRules = document.getElementById("badge-rules");
   const gridCrossSearchBtn = document.getElementById("grid-cross-search-btn");
+  const gridActiveFilterBar = document.getElementById("grid-active-filter-bar");
+  const gridActiveFilterLabel = document.getElementById("grid-active-filter-label");
+  const gridClearFilterBtn = document.getElementById("grid-clear-filter-btn");
   const correlationFileCount = document.getElementById("correlation-file-count");
   const correlationFilesList = document.getElementById("correlation-files-list");
   const correlationRefreshBtn = document.getElementById("correlation-refresh-btn");
@@ -443,6 +446,8 @@
 
   function resetIntelUiState() {
     resetGuidedQueryUi();
+    gridFilterDescription = null;
+    if (gridActiveFilterBar) gridActiveFilterBar.classList.add("hidden");
     columnRoleSuggestions = [];
     timestampAnalysis = null;
     timestampNormalizationSummary = null;
@@ -837,21 +842,24 @@
 
   function updateEvidenceColumnsUi() {
     const evidenceColumns = inferredEvidenceColumns();
+    const hasLoadedTable = columns.length > 0;
     suspiciousScanBtn.disabled =
-      columns.length === 0 ||
-      evidenceColumns.length === 0 ||
+      !hasLoadedTable ||
       roleDetectionInFlight ||
       intelScanInFlight;
-    if (columns.length === 0) {
+    if (!hasLoadedTable) {
       evidenceColumnsLabel.textContent = "Automatic evidence mapping starts after import.";
     } else if (roleDetectionInFlight) {
       evidenceColumnsLabel.textContent = "Detecting optional evidence mappings...";
     } else if (evidenceColumns.length === 0) {
-      evidenceColumnsLabel.textContent = "No evidence mapping was inferred. AI search is still available.";
+      evidenceColumnsLabel.textContent = "No columns available to enrich.";
     } else {
+      const isFallback = !columnRoleSuggestions.some(
+        (row) => row.status !== "rejected" && EVIDENCE_ROLES.has(row.role) && row.sqlName
+      );
       evidenceColumnsLabel.textContent = `Enrichment will inspect: ${evidenceColumns
         .map(columnDisplayName)
-        .join(", ")}`;
+        .join(", ")}${isFallback ? " (all columns)" : ""}`;
     }
   }
 
@@ -1031,22 +1039,26 @@
 
     if (filterType === "tactic") {
       spec.expression = { type: "intelTactic", name: filterValue };
+      gridFilterDescription = displayName || `MITRE Tactic: ${filterValue}`;
     } else if (filterType === "technique") {
       spec.expression = { type: "intelTechnique", id: filterValue };
+      gridFilterDescription = displayName || `MITRE Technique: ${filterValue}`;
     } else if (filterType === "chain") {
       if (Array.isArray(filterValue) && filterValue.length > 0) {
         spec.expression = { type: "rowIds", values: filterValue };
+        gridFilterDescription = displayName || `Attack Chain (${filterValue.length} steps)`;
       }
     }
 
     resetPagination();
+    refreshData();
+    refreshCount();
+    updateGridActiveFilterBar();
     switchTab("tab-grid");
     guidedResetBtn.classList.remove("hidden");
     guidedResetBtn.textContent = `✕ Clear Filter (${displayName})`;
     aiSearchAvailability.textContent = `Filtered to MITRE ${filterType}: ${displayName}`;
     aiSearchAvailability.classList.add("ready");
-    refreshData();
-    refreshCount();
   }
 
   function renderScanSummary(summary) {
@@ -2120,6 +2132,7 @@
         badgeGrid.classList.add("hidden");
       }
     }
+    updateGridActiveFilterBar();
   }
 
   function setAiMatchColumnVisible(visible) {
@@ -2265,6 +2278,64 @@
     aiSearchAvailability.classList.add("ready");
   }
 
+  let gridFilterDescription = null;
+
+  function isTableFiltered() {
+    return (
+      Boolean(gridFilterDescription) ||
+      queryMode !== "normal" ||
+      spec.expression !== null ||
+      Boolean(spec.search) ||
+      (spec.filters && spec.filters.length > 0)
+    );
+  }
+
+  function updateGridActiveFilterBar() {
+    if (!gridActiveFilterBar || !gridActiveFilterLabel) return;
+    if (!isTableFiltered() || columns.length === 0) {
+      gridActiveFilterBar.classList.add("hidden");
+      return;
+    }
+
+    let desc = gridFilterDescription;
+    if (!desc) {
+      if (queryMode === "guided" || queryMode === "querySpec") {
+        desc = "AI Evidence Search";
+      } else if (spec.expression) {
+        if (spec.expression.type === "intelTactic") {
+          desc = `MITRE Tactic: ${spec.expression.name}`;
+        } else if (spec.expression.type === "intelTechnique") {
+          desc = `MITRE Technique: ${spec.expression.id}`;
+        } else if (spec.expression.type === "rowIds") {
+          desc = `Attack Chain (${spec.expression.values ? spec.expression.values.length : 0} steps)`;
+        } else {
+          desc = "Threat Intelligence Match";
+        }
+      } else if (spec.search) {
+        desc = `Search: "${spec.search}"`;
+      } else if (spec.filters && spec.filters.length > 0) {
+        desc = `${spec.filters.length} column filter(s)`;
+      } else {
+        desc = "Filtered Table";
+      }
+    }
+
+    gridActiveFilterLabel.textContent = `🔍 ${desc}`;
+    gridActiveFilterBar.classList.remove("hidden");
+  }
+
+  function clearAllTableFilters() {
+    gridFilterDescription = null;
+    searchBox.value = "";
+    filterList.innerHTML = "";
+    sortColumn.value = "";
+    resetGuidedQueryUi({ invalidateDataset: false });
+    aiSearchAvailability.textContent = "Ready to search every imported row. No enrichment scan is required.";
+    aiSearchAvailability.classList.add("ready");
+    applyControlsAndReload();
+    updateGridActiveFilterBar();
+  }
+
   function applyControlsAndReload() {
     cancelSearchDebounce();
     if (sheetLoadInFlight || tableTransitionInFlight()) return null;
@@ -2282,6 +2353,7 @@
     resetPagination();
     const page = refreshData();
     refreshCount();
+    updateGridActiveFilterBar();
     return page;
   }
 
@@ -3119,6 +3191,8 @@
     nextPageBtn.disabled = !hasMore;
     updateRowCountLabel();
     refreshCount();
+    gridFilterDescription = guidedSearchBox.value.trim() ? `AI Evidence: "${guidedSearchBox.value.trim()}"` : "AI Evidence Search";
+    updateGridActiveFilterBar();
   }
 
   async function runGuidedQuery(intentToken = guidedIntentToken) {
@@ -3748,9 +3822,12 @@
         </div>
         <button class="btn btn-small" style="margin-left:auto;">${isCurrent ? "Active" : "Switch"}</button>
       `;
-      card.querySelector("button").addEventListener("click", () => {
-        switchLoadedFile(idx);
-      });
+      const switchBtn = card.querySelector("button");
+      if (switchBtn) {
+        switchBtn.addEventListener("click", () => {
+          switchLoadedFile(idx);
+        });
+      }
       correlationFilesList.appendChild(card);
     });
   }
@@ -4452,13 +4529,13 @@
     decideGuidedParse("rejected").catch((err) => alert(`Could not record decision: ${err}`));
   });
   guidedResetBtn.addEventListener("click", () => {
-    // This only returns to the ordinary table view. The imported dataset is unchanged, so keep
-    // semantic indexing, role detection, and timestamp analysis bound to their current revision.
-    resetGuidedQueryUi({ invalidateDataset: false });
-    aiSearchAvailability.textContent = "Ready to search every imported row. No enrichment scan is required.";
-    aiSearchAvailability.classList.add("ready");
-    applyControlsAndReload();
+    clearAllTableFilters();
   });
+  if (gridClearFilterBtn) {
+    gridClearFilterBtn.addEventListener("click", () => {
+      clearAllTableFilters();
+    });
+  }
   guidedPanelClose.addEventListener("click", () => {
     cancelActiveGuidedParse();
     decideGuidedParse("rejected").catch((err) => console.error("set_guided_parse_decision failed", err));
@@ -4472,10 +4549,7 @@
   applyBtn.addEventListener("click", applyControlsAndReload);
   clearBtn.addEventListener("click", () => {
     if (sheetLoadInFlight || tableTransitionInFlight()) return;
-    searchBox.value = "";
-    filterList.innerHTML = "";
-    sortColumn.value = "";
-    applyControlsAndReload();
+    clearAllTableFilters();
   });
 
   suspiciousScanBtn.addEventListener("click", () => {
@@ -4690,12 +4764,28 @@
     ignoreRuleRoleSelect.appendChild(option);
   });
 
+  if (typeof document !== "undefined" && typeof document.addEventListener === "function") {
+    document.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") {
+        if (isTableFiltered()) {
+          clearAllTableFilters();
+        }
+      }
+    });
+  }
+
   // Debug hook: lets automated/CDP-driven testing open a file by path directly,
   // bypassing the native OS file-picker dialog (which can't be scripted).
   // Harmless in normal use — withGlobalTauri already exposes the raw invoke()
   // surface to page scripts, so this adds no new capability, just convenience.
   window.__logParserDebug = window.__logParserDebug || {};
   Object.assign(window.__logParserDebug, {
+    clearAllTableFiltersForTest() {
+      clearAllTableFilters();
+    },
+    isTableFilteredForTest() {
+      return isTableFiltered();
+    },
     loadSheetForTest(path, sheet) {
       if (!path) {
         throw new Error("loadSheetForTest(path, sheet): path is required");

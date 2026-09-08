@@ -1573,4 +1573,47 @@ select { font: inherit; }
   font-weight: 700;
 }
 
+.grid-filter-bar {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  background: var(--accent-soft, rgba(56, 189, 248, 0.12));
+  border: 1px solid var(--accent, #38bdf8);
+  border-radius: 6px;
+  padding: 2px 8px;
+  font-size: 12px;
+  max-width: 480px;
+  height: 28px;
+  box-sizing: border-box;
+}
+
+.grid-filter-label {
+  color: var(--text);
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-size: 11.5px;
+}
+
+.btn-clear-filter {
+  background: transparent;
+  border: 1px solid var(--accent, #38bdf8);
+  color: var(--accent, #38bdf8);
+  font-weight: 700;
+  padding: 1px 7px;
+  border-radius: 4px;
+  cursor: pointer;
+  line-height: 1.4;
+  font-size: 11px;
+  white-space: nowrap;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+
+.btn-clear-filter:hover {
+  background: var(--accent, #38bdf8);
+  color: #fff;
+}
+
+
 

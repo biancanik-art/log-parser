@@ -595,8 +595,8 @@ pub fn query_rows(
         let mut obj = serde_json::Map::new();
         obj.insert("row_num".to_string(), serde_json::json!(row_num));
         for (i, name) in column_names.iter().enumerate() {
-            let value: String = row.get(i + 1)?;
-            obj.insert(name.clone(), serde_json::json!(value));
+            let value: Option<String> = row.get(i + 1)?;
+            obj.insert(name.clone(), serde_json::json!(value.unwrap_or_default()));
         }
         rows_out.push(serde_json::Value::Object(obj));
     }

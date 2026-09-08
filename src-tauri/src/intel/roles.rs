@@ -157,6 +157,49 @@ pub fn detect_column_roles(
         }
     }
 
+    // Ensure that at least one evidence role is suggested for threat enrichment,
+    // even if none met the keyword heuristic threshold.
+    let has_evidence_role: bool = conn
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM _column_roles
+                WHERE role IN ('command_line', 'process_name', 'file_name', 'host', 'text_evidence')
+                  AND status != 'rejected'
+            )",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+
+    if !has_evidence_role {
+        let fallback_col = columns
+            .iter()
+            .find(|c| {
+                c.sql_name != "row_num"
+                    && !claimed_columns.contains(&c.sql_name)
+                    && c.inferred_type == "text"
+            })
+            .or_else(|| {
+                columns
+                    .iter()
+                    .find(|c| c.sql_name != "row_num" && !claimed_columns.contains(&c.sql_name))
+            })
+            .or_else(|| columns.iter().find(|c| c.sql_name != "row_num"));
+
+        if let Some(col) = fallback_col {
+            let candidate = Candidate {
+                role: "text_evidence",
+                sql_name: col.sql_name.clone(),
+                confidence: 0.35,
+                reasons: vec![
+                    "automatically designated as primary evidence column for threat enrichment"
+                        .to_string(),
+                ],
+            };
+            upsert_suggestion(conn, &candidate)?;
+        }
+    }
+
     load_column_roles(conn, columns)
 }
 

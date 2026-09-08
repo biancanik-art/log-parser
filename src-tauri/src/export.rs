@@ -239,7 +239,8 @@ pub fn export_csv_guarded(
             let mut record: Vec<String> = vec![String::new(); columns.len()];
             while let Some(row) = rows.next()? {
                 for (i, cell) in record.iter_mut().enumerate() {
-                    *cell = row.get(i)?;
+                    let val: Option<String> = row.get(i)?;
+                    *cell = val.unwrap_or_default();
                 }
                 writer.write_record(&record)?;
                 row_count += 1;
@@ -311,7 +312,8 @@ pub fn export_csv_normalized_time_guarded(
             let mut record = vec![String::new(); columns.len()];
             while let Some(row) = rows.next()? {
                 for (index, cell) in record.iter_mut().enumerate() {
-                    *cell = row.get(index)?;
+                    let val: Option<String> = row.get(index)?;
+                    *cell = val.unwrap_or_default();
                 }
                 writer.write_record(&record)?;
                 row_count += 1;
@@ -375,8 +377,8 @@ pub fn export_xlsx_guarded(
             let mut excel_row: u32 = 1;
             while let Some(row) = rows.next()? {
                 for col_idx in 0..columns.len() {
-                    let value: String = row.get(col_idx)?;
-                    worksheet.write_string(excel_row, col_idx as u16, value.as_str())?;
+                    let value: Option<String> = row.get(col_idx)?;
+                    worksheet.write_string(excel_row, col_idx as u16, value.as_deref().unwrap_or(""))?;
                 }
                 excel_row += 1;
                 row_count += 1;
@@ -447,8 +449,8 @@ pub fn export_xlsx_normalized_time_guarded(
             let mut excel_row = 1u32;
             while let Some(row) = rows.next()? {
                 for column_index in 0..columns.len() {
-                    let value: String = row.get(column_index)?;
-                    worksheet.write_string(excel_row, column_index as u16, value.as_str())?;
+                    let value: Option<String> = row.get(column_index)?;
+                    worksheet.write_string(excel_row, column_index as u16, value.as_deref().unwrap_or(""))?;
                 }
                 excel_row += 1;
                 row_count += 1;

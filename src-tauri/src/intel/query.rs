@@ -372,18 +372,36 @@ fn validate_intent_against_current_context(conn: &Connection, intent: &GuidedInt
 /// Automatic, non-rejected data mappings are sufficient for optional MITRE enrichment. They are
 /// deliberately not consulted by the raw AI path.
 pub fn active_evidence_columns(conn: &Connection) -> Result<Vec<String>> {
-    if !table_exists(conn, "_column_roles")? {
+    if table_exists(conn, "_column_roles")? {
+        let mut stmt = conn.prepare(
+            "SELECT sql_name FROM _column_roles
+             WHERE status IN ('suggested', 'confirmed')
+               AND role IN ('command_line', 'process_name', 'file_name', 'host', 'text_evidence')
+             ORDER BY sql_name",
+        )?;
+        let mut columns = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        columns.sort();
+        columns.dedup();
+        if !columns.is_empty() {
+            return Ok(columns);
+        }
+    }
+    fallback_evidence_columns(conn)
+}
+
+fn fallback_evidence_columns(conn: &Connection) -> Result<Vec<String>> {
+    if !table_exists(conn, "rows")? {
         return Ok(Vec::new());
     }
-    let mut stmt = conn.prepare(
-        "SELECT sql_name FROM _column_roles
-         WHERE status IN ('suggested', 'confirmed')
-           AND role IN ('command_line', 'process_name', 'file_name', 'host', 'text_evidence')
-         ORDER BY sql_name",
-    )?;
+    let mut stmt = conn.prepare("PRAGMA table_info(rows)")?;
     let mut columns = stmt
-        .query_map([], |row| row.get::<_, String>(0))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
+        .query_map([], |row| row.get::<_, String>(1))?
+        .filter_map(|r| r.ok())
+        .filter(|col| col != "row_num")
+        .take(15)
+        .collect::<Vec<String>>();
     columns.sort();
     columns.dedup();
     Ok(columns)

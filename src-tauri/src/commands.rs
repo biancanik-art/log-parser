@@ -1578,15 +1578,17 @@ pub async fn scan_intel_matches(
         requested_columns.dedup();
         let active_columns = guided_query::active_evidence_columns(&conn)
             .map_err(|error| error.to_string())?;
-        if requested_columns != active_columns {
-            return Err(
-                "evidence columns changed or are not active automatic mappings; refresh data mapping before scanning"
-                    .to_string(),
-            );
+        let columns_to_scan = if !active_columns.is_empty() {
+            active_columns
+        } else {
+            requested_columns
+        };
+        if columns_to_scan.is_empty() {
+            return Err("no columns available for threat enrichment".to_string());
         }
         matcher::scan_connection_with_options(
             &mut conn,
-            &evidence_columns,
+            &columns_to_scan,
             include_bec,
             |rows_done, rows_total, phase| {
                 let _ = app_for_task.emit(

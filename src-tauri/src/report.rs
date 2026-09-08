@@ -2741,7 +2741,7 @@ mod tests {
                 "2026-01-01T00:03:00Z",
                 "CORP\\bob",
                 "WKSTN-02",
-                "45.33.1.2",
+                "198.51.100.2",
                 "whoami",
                 "Mozilla/5.0 Version/17.0 Safari/605.1.15",
             ),
