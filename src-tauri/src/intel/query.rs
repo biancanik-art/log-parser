@@ -89,7 +89,7 @@ fn query_raw_normalized_time(
     }
     time::require_row_time_binding(conn, columns, &sort.column)?;
     let predicate = crate::query::build_predicate_for_connection(conn, columns, spec)?;
-    let limit = spec.limit.clamp(1, 5000);
+    let limit = spec.limit.clamp(1, 100_000);
     let direction = match sort.direction {
         RawSortDirection::Asc => "ASC",
         RawSortDirection::Desc => "DESC",
@@ -376,7 +376,7 @@ pub fn active_evidence_columns(conn: &Connection) -> Result<Vec<String>> {
         let mut stmt = conn.prepare(
             "SELECT sql_name FROM _column_roles
              WHERE status IN ('suggested', 'confirmed')
-               AND role IN ('command_line', 'process_name', 'file_name', 'host', 'text_evidence')
+               AND role IN ('command_line', 'process_name', 'file_name', 'host', 'text_evidence', 'operation')
              ORDER BY sql_name",
         )?;
         let mut columns = stmt
@@ -470,7 +470,7 @@ fn query_page(
     limit: Option<u32>,
     use_time: bool,
 ) -> Result<QueryPage> {
-    let limit = limit.unwrap_or(200).clamp(1, 5000);
+    let limit = limit.unwrap_or(200).clamp(1, 100_000);
     let limit_plus_one = (limit as i64) + 1;
 
     let select_cols = rows_column_ident_list(columns);

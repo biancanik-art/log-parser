@@ -242,6 +242,27 @@ class FakeTabulator {
     return this.columns.get(field) || null;
   }
 
+  getColumns() {
+    return Array.from(this.columns.entries()).map(([field, col]) => ({
+      getField: () => field,
+      getElement: () => null,
+      isVisible: () => col.isVisible(),
+    }));
+  }
+
+  setColumns(columns) {
+    this.columns = new Map(
+      (columns || []).map((column) => [
+        column.field,
+        new FakeTabulatorColumn(column.visible !== false),
+      ])
+    );
+  }
+
+  getSelectedData() {
+    return [];
+  }
+
   destroy() {
     this.destroyed = true;
   }

@@ -74,7 +74,7 @@ jobs:
         with:
           projectPath: src-tauri
           tagName: ${{ github.ref_name }}
-          releaseName: 'log-parser v__VERSION__'
+          releaseName: 'logparser-DFIR v__VERSION__'
           releaseBody: |
             Pre-built installers for Windows, macOS (Apple Silicon and Intel), and Linux.
             See the assets below to download and install.

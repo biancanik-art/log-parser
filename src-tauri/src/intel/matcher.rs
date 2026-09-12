@@ -144,7 +144,7 @@ pub fn confirmed_evidence_columns(conn: &Connection) -> Result<Vec<String>> {
     let mut stmt = conn.prepare(
         "SELECT sql_name FROM _column_roles
          WHERE status = 'confirmed'
-           AND role IN ('command_line', 'process_name', 'file_name', 'host', 'text_evidence')
+           AND role IN ('command_line', 'process_name', 'file_name', 'host', 'text_evidence', 'operation')
          ORDER BY sql_name",
     )?;
     let columns = stmt

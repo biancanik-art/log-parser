@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>log-parser</title>
+  <title>logparser-DFIR</title>
   <link rel="stylesheet" href="vendor/tabulator/tabulator.min.css" />
   <link rel="stylesheet" href="style.css" />
 </head>
@@ -78,6 +78,8 @@
             </div>
           </div>
           <div class="pane-actions">
+            <button id="grid-export-csv-btn" class="btn btn-small" title="Export current filtered results to CSV" disabled>📥 Export CSV</button>
+            <button id="grid-export-xlsx-btn" class="btn btn-small" title="Export current filtered results to Excel (.xlsx)" disabled>📥 Export Excel</button>
             <button id="grid-maximize-btn" class="btn btn-small btn-expand-pane" title="Maximize Table View">⛶ Expand Table</button>
           </div>
         </div>
@@ -85,7 +87,7 @@
           <aside id="sidebar">
             <div class="sidebar-section">
               <h3>Sort</h3>
-              <select id="sort-column"><option value="">(row order)</option></select>
+              <select id="sort-column"><option value="">(row order)</option><option value="row_num"># (row order)</option></select>
               <select id="sort-direction">
                 <option value="asc">Ascending</option>
                 <option value="desc">Descending</option>
@@ -111,11 +113,28 @@
           <section id="grid-area">
             <div id="grid"></div>
             <footer id="status-bar">
-              <span id="row-count-label">&mdash;</span>
-              <div class="toolbar-spacer"></div>
-              <button id="prev-page-btn" class="btn btn-small" disabled>&laquo; Prev</button>
-              <span id="page-label"></span>
-              <button id="next-page-btn" class="btn btn-small" disabled>Next &raquo;</button>
+              <div class="status-left">
+                <span id="row-count-label">&mdash;</span>
+                <span id="selection-count-badge" class="selection-badge hidden" title="Selected rows (Click or press Esc to deselect)"></span>
+              </div>
+              <div class="status-right">
+                <label for="page-size-select" class="page-size-label">Per page:</label>
+                <select id="page-size-select" class="page-size-select" title="Rows to display per page" disabled>
+                  <option value="300" selected>300</option>
+                  <option value="500">500</option>
+                  <option value="1000">1,000</option>
+                  <option value="2500">2,500</option>
+                  <option value="5000">5,000</option>
+                  <option value="10000">10,000</option>
+                  <option value="50000">50,000 (All)</option>
+                </select>
+                <div class="pagination-controls">
+                  <button id="first-page-btn" class="btn btn-small" title="First page" disabled>&laquo; First</button>
+                  <button id="prev-page-btn" class="btn btn-small" title="Previous page" disabled>&lsaquo; Prev</button>
+                  <span id="page-label">page 1</span>
+                  <button id="next-page-btn" class="btn btn-small" title="Next page" disabled>Next &rsaquo;</button>
+                </div>
+              </div>
             </footer>
           </section>
         </main>
@@ -185,9 +204,18 @@
                 <button class="cross-ioc-filter-btn active" data-filter="overlap">Shared Only (&ge;2 files)</button>
                 <button class="cross-ioc-filter-btn" data-filter="all">All Indicators</button>
               </div>
-              <div class="ioc-category-tabs" style="margin-left: 10px;">
+              <div class="ioc-category-tabs" style="margin-left: 10px; flex-wrap: wrap; gap: 4px;">
                 <button class="cross-ioc-type-btn active" data-type="all">All Types</button>
+                <button class="cross-ioc-type-btn" data-type="correlation_id">Correlation / Request ID</button>
+                <button class="cross-ioc-type-btn" data-type="session_id">Session ID</button>
+                <button class="cross-ioc-type-btn" data-type="device_id">Device ID</button>
                 <button class="cross-ioc-type-btn" data-type="ip">IPs</button>
+                <button class="cross-ioc-type-btn" data-type="app_id">App ID</button>
+                <button class="cross-ioc-type-btn" data-type="unique_token_id">Token ID</button>
+                <button class="cross-ioc-type-btn" data-type="hash">Hashes</button>
+                <button class="cross-ioc-type-btn" data-type="mailbox_guid">Mailbox GUID</button>
+                <button class="cross-ioc-type-btn" data-type="message_id">Message IDs</button>
+                <button class="cross-ioc-type-btn" data-type="file_id">File / Object ID</button>
                 <button class="cross-ioc-type-btn" data-type="domain">Domains</button>
                 <button class="cross-ioc-type-btn" data-type="url">URLs</button>
                 <button class="cross-ioc-type-btn" data-type="email">Emails</button>
@@ -220,19 +248,140 @@
                 <p>Ask anything: &ldquo;what is in this file&rdquo;, &ldquo;map this to MITRE&rdquo;, &ldquo;find chained activity&rdquo;, &ldquo;make a report&rdquo; &mdash; or describe evidence to filter the table.</p>
               </div>
             </div>
-            <form id="guided-search-form" class="guided-search-form">
-              <label for="guided-search-box" class="sr-only">Describe evidence to find</label>
-              <input id="guided-search-box" type="search" maxlength="4096" placeholder="Example: what is in this file? &mdash; or: failed logons for alice chronologically" disabled />
-              <button id="guided-search-submit" class="btn btn-primary" disabled>Ask AI</button>
-              <button id="guided-reset-btn" type="button" class="btn hidden">Clear AI search</button>
-            </form>
+            <div class="guided-search-wrapper" style="position: relative; width: 100%;">
+              <form id="guided-search-form" class="guided-search-form">
+                <label for="guided-search-box" class="sr-only">Describe evidence to find</label>
+                <input id="guided-search-box" type="search" maxlength="4096" placeholder="Example: what is in this file? &mdash; or: failed logons for alice chronologically" disabled autocomplete="off" />
+                <button id="guided-search-submit" class="btn btn-primary" disabled>Ask AI</button>
+                <button id="guided-reset-btn" type="button" class="btn hidden">Clear AI search</button>
+              </form>
+
+              <div id="suggested-prompts-popover" class="suggested-prompts-popover hidden">
+                <div class="suggested-prompts-header">
+                  <div class="suggested-prompts-title">
+                    <span>💡 Suggested Prompts</span>
+                    <span class="suggested-prompts-hint">Click a prompt to ask immediately, or check multiple boxes to combine them</span>
+                  </div>
+                  <button id="close-suggested-prompts-btn" type="button" class="btn-close-popover" title="Close suggested prompts">&times;</button>
+                </div>
+
+                <div id="suggested-multi-actions" class="suggested-multi-actions hidden">
+                  <span id="suggested-selected-count" class="suggested-selected-count">0 prompts selected</span>
+                  <div style="display:flex; gap:8px; margin-left:auto;">
+                    <button id="run-combined-prompts-btn" type="button" class="btn btn-primary btn-small">🚀 Run Combined Prompts</button>
+                    <button id="clear-selected-prompts-btn" type="button" class="btn btn-small">Clear</button>
+                  </div>
+                </div>
+
+                <div class="suggested-prompts-body">
+                  <div class="suggested-category">
+                    <div class="suggested-category-title">🔍 Triage &amp; Dataset Overview</div>
+                    <div class="suggested-category-grid">
+                      <label class="suggested-item" data-prompt="what is in this file?">
+                        <input type="checkbox" class="prompt-select-cb" value="what is in this file?" />
+                        <span class="prompt-text">What is in this file?</span>
+                      </label>
+                      <label class="suggested-item" data-prompt="what happened in this dataset?">
+                        <input type="checkbox" class="prompt-select-cb" value="what happened in this dataset?" />
+                        <span class="prompt-text">What happened in this dataset?</span>
+                      </label>
+                      <label class="suggested-item" data-prompt="summarize suspicious activity">
+                        <input type="checkbox" class="prompt-select-cb" value="summarize suspicious activity" />
+                        <span class="prompt-text">Summarize suspicious activity</span>
+                      </label>
+                      <label class="suggested-item" data-prompt="make an executive summary report">
+                        <input type="checkbox" class="prompt-select-cb" value="make an executive summary report" />
+                        <span class="prompt-text">Make executive summary report</span>
+                      </label>
+                    </div>
+                  </div>
+
+                  <div class="suggested-category">
+                    <div class="suggested-category-title">⚔️ MITRE ATT&amp;CK &amp; Chained Activity</div>
+                    <div class="suggested-category-grid">
+                      <label class="suggested-item" data-prompt="map this to MITRE ATT&amp;CK">
+                        <input type="checkbox" class="prompt-select-cb" value="map this to MITRE ATT&amp;CK" />
+                        <span class="prompt-text">Map to MITRE ATT&amp;CK</span>
+                      </label>
+                      <label class="suggested-item" data-prompt="find chained attack activity">
+                        <input type="checkbox" class="prompt-select-cb" value="find chained attack activity" />
+                        <span class="prompt-text">Find chained attack activity</span>
+                      </label>
+                      <label class="suggested-item" data-prompt="persistence and privilege escalation">
+                        <input type="checkbox" class="prompt-select-cb" value="persistence and privilege escalation" />
+                        <span class="prompt-text">Persistence &amp; privilege escalation</span>
+                      </label>
+                      <label class="suggested-item" data-prompt="data exfiltration and defense evasion">
+                        <input type="checkbox" class="prompt-select-cb" value="data exfiltration and defense evasion" />
+                        <span class="prompt-text">Exfiltration &amp; defense evasion</span>
+                      </label>
+                    </div>
+                  </div>
+
+                  <div class="suggested-category">
+                    <div class="suggested-category-title">🛡️ Identity, Auth &amp; Cloud / Mail</div>
+                    <div class="suggested-category-grid">
+                      <label class="suggested-item" data-prompt="failed logons and brute force attempts">
+                        <input type="checkbox" class="prompt-select-cb" value="failed logons and brute force attempts" />
+                        <span class="prompt-text">Failed logons &amp; brute force</span>
+                      </label>
+                      <label class="suggested-item" data-prompt="abnormal user agents and suspicious logins">
+                        <input type="checkbox" class="prompt-select-cb" value="abnormal user agents and suspicious logins" />
+                        <span class="prompt-text">Abnormal user agents &amp; logins</span>
+                      </label>
+                      <label class="suggested-item" data-prompt="inbox forwarding rules and consent grants">
+                        <input type="checkbox" class="prompt-select-cb" value="inbox forwarding rules and consent grants" />
+                        <span class="prompt-text">Inbox forwarding rules &amp; consent grants</span>
+                      </label>
+                      <label class="suggested-item" data-prompt="suspicious admin operations and role assignments">
+                        <input type="checkbox" class="prompt-select-cb" value="suspicious admin operations and role assignments" />
+                        <span class="prompt-text">Admin operations &amp; role assignments</span>
+                      </label>
+                    </div>
+                  </div>
+
+                  <div class="suggested-category">
+                    <div class="suggested-category-title">⏱️ Execution, Tools &amp; Chronology</div>
+                    <div class="suggested-category-grid">
+                      <label class="suggested-item" data-prompt="powershell execution and encoded commands">
+                        <input type="checkbox" class="prompt-select-cb" value="powershell execution and encoded commands" />
+                        <span class="prompt-text">PowerShell &amp; encoded commands</span>
+                      </label>
+                      <label class="suggested-item" data-prompt="credential dumping and mimikatz activity">
+                        <input type="checkbox" class="prompt-select-cb" value="credential dumping and mimikatz activity" />
+                        <span class="prompt-text">Credential dumping &amp; Mimikatz</span>
+                      </label>
+                      <label class="suggested-item" data-prompt="timeline of all suspicious events">
+                        <input type="checkbox" class="prompt-select-cb" value="timeline of all suspicious events" />
+                        <span class="prompt-text">⏱️ Timeline of suspicious events</span>
+                      </label>
+                      <label class="suggested-item" data-prompt="wide-net heuristic anomalies">
+                        <input type="checkbox" class="prompt-select-cb" value="wide-net heuristic anomalies" />
+                        <span class="prompt-text">Wide-net heuristic anomalies</span>
+                      </label>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
             <div class="quick-prompts-bar">
               <span style="font-size: 11.5px; color: var(--text-muted); font-weight: 600;">Quick Prompts:</span>
               <button type="button" class="prompt-chip" data-prompt="what is in this file?">What is in this file?</button>
               <button type="button" class="prompt-chip" data-prompt="map this to MITRE ATT&amp;CK">Map to MITRE</button>
               <button type="button" class="prompt-chip" data-prompt="find chained activity and anomalies">Find anomalies &amp; chains</button>
               <button type="button" class="prompt-chip" data-prompt="summarize suspicious activity">Suspicious activity</button>
+              <button type="button" class="prompt-chip" data-prompt="timeline of suspicious events">⏱️ Suspicious Timeline</button>
               <button type="button" class="prompt-chip" data-prompt="make an executive summary report">Make report</button>
+            </div>
+            <div id="timeline-generator-card" class="timeline-generator-card">
+              <div class="timeline-generator-header">
+                <span class="timeline-generator-title">⏱️ Timeline Generator</span>
+                <span class="timeline-generator-subtitle">Reconstruct chronological sequence of events for specific keywords (e.g. users, IPs, commands, tools)</span>
+              </div>
+              <form id="timeline-generator-form" class="timeline-generator-form">
+                <input id="timeline-keywords-box" type="text" maxlength="512" placeholder="Enter keywords separated by commas (e.g. powershell, alice, 198.51.100.22, mimikatz)" disabled />
+                <button id="timeline-generate-btn" type="submit" class="btn btn-secondary" disabled>⏱️ Generate Timeline</button>
+              </form>
             </div>
             <div id="ai-search-availability" class="ai-search-availability" aria-live="polite">Import a file to search its evidence.</div>
             <div id="semantic-index-status" class="semantic-index-status">Semantic matching starts automatically after import.</div>
@@ -283,10 +432,19 @@
         </div>
         <div class="ioc-workspace">
           <div class="ioc-toolbar">
-            <input id="ioc-search-filter" class="ioc-filter-input" type="search" placeholder="Filter IOCs (e.g. domain name, IP, email, user-agent)..." />
-            <div class="ioc-category-tabs">
+            <input id="ioc-search-filter" class="ioc-filter-input" type="search" placeholder="Filter IOCs (e.g. domain name, IP, email, session, hash)..." />
+            <div class="ioc-category-tabs" style="flex-wrap: wrap; gap: 4px;">
               <button class="ioc-cat-btn active" data-cat="all">All</button>
+              <button class="ioc-cat-btn" data-cat="correlation_id">Correlation / Request ID</button>
+              <button class="ioc-cat-btn" data-cat="session_id">Session ID</button>
+              <button class="ioc-cat-btn" data-cat="device_id">Device ID</button>
               <button class="ioc-cat-btn" data-cat="ip">IPs</button>
+              <button class="ioc-cat-btn" data-cat="app_id">App ID</button>
+              <button class="ioc-cat-btn" data-cat="unique_token_id">Token ID</button>
+              <button class="ioc-cat-btn" data-cat="hash">Hashes</button>
+              <button class="ioc-cat-btn" data-cat="mailbox_guid">Mailbox GUID</button>
+              <button class="ioc-cat-btn" data-cat="message_id">Message IDs</button>
+              <button class="ioc-cat-btn" data-cat="file_id">File / Object ID</button>
               <button class="ioc-cat-btn" data-cat="domain">Domains</button>
               <button class="ioc-cat-btn" data-cat="url">URLs</button>
               <button class="ioc-cat-btn" data-cat="email">Emails</button>

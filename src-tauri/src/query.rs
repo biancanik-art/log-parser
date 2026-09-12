@@ -101,6 +101,7 @@ pub enum QueryExpression {
     IntelTechnique {
         id: String,
     },
+    IntelAny,
     /// Backend-created, dataset-bound semantic document selection. The identifier is never
     /// interpreted as SQL and is accepted only when it names the currently active semantic build.
     SemanticSelection {
@@ -314,6 +315,7 @@ impl ExpressionCompiler<'_> {
             QueryExpression::RowIds { values } => self.compile_row_ids(values),
             QueryExpression::IntelTactic { name } => self.compile_intel_tactic(name),
             QueryExpression::IntelTechnique { id } => self.compile_intel_technique(id),
+            QueryExpression::IntelAny => self.compile_intel_any(),
             QueryExpression::SemanticSelection { selection_id } => {
                 self.compile_semantic_selection(selection_id)
             }
@@ -370,9 +372,11 @@ impl ExpressionCompiler<'_> {
         if let Some(conn) = self.conn {
             let _ = crate::db::create_intel_schema(conn);
         }
-        self.params.push(Box::new(trimmed.to_string()));
-        self.params.push(Box::new(trimmed.to_string()));
-        Ok("row_num IN (SELECT row_num FROM _intel_match WHERE tactic_name = ? OR tactic_id = ?)".to_string())
+        let lower = trimmed.to_lowercase();
+        self.params.push(Box::new(lower.clone()));
+        self.params.push(Box::new(lower.clone()));
+        self.params.push(Box::new(format!("%{lower}%")));
+        Ok("row_num IN (SELECT row_num FROM _intel_match WHERE LOWER(tactic_name) = ? OR LOWER(tactic_id) = ? OR LOWER(tactic_name) LIKE ?)".to_string())
     }
 
     fn compile_intel_technique(&mut self, id: &str) -> Result<String> {
@@ -383,9 +387,18 @@ impl ExpressionCompiler<'_> {
         if let Some(conn) = self.conn {
             let _ = crate::db::create_intel_schema(conn);
         }
-        self.params.push(Box::new(trimmed.to_string()));
-        self.params.push(Box::new(trimmed.to_string()));
-        Ok("row_num IN (SELECT row_num FROM _intel_match WHERE technique_id = ? OR technique_name = ?)".to_string())
+        let lower = trimmed.to_lowercase();
+        self.params.push(Box::new(lower.clone()));
+        self.params.push(Box::new(lower.clone()));
+        self.params.push(Box::new(format!("%{lower}%")));
+        Ok("row_num IN (SELECT row_num FROM _intel_match WHERE LOWER(technique_id) = ? OR LOWER(technique_name) = ? OR LOWER(technique_id) LIKE ?)".to_string())
+    }
+
+    fn compile_intel_any(&mut self) -> Result<String> {
+        if let Some(conn) = self.conn {
+            let _ = crate::db::create_intel_schema(conn);
+        }
+        Ok("row_num IN (SELECT row_num FROM _intel_match)".to_string())
     }
 
     fn compile_semantic_selection(&mut self, selection_id: &str) -> Result<String> {
@@ -484,13 +497,17 @@ pub(crate) fn build_predicate_for_connection(
 pub(crate) fn build_order_by(columns: &[ColumnMeta], sort: &Option<SortSpec>) -> Result<String> {
     match sort {
         Some(sort) => {
-            let col = validate_column(columns, &sort.column)?;
-            let ident = db::quote_ident(&col.sql_name);
             let dir = match sort.direction {
                 SortDirection::Asc => "ASC",
                 SortDirection::Desc => "DESC",
             };
-            Ok(format!("ORDER BY {ident} {dir}, row_num {dir}"))
+            if sort.column == "row_num" {
+                Ok(format!("ORDER BY row_num {dir}"))
+            } else {
+                let col = validate_column(columns, &sort.column)?;
+                let ident = db::quote_ident(&col.sql_name);
+                Ok(format!("ORDER BY {ident} {dir}, row_num {dir}"))
+            }
         }
         None => Ok("ORDER BY row_num ASC".to_string()),
     }
@@ -522,20 +539,24 @@ pub fn query_rows(
     spec: &QuerySpec,
 ) -> Result<QueryPage> {
     let predicate = build_predicate_for_connection(conn, columns, spec)?;
-    let limit = spec.limit.clamp(1, 5000);
+    let limit = spec.limit.clamp(1, 100_000);
 
     let (order_sql, sort_ident) = match &spec.sort {
         Some(sort) => {
-            let col = validate_column(columns, &sort.column)?;
-            let ident = db::quote_ident(&col.sql_name);
             let dir = match sort.direction {
                 SortDirection::Asc => "ASC",
                 SortDirection::Desc => "DESC",
             };
-            (
-                format!("ORDER BY {ident} {dir}, row_num {dir}"),
-                Some(ident),
-            )
+            if sort.column == "row_num" {
+                (format!("ORDER BY row_num {dir}"), None)
+            } else {
+                let col = validate_column(columns, &sort.column)?;
+                let ident = db::quote_ident(&col.sql_name);
+                (
+                    format!("ORDER BY {ident} {dir}, row_num {dir}"),
+                    Some(ident),
+                )
+            }
         }
         None => ("ORDER BY row_num ASC".to_string(), None),
     };
@@ -547,14 +568,23 @@ pub fn query_rows(
 
     let mut cursor_params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
     if let Some(cursor) = &spec.cursor {
-        match (&spec.sort, &sort_ident, &cursor.sort_value) {
-            (Some(sort), Some(ident), Some(sort_value)) => {
+        match (&spec.sort, &sort_ident) {
+            (Some(sort), Some(ident)) => {
                 let op = match sort.direction {
                     SortDirection::Asc => ">",
                     SortDirection::Desc => "<",
                 };
                 clauses.push(format!("({ident}, row_num) {op} (?, ?)"));
-                cursor_params.push(Box::new(sort_value.clone()));
+                let val = cursor.sort_value.clone().unwrap_or_default();
+                cursor_params.push(Box::new(val));
+                cursor_params.push(Box::new(cursor.row_num));
+            }
+            (Some(sort), None) if sort.column == "row_num" => {
+                let op = match sort.direction {
+                    SortDirection::Asc => ">",
+                    SortDirection::Desc => "<",
+                };
+                clauses.push(format!("row_num {op} ?"));
                 cursor_params.push(Box::new(cursor.row_num));
             }
             _ => {
@@ -613,6 +643,7 @@ pub fn query_rows(
             let sort_value = spec
                 .sort
                 .as_ref()
+                .filter(|s| s.column != "row_num")
                 .and_then(|s| v.get(&s.column))
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
@@ -1329,5 +1360,88 @@ mod tests {
         let rows: Vec<i64> = page.rows.iter().map(|r| r["row_num"].as_i64().unwrap()).collect();
         assert_eq!(rows, vec![4]);
         assert_eq!(count_rows(&conn, &columns, &tech_spec).unwrap(), 1);
+
+        let any_spec = expression_spec(QueryExpression::IntelAny);
+        let any_page = query_rows(&conn, &columns, &any_spec).unwrap();
+        let any_rows: Vec<i64> = any_page.rows.iter().map(|r| r["row_num"].as_i64().unwrap()).collect();
+        assert_eq!(any_rows, vec![2, 4]);
+        assert_eq!(count_rows(&conn, &columns, &any_spec).unwrap(), 2);
+    }
+
+    #[test]
+    fn sorting_by_row_num_asc_and_desc_with_pagination() {
+        let (conn, columns) = setup();
+        let sort_asc = QuerySpec {
+            search: None,
+            filters: Vec::new(),
+            sort: Some(SortSpec {
+                column: "row_num".into(),
+                direction: SortDirection::Asc,
+            }),
+            expression: None,
+            cursor: None,
+            limit: 2,
+        };
+        let page1 = query_rows(&conn, &columns, &sort_asc).unwrap();
+        let rows1: Vec<i64> = page1.rows.iter().map(|r| r["row_num"].as_i64().unwrap()).collect();
+        assert_eq!(rows1, vec![1, 2]);
+        assert!(page1.has_more);
+        assert!(page1.next_cursor.is_some());
+
+        let mut sort_asc_p2 = sort_asc.clone();
+        sort_asc_p2.cursor = page1.next_cursor;
+        let page2 = query_rows(&conn, &columns, &sort_asc_p2).unwrap();
+        let rows2: Vec<i64> = page2.rows.iter().map(|r| r["row_num"].as_i64().unwrap()).collect();
+        assert_eq!(rows2, vec![3, 4]);
+
+        let sort_desc = QuerySpec {
+            search: None,
+            filters: Vec::new(),
+            sort: Some(SortSpec {
+                column: "row_num".into(),
+                direction: SortDirection::Desc,
+            }),
+            expression: None,
+            cursor: None,
+            limit: 2,
+        };
+        let page1_desc = query_rows(&conn, &columns, &sort_desc).unwrap();
+        let rows1_desc: Vec<i64> = page1_desc.rows.iter().map(|r| r["row_num"].as_i64().unwrap()).collect();
+        assert_eq!(rows1_desc, vec![5, 4]);
+        assert!(page1_desc.has_more);
+        assert!(page1_desc.next_cursor.is_some());
+
+        let mut sort_desc_p2 = sort_desc.clone();
+        sort_desc_p2.cursor = page1_desc.next_cursor;
+        let page2_desc = query_rows(&conn, &columns, &sort_desc_p2).unwrap();
+        let rows2_desc: Vec<i64> = page2_desc.rows.iter().map(|r| r["row_num"].as_i64().unwrap()).collect();
+        assert_eq!(rows2_desc, vec![3, 2]);
+    }
+
+    #[test]
+    fn sorting_by_text_column_asc_and_desc_with_pagination() {
+        let (conn, columns) = setup();
+        let sort_asc = QuerySpec {
+            search: None,
+            filters: Vec::new(),
+            sort: Some(SortSpec {
+                column: "account".into(),
+                direction: SortDirection::Asc,
+            }),
+            expression: None,
+            cursor: None,
+            limit: 2,
+        };
+        let page1 = query_rows(&conn, &columns, &sort_asc).unwrap();
+        let accounts1: Vec<String> = page1.rows.iter().map(|r| r["account"].as_str().unwrap().to_string()).collect();
+        assert_eq!(accounts1, vec!["alice", "bob"]);
+        assert!(page1.has_more);
+        assert!(page1.next_cursor.is_some());
+
+        let mut sort_asc_p2 = sort_asc.clone();
+        sort_asc_p2.cursor = page1.next_cursor;
+        let page2 = query_rows(&conn, &columns, &sort_asc_p2).unwrap();
+        let accounts2: Vec<String> = page2.rows.iter().map(|r| r["account"].as_str().unwrap().to_string()).collect();
+        assert_eq!(accounts2, vec!["dave", "eve"]);
     }
 }

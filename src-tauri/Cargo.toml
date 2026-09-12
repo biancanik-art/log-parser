@@ -1,8 +1,8 @@
 [package]
 name = "log-parser"
-version = "0.2.7"
-description = "Fast generic viewer/filter for large Excel exports (Sentinel, Taegis, Defender, etc.)"
-authors = ["log-parser contributors"]
+version = "0.2.8"
+description = "Fast offline DFIR log viewer and correlation workbench for large SIEM/EDR exports"
+authors = ["logparser-DFIR contributors"]
 edition = "2021"
 license = "Apache-2.0"
 

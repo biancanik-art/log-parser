@@ -561,7 +561,7 @@ pub fn query_spec_from_raw_intent(
             },
         }),
         cursor,
-        limit: limit.unwrap_or(200).clamp(1, 5000),
+        limit: limit.unwrap_or(200).clamp(1, 100_000),
     })
 }
 

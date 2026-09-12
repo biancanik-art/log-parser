@@ -15,6 +15,12 @@
   const reportExportBtn = document.getElementById("report-export-btn");
   const exportCsvBtn = document.getElementById("export-csv-btn");
   const exportXlsxBtn = document.getElementById("export-xlsx-btn");
+  const gridExportCsvBtn = document.getElementById("grid-export-csv-btn");
+  const gridExportXlsxBtn = document.getElementById("grid-export-xlsx-btn");
+  const timelineGeneratorCard = document.getElementById("timeline-generator-card");
+  const timelineGeneratorForm = document.getElementById("timeline-generator-form");
+  const timelineKeywordsBox = document.getElementById("timeline-keywords-box");
+  const timelineGenerateBtn = document.getElementById("timeline-generate-btn");
 
   const progressWrap = document.getElementById("progress-bar-wrap");
   const progressFill = document.getElementById("progress-fill");
@@ -127,11 +133,15 @@
 
   const rowCountLabel = document.getElementById("row-count-label");
   const pageLabel = document.getElementById("page-label");
+  const firstPageBtn = document.getElementById("first-page-btn");
   const prevPageBtn = document.getElementById("prev-page-btn");
   const nextPageBtn = document.getElementById("next-page-btn");
+  const pageSizeSelect = document.getElementById("page-size-select");
+  const selectionCountBadge = document.getElementById("selection-count-badge");
 
   // -- state --------------------------------------------------------------
-  const PAGE_SIZE = 300;
+  const DEFAULT_PAGE_SIZE = 300;
+  let pageSize = DEFAULT_PAGE_SIZE;
   // Above this many columns, the grid switches to a cheaper layout/render mode (see the
   // Tabulator setup below). Normal files here run ~50-300 columns; this exists for outliers
   // (a real 1,824-column export made "fitDataFill" + non-virtualized rendering measure every
@@ -142,6 +152,7 @@
   let table = null;
   let currentPath = null;
   let currentSheet = null;
+  let lockedColumnFields = new Set();
 
   // Multi-file tracking
   let loadedFiles = []; // array of { path, sheet, name, rowCount, columns, summary }
@@ -166,7 +177,7 @@
   let iocExtractionInFlight = false;
   let iocExtractionSummaryResult = null;
 
-  let spec = { search: null, filters: [], sort: null, expression: null, cursor: null, limit: PAGE_SIZE };
+  let spec = { search: null, filters: [], sort: null, expression: null, cursor: null, limit: pageSize };
   let cursorStack = []; // for Prev navigation
   let nextCursor = null;
   let hasMore = false;
@@ -299,11 +310,17 @@
     reportExportBtn.disabled = !enabled || sheetLoadInFlight || activeReportExport !== null;
     exportCsvBtn.disabled = !enabled;
     exportXlsxBtn.disabled = !enabled;
+    if (gridExportCsvBtn) gridExportCsvBtn.disabled = !enabled;
+    if (gridExportXlsxBtn) gridExportXlsxBtn.disabled = !enabled;
     addFilterBtn.disabled = !enabled;
     applyBtn.disabled = !enabled;
     clearBtn.disabled = !enabled;
     reviewRolesBtn.disabled = !enabled;
     manageIgnoreRulesBtn.disabled = !enabled;
+    if (pageSizeSelect) pageSizeSelect.disabled = !enabled;
+    if (firstPageBtn) firstPageBtn.disabled = !enabled || cursorStack.length === 0;
+    if (timelineKeywordsBox) timelineKeywordsBox.disabled = !enabled;
+    if (timelineGenerateBtn) timelineGenerateBtn.disabled = !enabled;
     aiSearchAvailability.textContent = enabled
       ? "Ready to search every imported row. No enrichment scan is required."
       : "Import a file to search its evidence.";
@@ -326,6 +343,8 @@
     reportExportBtn.disabled = inFlight || !controlsEnabled || activeReportExport !== null;
     exportCsvBtn.disabled = inFlight || !controlsEnabled;
     exportXlsxBtn.disabled = inFlight || !controlsEnabled;
+    if (gridExportCsvBtn) gridExportCsvBtn.disabled = inFlight || !controlsEnabled;
+    if (gridExportXlsxBtn) gridExportXlsxBtn.disabled = inFlight || !controlsEnabled;
     addFilterBtn.disabled = inFlight || !controlsEnabled;
     applyBtn.disabled = inFlight || !controlsEnabled;
     clearBtn.disabled = inFlight || !controlsEnabled;
@@ -334,11 +353,15 @@
     extractIocsBtn.disabled = inFlight || !controlsEnabled || iocExtractionInFlight;
     manageIgnoreRulesBtn.disabled = inFlight || !controlsEnabled;
     if (inFlight) {
+      if (firstPageBtn) firstPageBtn.disabled = true;
       prevPageBtn.disabled = true;
       nextPageBtn.disabled = true;
+      if (pageSizeSelect) pageSizeSelect.disabled = true;
     } else {
+      if (firstPageBtn) firstPageBtn.disabled = cursorStack.length === 0;
       prevPageBtn.disabled = cursorStack.length === 0;
       nextPageBtn.disabled = !hasMore;
+      if (pageSizeSelect) pageSizeSelect.disabled = !controlsEnabled;
       updateEvidenceColumnsUi();
     }
     updateGuidedInteractionControls();
@@ -393,9 +416,13 @@
     guidedRunBtn.disabled = tableTransition || activeReportExport !== null;
     guidedRejectBtn.disabled = tableTransition || activeReportExport !== null;
     guidedResetBtn.disabled = tableTransition || activeReportExport !== null;
+    if (timelineKeywordsBox) timelineKeywordsBox.disabled = guidedSearchBox.disabled;
+    if (timelineGenerateBtn) timelineGenerateBtn.disabled = guidedSearchSubmit.disabled;
     searchBox.disabled = tableControlsBlocked;
     exportCsvBtn.disabled = tableControlsBlocked;
     exportXlsxBtn.disabled = tableControlsBlocked;
+    if (gridExportCsvBtn) gridExportCsvBtn.disabled = tableControlsBlocked;
+    if (gridExportXlsxBtn) gridExportXlsxBtn.disabled = tableControlsBlocked;
     reportExportBtn.disabled = tableControlsBlocked || activeReportExport !== null;
     addFilterBtn.disabled = tableControlsBlocked;
     applyBtn.disabled = tableControlsBlocked;
@@ -1026,16 +1053,18 @@
     updateEvidenceColumnsUi();
   }
 
-  function filterGridByIntel(filterType, filterValue, displayName) {
-    if (sheetLoadInFlight || tableTransitionInFlight()) return;
+  async function filterGridByIntel(filterType, filterValue, displayName) {
+    if (sheetLoadInFlight || tableTransitionInFlight()) return null;
     discardGuidedPlanForTableAction();
-    queryMode = "querySpec";
+    queryMode = "normal";
     activeEvidenceQuery = null;
     spec.search = null;
     searchBox.value = "";
     spec.filters = [];
     filterList.innerHTML = "";
     spec.sort = null;
+    if (sortColumn) sortColumn.value = "";
+    if (sortDirection) sortDirection.value = "asc";
 
     if (filterType === "tactic") {
       spec.expression = { type: "intelTactic", name: filterValue };
@@ -1043,22 +1072,31 @@
     } else if (filterType === "technique") {
       spec.expression = { type: "intelTechnique", id: filterValue };
       gridFilterDescription = displayName || `MITRE Technique: ${filterValue}`;
-    } else if (filterType === "chain") {
+    } else if (filterType === "chain" || filterType === "rows") {
       if (Array.isArray(filterValue) && filterValue.length > 0) {
         spec.expression = { type: "rowIds", values: filterValue };
-        gridFilterDescription = displayName || `Attack Chain (${filterValue.length} steps)`;
+        gridFilterDescription = displayName || `Evidence (${filterValue.length} rows)`;
       }
+    } else if (filterType === "all") {
+      spec.expression = { type: "intelAny" };
+      gridFilterDescription = displayName || "All MITRE / Threat Matches";
     }
 
     resetPagination();
-    refreshData();
-    refreshCount();
-    updateGridActiveFilterBar();
     switchTab("tab-grid");
+    updateGridActiveFilterBar();
     guidedResetBtn.classList.remove("hidden");
-    guidedResetBtn.textContent = `✕ Clear Filter (${displayName})`;
-    aiSearchAvailability.textContent = `Filtered to MITRE ${filterType}: ${displayName}`;
+    guidedResetBtn.textContent = `✕ Clear Filter (${displayName || "Filtered"})`;
+    aiSearchAvailability.textContent = `Filtered to ${displayName || filterType}`;
     aiSearchAvailability.classList.add("ready");
+
+    const page = await refreshData();
+    refreshCount();
+    if (table && typeof table.selectAll === "function") {
+      table.selectAll();
+    }
+    updateTableSortVisuals();
+    return page;
   }
 
   function renderScanSummary(summary) {
@@ -1355,8 +1393,27 @@
     const rawUrls = summary.urlIndicators || [];
     const rawEmails = summary.emailIndicators || [];
     const rawUas = summary.userAgentIndicators || [];
+    const rawCorrelations = summary.correlationIndicators || [];
 
-    const totalRaw = rawIps.length + rawDomains.length + rawUrls.length + rawEmails.length + rawUas.length;
+    const rawCorrIds = rawCorrelations.filter((c) => c.kind === "correlation_id");
+    const rawSessionIds = rawCorrelations.filter((c) => c.kind === "session_id");
+    const rawDeviceIds = rawCorrelations.filter((c) => c.kind === "device_id");
+    const rawAppIds = rawCorrelations.filter((c) => c.kind === "app_id");
+    const rawTokenIds = rawCorrelations.filter((c) => c.kind === "unique_token_id");
+    const rawHashes = rawCorrelations.filter((c) => c.kind === "hash");
+    const rawMailboxGuids = rawCorrelations.filter((c) => c.kind === "mailbox_guid");
+    const rawMsgIds = rawCorrelations.filter(
+      (c) => c.kind === "internet_message_id" || c.kind === "network_message_id" || c.kind === "message_id"
+    );
+    const rawFileIds = rawCorrelations.filter((c) => c.kind === "file_id");
+
+    const totalRaw =
+      rawIps.length +
+      rawDomains.length +
+      rawUrls.length +
+      rawEmails.length +
+      rawUas.length +
+      rawCorrelations.length;
 
     // Update tab badge
     if (badgeIocs) {
@@ -1375,6 +1432,7 @@
     // Filter by search text
     const filterTerm = (currentIocFilterText || "").toLowerCase().trim();
     const matchesFilter = (str) => !filterTerm || (typeof str === "string" && str.toLowerCase().includes(filterTerm));
+    const matchesCorr = (c) => matchesFilter(c.value) || matchesFilter(c.kind) || matchesFilter(c.sourceColumn);
 
     const filteredIps = rawIps.filter((i) => matchesFilter(i.ip) || matchesFilter(i.vpnLabel) || (i.sourceColumns || []).some(matchesFilter));
     const filteredDomains = rawDomains.filter((d) => matchesFilter(d.domain));
@@ -1382,15 +1440,39 @@
     const filteredEmails = rawEmails.filter((e) => matchesFilter(e.email));
     const filteredUas = rawUas.filter((u) => matchesFilter(u.userAgent));
 
-    const totalFiltered = filteredIps.length + filteredDomains.length + filteredUrls.length + filteredEmails.length + filteredUas.length;
+    const filteredCorrIds = rawCorrIds.filter(matchesCorr);
+    const filteredSessionIds = rawSessionIds.filter(matchesCorr);
+    const filteredDeviceIds = rawDeviceIds.filter(matchesCorr);
+    const filteredAppIds = rawAppIds.filter(matchesCorr);
+    const filteredTokenIds = rawTokenIds.filter(matchesCorr);
+    const filteredHashes = rawHashes.filter(matchesCorr);
+    const filteredMailboxGuids = rawMailboxGuids.filter(matchesCorr);
+    const filteredMsgIds = rawMsgIds.filter(matchesCorr);
+    const filteredFileIds = rawFileIds.filter(matchesCorr);
+
+    const totalFiltered =
+      filteredIps.length +
+      filteredDomains.length +
+      filteredUrls.length +
+      filteredEmails.length +
+      filteredUas.length +
+      filteredCorrIds.length +
+      filteredSessionIds.length +
+      filteredDeviceIds.length +
+      filteredAppIds.length +
+      filteredTokenIds.length +
+      filteredHashes.length +
+      filteredMailboxGuids.length +
+      filteredMsgIds.length +
+      filteredFileIds.length;
 
     if (iocPanelSummary) {
-      iocPanelSummary.textContent = `${totalRaw.toLocaleString()} indicators (${rawIps.length} IPs, ${rawDomains.length} domains, ${rawUrls.length} URLs, ${rawEmails.length} emails, ${rawUas.length} user agents)`;
+      iocPanelSummary.textContent = `${totalRaw.toLocaleString()} indicators (${rawIps.length} IPs, ${rawDomains.length} domains, ${rawCorrelations.length} correlation indicators, ${rawUrls.length} URLs, ${rawEmails.length} emails, ${rawUas.length} user agents)`;
     }
 
     if (iocStats) {
       const filterNote = filterTerm ? ` (showing ${totalFiltered.toLocaleString()} matching "${filterTerm}")` : "";
-      iocStats.textContent = `Scanned ${summary.rowsScanned.toLocaleString()} rows — found ${totalRaw.toLocaleString()} unique indicators across evidence columns${filterNote}. Click any indicator to filter the evidence grid.`;
+      iocStats.textContent = `Scanned ${summary.rowsScanned.toLocaleString()} rows — found ${totalRaw.toLocaleString()} unique indicators (including correlation IDs, sessions, devices, hashes) across evidence columns${filterNote}. Click any indicator to filter the evidence grid.`;
     }
 
     function createClickableCell(text, queryValue = text) {
@@ -1437,7 +1519,7 @@
       sectionCopy.className = "btn btn-small";
       sectionCopy.textContent = "Copy Group";
       sectionCopy.addEventListener("click", () => {
-        const textLines = items.map((it) => it.ip || it.domain || it.url || it.email || it.userAgent).join("\n");
+        const textLines = items.map((it) => it.value || it.ip || it.domain || it.url || it.email || it.userAgent).join("\n");
         navigator.clipboard.writeText(textLines).then(() => {
           sectionCopy.textContent = "✓ Copied!";
           setTimeout(() => { sectionCopy.textContent = "Copy Group"; }, 1500);
@@ -1492,8 +1574,88 @@
       return section;
     }
 
+    function createCorrelationSection(title, items, defaultColHeader = "Source Column") {
+      return createIocSection(
+        title,
+        items.length,
+        items,
+        (tr, item) => {
+          tr.appendChild(createClickableCell(item.value));
+          const tdCount = document.createElement("td");
+          tdCount.style.padding = "6px 8px";
+          tdCount.textContent = item.occurrenceCount.toLocaleString();
+          tr.appendChild(tdCount);
+          const tdRow = document.createElement("td");
+          tdRow.style.padding = "6px 8px";
+          tdRow.textContent = `Row ${item.firstRow.toLocaleString()}`;
+          tr.appendChild(tdRow);
+          const tdCol = document.createElement("td");
+          tdCol.style.padding = "6px 8px";
+          tdCol.textContent = item.sourceColumn || "—";
+          tr.appendChild(tdCol);
+        },
+        ["Indicator Value", "Count", "First Seen", defaultColHeader]
+      );
+    }
+
     const showAll = currentIocCategory === "all";
 
+    // Correlation indicators
+    if ((showAll && filteredCorrIds.length > 0) || currentIocCategory === "correlation_id") {
+      iocResultsContent.appendChild(
+        createCorrelationSection("Correlation & Request IDs", filteredCorrIds)
+      );
+    }
+
+    if ((showAll && filteredSessionIds.length > 0) || currentIocCategory === "session_id") {
+      iocResultsContent.appendChild(
+        createCorrelationSection("Session IDs (AAD / Logon)", filteredSessionIds)
+      );
+    }
+
+    if ((showAll && filteredDeviceIds.length > 0) || currentIocCategory === "device_id") {
+      iocResultsContent.appendChild(
+        createCorrelationSection("Device IDs & Machine IDs", filteredDeviceIds)
+      );
+    }
+
+    if ((showAll && filteredAppIds.length > 0) || currentIocCategory === "app_id") {
+      iocResultsContent.appendChild(
+        createCorrelationSection("Application & Client App IDs", filteredAppIds)
+      );
+    }
+
+    if ((showAll && filteredTokenIds.length > 0) || currentIocCategory === "unique_token_id") {
+      iocResultsContent.appendChild(
+        createCorrelationSection("Unique Token IDs (jti)", filteredTokenIds)
+      );
+    }
+
+    if ((showAll && filteredHashes.length > 0) || currentIocCategory === "hash") {
+      iocResultsContent.appendChild(
+        createCorrelationSection("File Hashes (MD5 / SHA1 / SHA256)", filteredHashes)
+      );
+    }
+
+    if ((showAll && filteredMailboxGuids.length > 0) || currentIocCategory === "mailbox_guid") {
+      iocResultsContent.appendChild(
+        createCorrelationSection("Mailbox GUIDs", filteredMailboxGuids)
+      );
+    }
+
+    if ((showAll && filteredMsgIds.length > 0) || currentIocCategory === "message_id") {
+      iocResultsContent.appendChild(
+        createCorrelationSection("Message IDs (Network & Internet)", filteredMsgIds)
+      );
+    }
+
+    if ((showAll && filteredFileIds.length > 0) || currentIocCategory === "file_id") {
+      iocResultsContent.appendChild(
+        createCorrelationSection("File & Object IDs", filteredFileIds)
+      );
+    }
+
+    // Standard IOCs
     if (showAll || currentIocCategory === "ip") {
       iocResultsContent.appendChild(
         createIocSection(
@@ -1639,6 +1801,15 @@
     if (!iocExtractionSummaryResult) return;
     const s = iocExtractionSummaryResult;
     const lines = [];
+
+    const correlations = s.correlationIndicators || [];
+    if (correlations.length > 0) {
+      lines.push(`=== CORRELATION & OBJECT INDICATORS (${correlations.length}) ===`);
+      correlations.forEach((c) =>
+        lines.push(`[${c.kind}]\t${c.value}\tCount: ${c.occurrenceCount}\tCol: ${c.sourceColumn || "-"}`)
+      );
+      lines.push("");
+    }
 
     const ips = s.ipIndicators || [];
     if (ips.length > 0) {
@@ -1806,7 +1977,7 @@
       sort: null,
       expression: normalizeQueryExpression(candidate.expression),
       cursor: null,
-      limit: PAGE_SIZE,
+      limit: pageSize,
     };
     if (
       normalized.search !== null &&
@@ -2031,6 +2202,7 @@
 
   function resetPagination() {
     spec.cursor = null;
+    spec.limit = pageSize;
     cursorStack = [];
     nextCursor = null;
     hasMore = false;
@@ -2044,9 +2216,9 @@
       sort: sortColumn.value
         ? { column: sortColumn.value, direction: sortDirection.value }
         : null,
-      expression: null,
+      expression: spec.expression ? JSON.parse(JSON.stringify(spec.expression)) : null,
       cursor: forExport ? null : spec.cursor,
-      limit: PAGE_SIZE,
+      limit: pageSize,
     };
     return s;
   }
@@ -2111,15 +2283,29 @@
 
   function updateRowCountLabel() {
     const shown = table ? table.getDataCount() : 0;
+    const totalPages = totalCount !== null ? Math.max(1, Math.ceil(totalCount / pageSize)) : null;
+
     if (totalCount === null) {
       rowCountLabel.textContent =
         ["guided", "querySpec"].includes(queryMode)
-          ? `${shown} AI evidence rows on this page`
-          : `${shown} rows on this page`;
+          ? `${shown.toLocaleString()} AI evidence rows on this page`
+          : `${shown.toLocaleString()} rows on this page`;
+      pageLabel.textContent = `page ${pageIndex}`;
+    } else if (totalCount === 0) {
+      rowCountLabel.textContent = "0 matching rows";
+      pageLabel.textContent = "page 1 of 1";
     } else {
-      rowCountLabel.textContent = `${totalCount.toLocaleString()} ${["guided", "querySpec"].includes(queryMode) ? "evidence" : "matching"} rows`;
+      const start = (pageIndex - 1) * pageSize + 1;
+      const end = Math.min(start + shown - 1, totalCount);
+      const rowRange = shown > 0 ? `Showing ${start.toLocaleString()}–${end.toLocaleString()} of ` : "";
+      rowCountLabel.textContent = `${rowRange}${totalCount.toLocaleString()} ${["guided", "querySpec"].includes(queryMode) ? "evidence" : "matching"} rows`;
+      pageLabel.textContent = totalPages !== null ? `page ${pageIndex} of ${totalPages.toLocaleString()}` : `page ${pageIndex}`;
     }
-    pageLabel.textContent = `page ${pageIndex}`;
+
+    if (firstPageBtn) firstPageBtn.disabled = cursorStack.length === 0;
+    if (prevPageBtn) prevPageBtn.disabled = cursorStack.length === 0;
+    if (nextPageBtn) nextPageBtn.disabled = !hasMore;
+    if (pageSizeSelect) pageSizeSelect.disabled = !controlsEnabled || sheetLoadInFlight;
     if (badgeGrid) {
       if (totalCount !== null) {
         badgeGrid.textContent = totalCount.toLocaleString();
@@ -2156,7 +2342,7 @@
     const modeAtStart = queryMode;
     const isGuidedRequest = modeAtStart === "guided";
     const isQuerySpecRequest = modeAtStart === "querySpec";
-    const isTrackedEvidenceRequest = isGuidedRequest || isQuerySpecRequest;
+    const isTrackedEvidenceRequest = (isGuidedRequest || isQuerySpecRequest) && activeEvidenceQuery !== null;
     if (isTrackedEvidenceRequest && guidedActiveQuery !== null) return null;
     const evidenceQuery = isTrackedEvidenceRequest ? activeEvidenceQuery : null;
     if (isTrackedEvidenceRequest && evidenceQuery?.mode !== modeAtStart) return null;
@@ -2190,8 +2376,10 @@
       (!isTrackedEvidenceRequest || activeEvidenceQuery === request.evidenceQuery) &&
       table === request.table;
 
+    if (firstPageBtn) firstPageBtn.disabled = true;
     prevPageBtn.disabled = true;
     nextPageBtn.disabled = true;
+    if (pageSizeSelect) pageSizeSelect.disabled = true;
     showProgress(
       isGuidedRequest
         ? "Searching evidence..."
@@ -2216,6 +2404,7 @@
       nextCursor = page.nextCursor;
       hasMore = page.hasMore;
       updateRowCountLabel();
+      updateTableSortVisuals();
       return page;
     } catch (err) {
       if (!requestIsCurrent()) return null;
@@ -2233,8 +2422,10 @@
         updateGuidedInteractionControls();
       }
       if (stillCurrent) {
+        if (firstPageBtn) firstPageBtn.disabled = cursorStack.length === 0;
         prevPageBtn.disabled = cursorStack.length === 0;
         nextPageBtn.disabled = !hasMore;
+        if (pageSizeSelect) pageSizeSelect.disabled = !controlsEnabled || sheetLoadInFlight;
         hideProgress();
       }
     }
@@ -2306,8 +2497,10 @@
           desc = `MITRE Tactic: ${spec.expression.name}`;
         } else if (spec.expression.type === "intelTechnique") {
           desc = `MITRE Technique: ${spec.expression.id}`;
+        } else if (spec.expression.type === "intelAny") {
+          desc = "All Detected MITRE Threat Matches";
         } else if (spec.expression.type === "rowIds") {
-          desc = `Attack Chain (${spec.expression.values ? spec.expression.values.length : 0} steps)`;
+          desc = `Evidence (${spec.expression.values ? spec.expression.values.length : 0} rows)`;
         } else {
           desc = "Threat Intelligence Match";
         }
@@ -2328,32 +2521,81 @@
     gridFilterDescription = null;
     searchBox.value = "";
     filterList.innerHTML = "";
-    sortColumn.value = "";
+    if (sortColumn) sortColumn.value = "";
+    if (sortDirection) sortDirection.value = "asc";
+    spec.expression = null;
     resetGuidedQueryUi({ invalidateDataset: false });
     aiSearchAvailability.textContent = "Ready to search every imported row. No enrichment scan is required.";
     aiSearchAvailability.classList.add("ready");
     applyControlsAndReload();
     updateGridActiveFilterBar();
+    updateTableSortVisuals();
+  }
+
+  function updateTableSortVisuals() {
+    if (!table || typeof table.getColumns !== "function") return;
+    const activeCol = sortColumn ? sortColumn.value : "";
+    const activeDir = sortDirection ? sortDirection.value : "asc";
+
+    table.getColumns().forEach((col) => {
+      const el = col.getElement();
+      if (!el) return;
+      const field = col.getField();
+      if (field && ((activeCol && field === activeCol) || (activeCol === "" && field === "row_num" && activeDir === "asc"))) {
+        el.setAttribute("aria-sort", activeDir === "desc" ? "descending" : "ascending");
+        el.classList.add("sorted-col");
+      } else {
+        el.removeAttribute("aria-sort");
+        el.classList.remove("sorted-col");
+      }
+    });
   }
 
   function applyControlsAndReload() {
     cancelSearchDebounce();
     if (sheetLoadInFlight || tableTransitionInFlight()) return null;
-    discardGuidedPlanForTableAction();
-    queryMode = "normal";
-    activeEvidenceQuery = null;
-    setAiMatchColumnVisible(false);
-    guidedResetBtn.classList.add("hidden");
-    spec.search = searchBox.value.trim() || null;
-    spec.filters = currentFilterValues();
+
+    const hasActiveAiFilter =
+      (queryMode === "querySpec" || queryMode === "guided") &&
+      activeEvidenceQuery?.querySpec;
+    const hasActiveIntelFilter = Boolean(spec.expression);
+    const hasManualFilters =
+      searchBox.value.trim() !== "" || currentFilterValues().length > 0;
+    const preservingAiFilter = hasActiveAiFilter && !hasManualFilters;
+    const preservingIntelFilter = hasActiveIntelFilter && !hasManualFilters;
+
+    if (preservingAiFilter) {
+      queryMode = "querySpec";
+      spec = {
+        ...snapshotQuerySpec(activeEvidenceQuery.querySpec),
+        cursor: null,
+        limit: pageSize,
+      };
+    } else if (preservingIntelFilter) {
+      queryMode = "normal";
+      spec.cursor = null;
+      spec.limit = pageSize;
+    } else {
+      discardGuidedPlanForTableAction();
+      queryMode = "normal";
+      activeEvidenceQuery = null;
+      setAiMatchColumnVisible(false);
+      guidedResetBtn.classList.add("hidden");
+      spec.search = searchBox.value.trim() || null;
+      spec.filters = currentFilterValues();
+      spec.expression = null;
+      gridFilterDescription = null;
+    }
+
     spec.sort = sortColumn.value
       ? { column: sortColumn.value, direction: sortDirection.value }
-      : null;
-    spec.expression = null;
+      : (preservingAiFilter ? activeEvidenceQuery?.querySpec?.sort || null : null);
+
     resetPagination();
     const page = refreshData();
     refreshCount();
     updateGridActiveFilterBar();
+    updateTableSortVisuals();
     return page;
   }
 
@@ -2735,6 +2977,34 @@
           (row) => row.role === "timestamp" && row.status !== "rejected" && row.confidence >= 0.75
         );
         if (timestampSuggestion) {
+          if (
+            lockedColumnFields.size === 0 ||
+            (lockedColumnFields.size === 1 &&
+              !lockedColumnFields.has(timestampSuggestion.sqlName) &&
+              columns.length > 0 &&
+              lockedColumnFields.has(columns[0].sqlName) &&
+              columns[0].inferredType !== "timestamp")
+          ) {
+            lockedColumnFields = new Set([timestampSuggestion.sqlName]);
+            if (activeFileIndex >= 0 && loadedFiles[activeFileIndex]) {
+              loadedFiles[activeFileIndex].lockedColumnFields = new Set(lockedColumnFields);
+            }
+            if (table && typeof table.setColumns === "function") {
+              const isAiMatchVisible = Boolean(table.getColumn("__aiMatch")?.isVisible());
+              const selectedIds =
+                typeof table.getSelectedData === "function"
+                  ? table.getSelectedData().map((r) => r.row_num)
+                  : [];
+              table.setColumns(buildTabulatorColumns());
+              if (isAiMatchVisible) {
+                setAiMatchColumnVisible(true);
+              }
+              if (selectedIds.length > 0 && typeof table.selectRow === "function") {
+                selectedIds.forEach((id) => table.selectRow(id));
+              }
+              updateTableSortVisuals();
+            }
+          }
           await analyzeAutomaticTimestampMapping(timestampSuggestion, request);
         }
       }
@@ -3132,8 +3402,10 @@
     const targetTable = table;
     if (!targetTable) throw new Error("the evidence table is not available");
     const previousRows = targetTable.getData();
+    if (firstPageBtn) firstPageBtn.disabled = true;
     prevPageBtn.disabled = true;
     nextPageBtn.disabled = true;
+    if (pageSizeSelect) pageSizeSelect.disabled = true;
     showProgress("Searching evidence...", 0.5);
     try {
       const page =
@@ -3142,10 +3414,10 @@
               intentToken: action.intentToken,
               auditId: action.auditId,
               cursor: null,
-              limit: PAGE_SIZE,
+              limit: pageSize,
             })
           : await invoke("query_rows", {
-              spec: { ...action.querySpec, cursor: null, limit: PAGE_SIZE },
+              spec: { ...action.querySpec, cursor: null, limit: pageSize },
             });
       if (!guidedActionIsCurrent(action) || table !== targetTable) return null;
       if (!page || !Array.isArray(page.rows)) {
@@ -3161,8 +3433,10 @@
       return page;
     } finally {
       if (guidedActionIsCurrent(action)) {
+        if (firstPageBtn) firstPageBtn.disabled = cursorStack.length === 0;
         prevPageBtn.disabled = cursorStack.length === 0;
         nextPageBtn.disabled = !hasMore;
+        if (pageSizeSelect) pageSizeSelect.disabled = !controlsEnabled || sheetLoadInFlight;
         hideProgress();
       }
     }
@@ -3170,7 +3444,7 @@
 
   function publishInitialEvidencePage(action, mode, page) {
     if (mode === "querySpec") {
-      spec = { ...action.querySpec, cursor: null, limit: PAGE_SIZE };
+      spec = { ...action.querySpec, cursor: null, limit: pageSize };
     }
     queryMode = mode;
     totalCount = null;
@@ -3187,8 +3461,10 @@
     guidedResetBtn.classList.remove("hidden");
     guidedRunBtn.textContent = "Search evidence";
     guidedRunBtn.classList.remove("hidden");
+    if (firstPageBtn) firstPageBtn.disabled = true;
     prevPageBtn.disabled = true;
     nextPageBtn.disabled = !hasMore;
+    if (pageSizeSelect) pageSizeSelect.disabled = !controlsEnabled || sheetLoadInFlight;
     updateRowCountLabel();
     refreshCount();
     gridFilterDescription = guidedSearchBox.value.trim() ? `AI Evidence: "${guidedSearchBox.value.trim()}"` : "AI Evidence Search";
@@ -3460,6 +3736,287 @@
     }
   }
 
+  function findFirstDateTimeColumn(colList, roleSuggestions = []) {
+    if (!Array.isArray(colList) || colList.length === 0) return null;
+
+    // 1. Check if columnRoleSuggestions has a confirmed/suggested timestamp role
+    if (Array.isArray(roleSuggestions) && roleSuggestions.length > 0) {
+      const tsRole = roleSuggestions.find(
+        (r) => r.role === "timestamp" && r.status !== "rejected"
+      );
+      if (tsRole) {
+        const match = colList.find((c) => c.sqlName === tsRole.sqlName);
+        if (match) return match;
+      }
+    }
+
+    // 2. Inferred type timestamp (from header_utils / db)
+    const inferredTs = colList.find((c) => c.inferredType === "timestamp");
+    if (inferredTs) return inferredTs;
+
+    // 3. Strong date/time patterns in order of columns (first column with date/time)
+    const exactDateTimeRegex = /^(date_?time|timestamp|timegenerated|event_?time|created_?at|log_?time|start_?time|record_?time|@timestamp|_time)$/i;
+    for (const col of colList) {
+      if (exactDateTimeRegex.test(col.originalName || "") || exactDateTimeRegex.test(col.sqlName || "")) {
+        return col;
+      }
+    }
+
+    // 4. Broader date/time token match
+    const broadRegex = /\b(timestamp|datetime|timegenerated|eventtime|logtime|@timestamp)\b/i;
+    for (const col of colList) {
+      if (broadRegex.test(col.originalName || "") || broadRegex.test(col.sqlName || "")) {
+        return col;
+      }
+    }
+
+    // 5. Separate date or time token
+    const dateOrTimeRegex = /\b(date|time)\b/i;
+    for (const col of colList) {
+      if (dateOrTimeRegex.test(col.originalName || "") || dateOrTimeRegex.test(col.sqlName || "")) {
+        return col;
+      }
+    }
+
+    // 6. Substring match for date or time
+    for (const col of colList) {
+      const orig = (col.originalName || "").toLowerCase();
+      const sql = (col.sqlName || "").toLowerCase();
+      if (orig.includes("time") || orig.includes("date") || sql.includes("time") || sql.includes("date")) {
+        return col;
+      }
+    }
+
+    // 7. Fallback: First data column
+    return colList[0] || null;
+  }
+
+  function findInitialLockedColumns(colList, roleSuggestions = []) {
+    if (!Array.isArray(colList) || colList.length === 0) return [];
+
+    const firstTs = findFirstDateTimeColumn(colList, roleSuggestions);
+    if (!firstTs) {
+      return [colList[0]];
+    }
+
+    const result = [firstTs];
+
+    // Check if firstTs is "date" (without "time") and the adjacent column is "time"
+    const origLower = (firstTs.originalName || "").toLowerCase();
+    const sqlLower = (firstTs.sqlName || "").toLowerCase();
+    const isDateOnly =
+      (origLower.includes("date") || sqlLower.includes("date")) &&
+      !origLower.includes("time") &&
+      !sqlLower.includes("time");
+
+    if (isDateOnly) {
+      const idx = colList.findIndex((c) => c.sqlName === firstTs.sqlName);
+      if (idx !== -1 && idx + 1 < colList.length) {
+        const nextCol = colList[idx + 1];
+        const nextOrig = (nextCol.originalName || "").toLowerCase();
+        const nextSql = (nextCol.sqlName || "").toLowerCase();
+        if (
+          (nextOrig.includes("time") || nextSql.includes("time")) &&
+          !nextOrig.includes("date") &&
+          !nextSql.includes("date")
+        ) {
+          result.push(nextCol);
+        }
+      }
+    }
+
+    return result;
+  }
+
+  function toggleColumnLock(sqlName) {
+    if (sheetLoadInFlight || tableTransitionInFlight()) return;
+    if (lockedColumnFields.has(sqlName)) {
+      lockedColumnFields.delete(sqlName);
+    } else {
+      lockedColumnFields.add(sqlName);
+    }
+
+    if (activeFileIndex >= 0 && loadedFiles[activeFileIndex]) {
+      loadedFiles[activeFileIndex].lockedColumnFields = new Set(lockedColumnFields);
+    }
+
+    if (table && typeof table.setColumns === "function") {
+      const isAiMatchVisible = Boolean(table.getColumn("__aiMatch")?.isVisible());
+      const selectedIds =
+        typeof table.getSelectedData === "function"
+          ? table.getSelectedData().map((r) => r.row_num)
+          : [];
+
+      const tabulatorColumns = buildTabulatorColumns();
+      table.setColumns(tabulatorColumns);
+
+      if (isAiMatchVisible) {
+        setAiMatchColumnVisible(true);
+      }
+      if (selectedIds.length > 0 && typeof table.selectRow === "function") {
+        selectedIds.forEach((id) => table.selectRow(id));
+      }
+      updateTableSortVisuals();
+    }
+  }
+
+  let headerClickTimer = null;
+  let lastHeaderClickField = null;
+  let lastLockToggleTime = 0;
+
+  function handleColumnHeaderClick(field) {
+    if (sheetLoadInFlight || tableTransitionInFlight()) return;
+    if (!field) return;
+
+    if (headerClickTimer && lastHeaderClickField === field) {
+      clearTimeout(headerClickTimer);
+      headerClickTimer = null;
+      lastHeaderClickField = null;
+      lastLockToggleTime = Date.now();
+      toggleColumnLock(field);
+      return;
+    }
+
+    if (headerClickTimer) {
+      clearTimeout(headerClickTimer);
+    }
+    lastHeaderClickField = field;
+    headerClickTimer = setTimeout(() => {
+      headerClickTimer = null;
+      lastHeaderClickField = null;
+      if (sheetLoadInFlight || tableTransitionInFlight()) return;
+      if (sortColumn.value === field) {
+        sortDirection.value = sortDirection.value === "asc" ? "desc" : "asc";
+      } else {
+        sortColumn.value = field;
+        sortDirection.value = "asc";
+      }
+      applyControlsAndReload();
+    }, 250);
+  }
+
+  function handleColumnHeaderDblClick(field) {
+    if (sheetLoadInFlight || tableTransitionInFlight()) return;
+    if (!field) return;
+    if (Date.now() - lastLockToggleTime < 400) {
+      return;
+    }
+    if (headerClickTimer) {
+      clearTimeout(headerClickTimer);
+      headerClickTimer = null;
+      lastHeaderClickField = null;
+    }
+    lastLockToggleTime = Date.now();
+    toggleColumnLock(field);
+  }
+
+  function buildTabulatorColumns() {
+    const isWideGrid = columns.length > WIDE_GRID_COLUMN_THRESHOLD;
+
+    const lockedCols = [];
+    const unlockedCols = [];
+
+    columns.forEach((c) => {
+      if (lockedColumnFields.has(c.sqlName)) {
+        lockedCols.push(c);
+      } else {
+        unlockedCols.push(c);
+      }
+    });
+
+    function createDataColumnDef(c, isFrozen) {
+      return {
+        title: c.originalName,
+        field: c.sqlName,
+        headerSort: false,
+        resizable: true,
+        frozen: isFrozen,
+        minWidth: isFrozen ? 140 : 80,
+        headerTooltip: isFrozen
+          ? "Pinned column · Click to sort · Double-click to unpin"
+          : "Click to sort · Double-click to pin column to left",
+        ...(isWideGrid ? { width: 160 } : {}),
+        titleFormatter() {
+          const wrapper = document.createElement("span");
+          wrapper.className = "col-header-inner";
+
+          const titleText = document.createElement("span");
+          titleText.className = "col-title-text";
+          titleText.textContent = c.originalName;
+          wrapper.appendChild(titleText);
+
+          const pinBtn = document.createElement("button");
+          pinBtn.type = "button";
+          pinBtn.className = isFrozen ? "col-pin-btn is-pinned" : "col-pin-btn";
+          pinBtn.title = isFrozen
+            ? "Pinned timeline column (click or double-click header to unpin)"
+            : "Pin column to left (or double-click header)";
+          pinBtn.innerHTML = isFrozen ? "📌" : "📍";
+          pinBtn.addEventListener("click", (e) => {
+            e.stopPropagation();
+            e.preventDefault();
+            toggleColumnLock(c.sqlName);
+          });
+          wrapper.appendChild(pinBtn);
+
+          return wrapper;
+        },
+        headerClick(e, col) {
+          handleColumnHeaderClick(col.getField());
+        },
+        headerDblClick(e, col) {
+          handleColumnHeaderDblClick(col.getField());
+        },
+      };
+    }
+
+    return [
+      {
+        title: "#",
+        field: "row_num",
+        width: 70,
+        headerSort: false,
+        frozen: true,
+        headerClick() {
+          if (sheetLoadInFlight || tableTransitionInFlight()) return;
+          if (sortColumn.value === "row_num" || sortColumn.value === "") {
+            sortDirection.value = sortDirection.value === "asc" ? "desc" : "asc";
+            sortColumn.value = "row_num";
+          } else {
+            sortColumn.value = "row_num";
+            sortDirection.value = "asc";
+          }
+          applyControlsAndReload();
+        },
+      },
+      ...lockedCols.map((c) => createDataColumnDef(c, true)),
+      {
+        title: "Why matched",
+        field: "__aiMatch",
+        width: 250,
+        minWidth: 180,
+        headerSort: false,
+        visible: false,
+        formatter(cell) {
+          const rawReasons = cell.getValue();
+          const reasons = Array.isArray(rawReasons)
+            ? rawReasons.filter((reason) => typeof reason === "string" && reason.trim())
+            : [];
+          const element = document.createElement("div");
+          element.className = "ai-match-reason";
+          if (reasons.length === 0) {
+            element.textContent = "AI search plan match";
+            return element;
+          }
+          element.textContent = reasons.length > 1 ? `${reasons[0]} (+${reasons.length - 1})` : reasons[0];
+          element.title = reasons.join("\n");
+          return element;
+        },
+      },
+      ...unlockedCols.map((c) => createDataColumnDef(c, false)),
+    ];
+  }
+
   function onImportComplete(summary, importedPath, importedSheet) {
     currentPath = importedPath;
     currentSheet = importedSheet;
@@ -3487,6 +4044,18 @@
     updateFileSwitcherUi();
     renderCorrelationScope();
 
+    // Check if switching back to an existing file with saved locked columns
+    const existingLocked = existingEntry?.lockedColumnFields;
+    if (existingLocked && existingLocked.size > 0) {
+      lockedColumnFields = new Set(existingLocked);
+    } else {
+      const initialLocked = findInitialLockedColumns(columns, columnRoleSuggestions);
+      lockedColumnFields = new Set(initialLocked.map((c) => c.sqlName));
+    }
+    if (existingEntry) {
+      existingEntry.lockedColumnFields = new Set(lockedColumnFields);
+    }
+
     const fileName = importedPath.split(/[\\/]/).pop();
     const fileCountBadge = loadedFiles.length > 1 ? ` [${activeFileIndex + 1}/${loadedFiles.length} files]` : "";
     fileInfo.textContent = `${fileName}${fileCountBadge} — ${summary.rowCount.toLocaleString()} rows, ${columns.length} columns${summary.fromCache ? " (cached)" : ""}`;
@@ -3496,7 +4065,7 @@
     resetIntelUiState();
     searchBox.value = "";
     filterList.innerHTML = "";
-    sortColumn.innerHTML = '<option value="">(row order)</option>';
+    sortColumn.innerHTML = '<option value="">(row order)</option><option value="row_num"># (row order)</option>';
     columns.forEach((c) => {
       const opt = document.createElement("option");
       opt.value = c.sqlName;
@@ -3504,43 +4073,12 @@
       sortColumn.appendChild(opt);
     });
 
-    spec = { search: null, filters: [], sort: null, expression: null, cursor: null, limit: PAGE_SIZE };
+    spec = { search: null, filters: [], sort: null, expression: null, cursor: null, limit: pageSize };
+    if (pageSizeSelect) pageSizeSelect.value = String(pageSize);
     resetPagination();
 
     const isWideGrid = columns.length > WIDE_GRID_COLUMN_THRESHOLD;
-    const tabulatorColumns = [
-      { title: "#", field: "row_num", width: 70, headerSort: false, frozen: true },
-      {
-        title: "Why matched",
-        field: "__aiMatch",
-        width: 250,
-        minWidth: 180,
-        headerSort: false,
-        visible: false,
-        formatter(cell) {
-          const rawReasons = cell.getValue();
-          const reasons = Array.isArray(rawReasons)
-            ? rawReasons.filter((reason) => typeof reason === "string" && reason.trim())
-            : [];
-          const element = document.createElement("div");
-          element.className = "ai-match-reason";
-          if (reasons.length === 0) {
-            element.textContent = "AI search plan match";
-            return element;
-          }
-          element.textContent = reasons.length > 1 ? `${reasons[0]} (+${reasons.length - 1})` : reasons[0];
-          element.title = reasons.join("\n");
-          return element;
-        },
-      },
-      ...columns.map((c) => ({
-        title: c.originalName,
-        field: c.sqlName,
-        headerSort: false,
-        resizable: true,
-        ...(isWideGrid ? { width: 160 } : {}),
-      })),
-    ];
+    const tabulatorColumns = buildTabulatorColumns();
 
     if (table) {
       table.destroy();
@@ -3548,6 +4086,10 @@
     table = new Tabulator("#grid", {
       data: [],
       columns: tabulatorColumns,
+      index: "row_num",
+      selectableRows: true,
+      selectableRowsRangeMode: "click",
+      selectableRowsPersistence: true,
       // "fitDataFill" measures every rendered cell of every column to size columns to content
       // (Tabulator's reinitializeWidth()/fitToData()) - on a very wide file that's real,
       // synchronous, per-cell DOM measurement work repeated on every page turn. "fitColumns"
@@ -3559,6 +4101,21 @@
       height: "100%",
       placeholder: "No matching rows",
     });
+
+    if (typeof table.on === "function") {
+      table.on("rowSelectionChanged", (_data, rows) => {
+        const count = Array.isArray(rows) ? rows.length : 0;
+        if (selectionCountBadge) {
+          if (count > 0) {
+            selectionCountBadge.textContent =
+              count === 1 ? "1 row selected (Esc to clear)" : `${count.toLocaleString()} rows selected (Esc to clear)`;
+            selectionCountBadge.classList.remove("hidden");
+          } else {
+            selectionCountBadge.classList.add("hidden");
+          }
+        }
+      });
+    }
 
     setControlsEnabled(true);
     // Semantic preparation is independent of optional mapping. Start both immediately so a
@@ -3613,20 +4170,24 @@
       table = null;
     }
     columns = [];
+    lockedColumnFields = new Set();
     currentPath = null;
     currentSheet = null;
     fileInfo.textContent = "No file loaded";
     fileInfo.title = "";
-    sortColumn.innerHTML = '<option value="">(row order)</option>';
+    sortColumn.innerHTML = '<option value="">(row order)</option><option value="row_num"># (row order)</option>';
     filterList.innerHTML = "";
     searchBox.value = "";
-    spec = { search: null, filters: [], sort: null, expression: null, cursor: null, limit: PAGE_SIZE };
+    spec = { search: null, filters: [], sort: null, expression: null, cursor: null, limit: pageSize };
     resetPagination();
     resetIntelUiState();
     setControlsEnabled(false);
     hideProgress();
     rowCountLabel.textContent = "—";
     pageLabel.textContent = "";
+    if (selectionCountBadge) selectionCountBadge.classList.add("hidden");
+    if (firstPageBtn) firstPageBtn.disabled = true;
+    if (pageSizeSelect) pageSizeSelect.disabled = true;
     return invoke("clear_loaded_file").catch((err) => {
       // The local generation/UI have already been invalidated synchronously. Keep the app in
       // that safe empty state and surface a backend-clear failure for diagnostics.
@@ -3953,6 +4514,25 @@
     }
   }
 
+  const IOC_TYPE_LABELS = {
+    correlation_id: "Correlation / Request ID",
+    session_id: "Session ID",
+    device_id: "Device ID",
+    app_id: "App ID",
+    unique_token_id: "Token ID",
+    hash: "Hash",
+    mailbox_guid: "Mailbox GUID",
+    internet_message_id: "Internet Msg ID",
+    network_message_id: "Network Msg ID",
+    message_id: "Message ID",
+    file_id: "File / Object ID",
+    ip: "IP Address",
+    domain: "Domain",
+    url: "URL",
+    email: "Email",
+    user_agent: "User Agent",
+  };
+
   function renderCrossIocResults() {
     if (!crossIocSummary) return;
     const { filesScanned, totalUniqueIocs, overlappingCount, items } = crossIocSummary;
@@ -3965,7 +4545,16 @@
       filtered = filtered.filter((i) => i.fileCount >= 2);
     }
     if (crossIocActiveType !== "all") {
-      filtered = filtered.filter((i) => i.iocType === crossIocActiveType);
+      if (crossIocActiveType === "message_id") {
+        filtered = filtered.filter(
+          (i) =>
+            i.iocType === "message_id" ||
+            i.iocType === "internet_message_id" ||
+            i.iocType === "network_message_id"
+        );
+      } else {
+        filtered = filtered.filter((i) => i.iocType === crossIocActiveType);
+      }
     }
     if (q) {
       filtered = filtered.filter((i) => i.value.toLowerCase().includes(q));
@@ -3998,10 +4587,13 @@
         })
         .join("");
 
+      const typeLabel = IOC_TYPE_LABELS[item.iocType] || item.iocType;
+      const typeClass = `cross-ioc-type-tag ${item.iocType}`;
+
       card.innerHTML = `
         <div class="cross-ioc-left">
-          <span class="cross-ioc-type-tag">${escapeHtml(item.iocType)}</span>
-          <span class="cross-ioc-val">${escapeHtml(item.value)}</span>
+          <span class="${typeClass}">${escapeHtml(typeLabel)}</span>
+          <span class="cross-ioc-val clickable" title="Click to filter currently loaded table for this value">${escapeHtml(item.value)}</span>
           ${metaTagsHtml}
           ${item.fileCount >= 2 ? `<span class="correlation-count-badge">Found in ${item.fileCount} files (${item.totalCount} total hits)</span>` : ""}
         </div>
@@ -4009,6 +4601,15 @@
           ${fileChipsHtml}
         </div>
       `;
+
+      const valEl = card.querySelector(".cross-ioc-val");
+      if (valEl) {
+        valEl.addEventListener("click", () => {
+          searchBox.value = item.value;
+          switchTab("tab-grid");
+          applyControlsAndReload();
+        });
+      }
 
       card.querySelectorAll(".cross-ioc-file-chip").forEach((chip) => {
         chip.addEventListener("click", async () => {
@@ -4064,7 +4665,16 @@
         itemsToExport = itemsToExport.filter((i) => i.fileCount >= 2);
       }
       if (crossIocActiveType !== "all") {
-        itemsToExport = itemsToExport.filter((i) => i.iocType === crossIocActiveType);
+        if (crossIocActiveType === "message_id") {
+          itemsToExport = itemsToExport.filter(
+            (i) =>
+              i.iocType === "message_id" ||
+              i.iocType === "internet_message_id" ||
+              i.iocType === "network_message_id"
+          );
+        } else {
+          itemsToExport = itemsToExport.filter((i) => i.iocType === crossIocActiveType);
+        }
       }
       const q = (crossIocSearch.value || "").trim().toLowerCase();
       if (q) {
@@ -4124,6 +4734,8 @@
       .find((row) => row.getData().row_num === rowNum);
     if (!target) return false;
     table.scrollToRow(target, "center", false);
+    if (typeof table.deselectRows === "function") table.deselectRows();
+    if (typeof target.select === "function") target.select();
     target.getElement().classList.add("analyst-row-flash");
     setTimeout(() => target.getElement().classList.remove("analyst-row-flash"), 1600);
     return true;
@@ -4132,6 +4744,77 @@
   function renderAnalystAnswer(answer) {
     analystHeadline.textContent = answer.headline || "AI analyst";
     analystSections.innerHTML = "";
+
+    // 1. Collect all rows grouped by file across all sections for the Whole-Picture Filter Bar
+    const fileRowMap = new Map(); // fileName -> Set of row numbers
+    const unscopedRows = new Set();
+
+    (answer.sections || []).forEach((section) => {
+      (section.lines || []).forEach((line) => {
+        if (!Array.isArray(line.rows) || line.rows.length === 0) return;
+        const fileMatch = line.text.match(/\[([^\]]+\.[a-zA-Z0-9]+)\]/);
+        if (fileMatch) {
+          const fname = fileMatch[1];
+          if (!fileRowMap.has(fname)) fileRowMap.set(fname, new Set());
+          const set = fileRowMap.get(fname);
+          line.rows.forEach((r) => set.add(r));
+        } else {
+          line.rows.forEach((r) => unscopedRows.add(r));
+        }
+      });
+    });
+
+    if (fileRowMap.size === 0 && unscopedRows.size > 0) {
+      const currentFileName = (loadedFiles && loadedFiles[activeFileIndex]?.name) || (currentPath ? currentPath.split(/[\\/]/).pop() : "Evidence");
+      fileRowMap.set(currentFileName, unscopedRows);
+    } else if (fileRowMap.size === 1 && unscopedRows.size > 0) {
+      const onlySet = fileRowMap.values().next().value;
+      unscopedRows.forEach((r) => onlySet.add(r));
+    }
+
+    let totalRowsCount = 0;
+    fileRowMap.forEach((set) => { totalRowsCount += set.size; });
+
+    if (totalRowsCount > 1) {
+      const wholePicBar = document.createElement("div");
+      wholePicBar.className = "analyst-whole-picture-bar";
+
+      const barLabel = document.createElement("span");
+      barLabel.className = "analyst-whole-picture-label";
+      barLabel.innerHTML = `<span>🌐 Whole-Picture Filter:</span>`;
+      wholePicBar.appendChild(barLabel);
+
+      fileRowMap.forEach((set, fname) => {
+        const rowNums = Array.from(set).sort((a, b) => a - b);
+        if (rowNums.length === 0) return;
+
+        const filterBtn = document.createElement("button");
+        filterBtn.type = "button";
+        filterBtn.className = "btn btn-filter-whole-picture";
+        const fileBadge = (fileRowMap.size > 1 || (loadedFiles && loadedFiles.length > 1))
+          ? ` [${fname}]`
+          : "";
+        filterBtn.innerHTML = `🔍 Filter Evidence Grid to ALL ${rowNums.length.toLocaleString()} Correlated Events${fileBadge}`;
+        filterBtn.title = `Filter Evidence grid to all ${rowNums.length.toLocaleString()} correlated rows in ${fname}`;
+
+        filterBtn.addEventListener("click", async () => {
+          if (loadedFiles && loadedFiles.length > 1) {
+            const targetIdx = loadedFiles.findIndex(
+              (f) => f.name === fname || f.path.endsWith(fname)
+            );
+            if (targetIdx !== -1 && loadedFiles[targetIdx].path !== currentPath) {
+              await switchLoadedFile(targetIdx);
+            }
+          }
+          filterGridByIntel("rows", rowNums, `Correlated Events (${rowNums.length} rows)${fileBadge}`);
+        });
+
+        wholePicBar.appendChild(filterBtn);
+      });
+
+      analystSections.appendChild(wholePicBar);
+    }
+
     (answer.sections || []).forEach((section) => {
       const heading = document.createElement("h4");
       heading.className = "analyst-section-heading";
@@ -4141,21 +4824,105 @@
         const paragraph = document.createElement("p");
         paragraph.className = "analyst-line";
         paragraph.appendChild(document.createTextNode(line.text + " "));
-        (line.rows || []).forEach((rowNum) => {
+
+        // Extract MITRE technique ID if present (e.g. T1048 or T1114.003)
+        const techMatch = line.text.match(/\b(T\d{4}(?:\.\d{3})?)\b/);
+        const hasRows = Array.isArray(line.rows) && line.rows.length > 0;
+        const isTimelineSection = section.heading.toLowerCase().includes("timeline");
+        const isMitreContext = !isTimelineSection && (
+          section.heading.toLowerCase().includes("mitre") ||
+          line.text.startsWith("MITRE ATT&CK:") ||
+          line.text.startsWith("Technique ")
+        );
+
+        const actionsContainer = document.createElement("span");
+        actionsContainer.className = "analyst-line-actions";
+
+        if (techMatch && isMitreContext) {
+          const techId = techMatch[1];
+          const techName = line.text.split("(")[0].trim() || techId;
+          const filterBtn = document.createElement("button");
+          filterBtn.type = "button";
+          filterBtn.className = "btn btn-small btn-analyst-filter";
+          filterBtn.innerHTML = `🔍 View in Table (${techId})`;
+          filterBtn.title = `Filter Evidence grid to all rows matching MITRE Technique ${techId}`;
+          filterBtn.addEventListener("click", () => {
+            filterGridByIntel("technique", techId, `${techId} ${techName}`);
+          });
+          actionsContainer.appendChild(filterBtn);
+        } else if (hasRows && line.rows.length > 1) {
+          const filterBtn = document.createElement("button");
+          filterBtn.type = "button";
+          filterBtn.className = "btn btn-small btn-analyst-filter";
+          filterBtn.innerHTML = `🔍 View in Table (${line.rows.length} rows)`;
+          filterBtn.title = `Filter Evidence grid to these ${line.rows.length} affected rows`;
+          const filterLabel = isTimelineSection
+            ? `Timeline (${line.rows.length} events)`
+            : `AI Finding (${line.rows.length} rows)`;
+          const fileMatch = line.text.match(/\[([^\]]+\.[a-zA-Z0-9]+)\]/);
+          const targetFileName = fileMatch ? fileMatch[1] : null;
+          filterBtn.addEventListener("click", async () => {
+            if (targetFileName && loadedFiles && loadedFiles.length > 1) {
+              const targetIdx = loadedFiles.findIndex(
+                (f) => f.name === targetFileName || f.path.endsWith(targetFileName)
+              );
+              if (targetIdx !== -1 && loadedFiles[targetIdx].path !== currentPath) {
+                await switchLoadedFile(targetIdx);
+              }
+            }
+            filterGridByIntel("rows", line.rows, filterLabel);
+          });
+          actionsContainer.appendChild(filterBtn);
+        } else if (
+          section.heading === "MITRE ATT&CK mapping" &&
+          line.text.includes("matches on") &&
+          answer.scan &&
+          answer.scan.matchedRows > 0
+        ) {
+          const filterBtn = document.createElement("button");
+          filterBtn.type = "button";
+          filterBtn.className = "btn btn-small btn-analyst-filter";
+          filterBtn.innerHTML = `🔍 View All Matches (${answer.scan.matchedRows.toLocaleString()} rows)`;
+          filterBtn.title = "Filter Evidence grid to all detected MITRE threat rows";
+          filterBtn.addEventListener("click", () => {
+            filterGridByIntel("all", null, "All Detected MITRE Matches");
+          });
+          actionsContainer.appendChild(filterBtn);
+        }
+
+        if (actionsContainer.hasChildNodes()) {
+          paragraph.appendChild(actionsContainer);
+        }
+
+        // Only render individual row chip when there is exactly 1 row.
+        // When there are multiple rows (e.g. 252 rows), the View in Table button above
+        // handles it cleanly, preventing walls of hundreds of individual row chips.
+        if (line.rows && line.rows.length === 1) {
+          const rowNum = line.rows[0];
           const chip = document.createElement("button");
           chip.type = "button";
           chip.className = "analyst-row-chip";
           chip.textContent = `row ${rowNum}`;
-          chip.title = "Scroll the grid to this source row (when it is on the current page)";
-          chip.addEventListener("click", () => {
-            switchTab("tab-grid");
-            if (!scrollGridToRow(rowNum)) {
-              aiSearchAvailability.textContent = `Row ${rowNum} is not on the current grid page. Clear filters or page to it; the row number always refers to the imported sheet.`;
-              aiSearchAvailability.classList.remove("ready");
+          chip.title = `Filter Evidence grid to row #${rowNum} and highlight it`;
+
+          // Check if line text references a specific file from multi-file timeline, e.g. [audit.csv]
+          const fileMatch = line.text.match(/\[([^\]]+\.[a-zA-Z0-9]+)\]/);
+          const targetFileName = fileMatch ? fileMatch[1] : null;
+
+          chip.addEventListener("click", async () => {
+            if (targetFileName && loadedFiles && loadedFiles.length > 1) {
+              const targetIdx = loadedFiles.findIndex(
+                (f) => f.name === targetFileName || f.path.endsWith(targetFileName)
+              );
+              if (targetIdx !== -1 && loadedFiles[targetIdx].path !== currentPath) {
+                await switchLoadedFile(targetIdx);
+              }
             }
+            await filterGridByIntel("rows", [rowNum], `Row #${rowNum}`);
+            scrollGridToRow(rowNum);
           });
           paragraph.appendChild(chip);
-        });
+        }
         analystSections.appendChild(paragraph);
       });
     });
@@ -4195,9 +4962,18 @@
     analystStatus.classList.remove("hidden");
     analystPanel.classList.remove("hidden");
     try {
+      const filesPayload = (loadedFiles && loadedFiles.length > 1)
+        ? loadedFiles.map((f) => ({
+            path: f.path,
+            sheet: f.sheet || null,
+            cacheDbPath: f.summary?.cacheDbPath || null,
+          }))
+        : null;
+
       const answer = await invoke("ask_analyst", {
         askText: trimmed,
         requestId: request.id,
+        files: filesPayload,
       });
       if (!analystRequestIsCurrent(request)) return null;
       return answer;
@@ -4429,6 +5205,150 @@
     });
   }
 
+  // Suggested Prompts Popover with Multi-Select
+  const suggestedPromptsPopover = document.getElementById("suggested-prompts-popover");
+  const closeSuggestedPromptsBtn = document.getElementById("close-suggested-prompts-btn");
+  const suggestedMultiActions = document.getElementById("suggested-multi-actions");
+  const suggestedSelectedCount = document.getElementById("suggested-selected-count");
+  const runCombinedPromptsBtn = document.getElementById("run-combined-prompts-btn");
+  const clearSelectedPromptsBtn = document.getElementById("clear-selected-prompts-btn");
+
+  function openSuggestedPrompts() {
+    if (suggestedPromptsPopover && controlsEnabled) {
+      suggestedPromptsPopover.classList.remove("hidden");
+    }
+  }
+
+  function closeSuggestedPrompts() {
+    if (suggestedPromptsPopover) {
+      suggestedPromptsPopover.classList.add("hidden");
+    }
+  }
+
+  function updateSuggestedMultiSelectUi() {
+    if (!suggestedPromptsPopover || !suggestedMultiActions) return;
+    const checkedCbs = suggestedPromptsPopover.querySelectorAll(".prompt-select-cb:checked");
+    const count = checkedCbs.length;
+    if (count > 0) {
+      suggestedMultiActions.classList.remove("hidden");
+      if (suggestedSelectedCount) {
+        suggestedSelectedCount.textContent = `${count} prompt${count > 1 ? "s" : ""} selected`;
+      }
+    } else {
+      suggestedMultiActions.classList.add("hidden");
+    }
+    suggestedPromptsPopover.querySelectorAll(".suggested-item").forEach((item) => {
+      const cb = item.querySelector(".prompt-select-cb");
+      item.classList.toggle("checked", Boolean(cb && cb.checked));
+    });
+  }
+
+  function clearSuggestedPromptSelections() {
+    if (!suggestedPromptsPopover) return;
+    suggestedPromptsPopover.querySelectorAll(".prompt-select-cb").forEach((cb) => {
+      cb.checked = false;
+    });
+    updateSuggestedMultiSelectUi();
+  }
+
+  if (guidedSearchBox) {
+    guidedSearchBox.addEventListener("focus", openSuggestedPrompts);
+    guidedSearchBox.addEventListener("click", openSuggestedPrompts);
+  }
+
+  if (closeSuggestedPromptsBtn) {
+    closeSuggestedPromptsBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      closeSuggestedPrompts();
+    });
+  }
+
+  if (clearSelectedPromptsBtn) {
+    clearSelectedPromptsBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      clearSuggestedPromptSelections();
+    });
+  }
+
+  if (runCombinedPromptsBtn) {
+    runCombinedPromptsBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      if (!suggestedPromptsPopover) return;
+      const checkedCbs = Array.from(suggestedPromptsPopover.querySelectorAll(".prompt-select-cb:checked"));
+      if (checkedCbs.length === 0) return;
+      const combined = checkedCbs.map((cb) => cb.value.trim()).filter(Boolean).join(" and ");
+      guidedSearchBox.value = combined;
+      clearSuggestedPromptSelections();
+      closeSuggestedPrompts();
+      routeAnalystAsk().catch((err) => alert(`AI analyst failed: ${err}`));
+    });
+  }
+
+  if (suggestedPromptsPopover) {
+    suggestedPromptsPopover.querySelectorAll(".prompt-select-cb").forEach((cb) => {
+      cb.addEventListener("change", (e) => {
+        e.stopPropagation();
+        updateSuggestedMultiSelectUi();
+      });
+      cb.addEventListener("click", (e) => {
+        e.stopPropagation();
+      });
+    });
+
+    suggestedPromptsPopover.querySelectorAll(".suggested-item").forEach((item) => {
+      item.addEventListener("click", (e) => {
+        if (e.target.classList.contains("prompt-select-cb")) {
+          return;
+        }
+        e.preventDefault();
+        const checkedCount = suggestedPromptsPopover.querySelectorAll(".prompt-select-cb:checked").length;
+        const cb = item.querySelector(".prompt-select-cb");
+        if (checkedCount > 0) {
+          if (cb) {
+            cb.checked = !cb.checked;
+            updateSuggestedMultiSelectUi();
+          }
+        } else {
+          const prompt = item.dataset.prompt || (cb ? cb.value : "");
+          if (!prompt) return;
+          guidedSearchBox.value = prompt;
+          closeSuggestedPrompts();
+          routeAnalystAsk().catch((err) => alert(`AI analyst failed: ${err}`));
+        }
+      });
+    });
+  }
+
+  if (typeof document !== "undefined" && typeof document.addEventListener === "function") {
+    document.addEventListener("click", (e) => {
+      if (
+        suggestedPromptsPopover &&
+        !suggestedPromptsPopover.classList.contains("hidden") &&
+        !e.target.closest(".guided-search-wrapper")
+      ) {
+        closeSuggestedPrompts();
+      }
+    });
+
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape" && suggestedPromptsPopover && !suggestedPromptsPopover.classList.contains("hidden")) {
+        closeSuggestedPrompts();
+      }
+    });
+  }
+
+  // Timeline Generator Form
+  if (timelineGeneratorForm) {
+    timelineGeneratorForm.addEventListener("submit", (e) => {
+      e.preventDefault();
+      if (sheetLoadInFlight || tableTransitionInFlight()) return;
+      const kw = timelineKeywordsBox ? timelineKeywordsBox.value.trim() : "";
+      const query = kw ? `timeline for ${kw}` : "timeline of events";
+      guidedSearchBox.value = query;
+      routeAnalystAsk().catch((err) => alert(`AI timeline generation failed: ${err}`));
+    });
+  }
+
   // IOC category buttons
   if (typeof document.querySelectorAll === "function") {
     document.querySelectorAll(".ioc-cat-btn").forEach((btn) => {
@@ -4547,6 +5467,18 @@
     addFilterRow();
   });
   applyBtn.addEventListener("click", applyControlsAndReload);
+  if (sortColumn) {
+    sortColumn.addEventListener("change", () => {
+      if (sheetLoadInFlight || tableTransitionInFlight()) return;
+      applyControlsAndReload();
+    });
+  }
+  if (sortDirection) {
+    sortDirection.addEventListener("change", () => {
+      if (sheetLoadInFlight || tableTransitionInFlight()) return;
+      applyControlsAndReload();
+    });
+  }
   clearBtn.addEventListener("click", () => {
     if (sheetLoadInFlight || tableTransitionInFlight()) return;
     clearAllTableFilters();
@@ -4642,6 +5574,26 @@
   reportExportBtn.addEventListener("click", doReportExport);
   exportCsvBtn.addEventListener("click", () => doExport("csv"));
   exportXlsxBtn.addEventListener("click", () => doExport("xlsx"));
+  if (gridExportCsvBtn) gridExportCsvBtn.addEventListener("click", () => doExport("csv"));
+  if (gridExportXlsxBtn) gridExportXlsxBtn.addEventListener("click", () => doExport("xlsx"));
+  if (selectionCountBadge) {
+    selectionCountBadge.addEventListener("click", () => {
+      if (table && typeof table.deselectRows === "function") {
+        table.deselectRows();
+      }
+    });
+  }
+
+  if (firstPageBtn) {
+    firstPageBtn.addEventListener("click", () => {
+      if (sheetLoadInFlight || tableTransitionInFlight()) return;
+      if (cursorStack.length === 0) return;
+      spec.cursor = null;
+      cursorStack = [];
+      pageIndex = 1;
+      refreshData();
+    });
+  }
 
   prevPageBtn.addEventListener("click", () => {
     if (sheetLoadInFlight || tableTransitionInFlight()) return;
@@ -4659,6 +5611,18 @@
     pageIndex += 1;
     refreshData();
   });
+
+  if (pageSizeSelect) {
+    pageSizeSelect.addEventListener("change", () => {
+      if (sheetLoadInFlight || tableTransitionInFlight()) return;
+      const newSize = parseInt(pageSizeSelect.value, 10);
+      if (!newSize || newSize === pageSize) return;
+      pageSize = newSize;
+      spec.limit = pageSize;
+      resetPagination();
+      refreshData();
+    });
+  }
 
   listen("import-progress", (event) => {
     const { rowsDone, rowsTotal, phase } = event.payload;
@@ -4767,7 +5731,9 @@
   if (typeof document !== "undefined" && typeof document.addEventListener === "function") {
     document.addEventListener("keydown", (event) => {
       if (event.key === "Escape") {
-        if (isTableFiltered()) {
+        if (table && typeof table.getSelectedRows === "function" && table.getSelectedRows().length > 0) {
+          table.deselectRows();
+        } else if (isTableFiltered()) {
           clearAllTableFilters();
         }
       }

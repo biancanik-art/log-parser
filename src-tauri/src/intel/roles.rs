@@ -163,7 +163,7 @@ pub fn detect_column_roles(
         .query_row(
             "SELECT EXISTS(
                 SELECT 1 FROM _column_roles
-                WHERE role IN ('command_line', 'process_name', 'file_name', 'host', 'text_evidence')
+                WHERE role IN ('command_line', 'process_name', 'file_name', 'host', 'text_evidence', 'operation')
                   AND status != 'rejected'
             )",
             [],
@@ -653,18 +653,20 @@ fn score_file_name(header: &HeaderProfile, values: &[String]) -> (f64, Vec<Strin
 fn score_host(header: &HeaderProfile, values: &[String]) -> (f64, Vec<String>) {
     let mut score = 0.0;
     let mut reasons = Vec::new();
-    if let Some(keyword) = header.contains_any(&[
-        "hostname",
-        "computer",
-        "devicename",
-        "device",
-        "workstation",
-        "machine",
-        "host",
-        "dvc",
-    ]) {
-        score += 0.42;
-        reasons.push(format!("header contains host keyword '{keyword}'"));
+    if !header.compact.contains("hosted") && !header.compact.contains("ghost") {
+        if let Some(keyword) = header.contains_any(&[
+            "hostname",
+            "computer",
+            "devicename",
+            "device",
+            "workstation",
+            "machine",
+            "host",
+            "dvc",
+        ]) {
+            score += 0.42;
+            reasons.push(format!("header contains host keyword '{keyword}'"));
+        }
     }
 
     let total = values.len();
@@ -807,6 +809,89 @@ fn score_session_id(header: &HeaderProfile, values: &[String]) -> (f64, Vec<Stri
     (score, reasons)
 }
 
+/// Returns true if a string matches common patterns for browsers, HTTP client libraries,
+/// API / dev tools, penetration testing / vulnerability scanners, offensive / C2 frameworks,
+/// or cloud / admin automation tools.
+pub fn is_known_tool_or_browser_ua(val: &str) -> bool {
+    let v = val.trim();
+    if v.len() < 3 || v.len() > 1024 {
+        return false;
+    }
+    let vl = v.to_ascii_lowercase();
+
+    // Standard browsers & engines
+    if v.contains("Mozilla/")
+        || v.contains("Chrome/")
+        || v.contains("Safari/")
+        || v.contains("Edge/")
+        || v.contains("Firefox/")
+        || v.contains("Opera/")
+        || v.contains("AppleWebKit/")
+        || v.contains("Gecko/")
+        || v.contains("Trident/")
+        || v.contains("MSIE ")
+    {
+        return true;
+    }
+
+    // Exact matches or clean prefixes
+    const EXACT_OR_PREFIX_TOOLS: &[&str] = &[
+        "curl", "wget", "axios", "sqlmap", "nikto", "nmap", "masscan", "zgrab",
+        "dirbuster", "gobuster", "ffuf", "feroxbuster", "wfuzz", "hydra",
+        "nuclei", "wpscan", "dirsearch", "katana", "postman", "insomnia",
+        "soapui", "swagger", "bruno", "httpie", "rclone", "kubectl", "helm",
+        "docker", "packer", "terraform", "ansible", "impacket", "responder",
+        "crackmapexec", "netexec", "mimikatz", "chisel", "sliver", "havoc",
+        "commix", "sublist3r", "amass", "arjun", "dalfox", "xsstrike",
+    ];
+    for &tool in EXACT_OR_PREFIX_TOOLS {
+        if vl == tool
+            || vl.starts_with(&format!("{tool}/"))
+            || vl.starts_with(&format!("{tool} "))
+            || vl.starts_with(&format!("{tool}-"))
+            || vl.starts_with(&format!("{tool}_"))
+            || vl.starts_with(&format!("{tool}v"))
+        {
+            return true;
+        }
+    }
+
+    // Substring tool signatures
+    const TOOL_SUBSTRINGS: &[&str] = &[
+        // HTTP Libraries & CLI clients
+        "curl/", "curl ", "wget/", "wget ", "python-requests", "requests/",
+        "urllib", "aiohttp", "httpx", "axios", "got/", "node-fetch",
+        "okhttp", "go-http-client", "go-http", "winhttp", "powershell",
+        "restsharp", "reqwest", "guzzle", "faraday", "libwww-perl",
+        "lwp-trivial", "lwp::", "dart/", "rust-http", "java/",
+        "apache-httpclient", "httpclient", "packagemanager", "bun/", "deno/",
+        "undici",
+        // API & Dev REST clients
+        "postman", "insomnia", "client rest", "rest-client", "soapui",
+        "swagger", "thunder client", "thunder-client", "bruno", "hoppscotch",
+        "httpie", "paw/", "altair", "graphiql", "apollo-client", "yaak",
+        // Scanners & Pentest tools
+        "sqlmap", "nikto", "nmap", "masscan", "zgrab", "dirbuster", "gobuster",
+        "ffuf", "feroxbuster", "wfuzz", "hydra", "burp", "burpsuite",
+        "owasp zap", "owasp-zap", "acunetix", "nessus", "qualys", "openvas",
+        "nuclei", "wpscan", "dirsearch", "katana", "sublist3r", "amass",
+        "arjun", "paramspider", "waybackurls", "dalfox", "xsstrike", "jaeles",
+        "sn1per", "arachni", "skipfish", "whatweb", "w3af", "commix",
+        // C2 & Offensive Tools
+        "metasploit", "meterpreter", "empire", "covenant", "havoc", "sliver",
+        "cobaltstrike", "beacon", "bloodhound", "sharphound", "rubeus",
+        "responder", "crackmapexec", "netexec", "impacket", "mimikatz",
+        "chisel", "ligolo", "ngrok",
+        // Cloud & Admin CLIs
+        "aws-cli", "aws-sdk", "azsdk-python", "azure-cli", "azure-sdk",
+        "gcloud", "terraform", "ansible", "packer", "rclone", "kubectl",
+        "helm", "docker", "containerd", "git/", "github-actions",
+        "gitlab-runner", "jenkins", "circleci",
+    ];
+
+    TOOL_SUBSTRINGS.iter().any(|&sig| vl.contains(sig))
+}
+
 fn score_user_agent(header: &HeaderProfile, values: &[String]) -> (f64, Vec<String>) {
     let mut score = 0.0;
     let mut reasons = Vec::new();
@@ -817,12 +902,22 @@ fn score_user_agent(header: &HeaderProfile, values: &[String]) -> (f64, Vec<Stri
     if let Some(keyword) = header.contains_any(&[
         "useragent",
         "user_agent",
+        "user-agent",
         "httpuseragent",
+        "http_user_agent",
         "clientinfo",
+        "client_info",
         "browser",
+        "caller_agent",
+        "request_agent",
+        "http_agent",
+        "client_app",
     ]) {
         score += 0.5;
         reasons.push(format!("header contains user-agent keyword '{keyword}'"));
+    } else if header.has_token("ua") {
+        score += 0.45;
+        reasons.push("header contains 'ua' token".to_string());
     } else if let Some(keyword) = header.contains_any(&["agent", "client"]) {
         score += 0.25;
         reasons.push(format!("header contains weak user-agent keyword '{keyword}'"));
@@ -832,20 +927,13 @@ fn score_user_agent(header: &HeaderProfile, values: &[String]) -> (f64, Vec<Stri
     if total > 0 {
         let match_count = values
             .iter()
-            .filter(|value| {
-                let v = value.trim();
-                v.contains("Mozilla/")
-                    || v.contains("Chrome/")
-                    || v.contains("Safari/")
-                    || v.contains("Edge/")
-                    || v.contains("python-requests")
-            })
+            .filter(|value| is_known_tool_or_browser_ua(value))
             .count();
         let ratio = match_count as f64 / total as f64;
-        if ratio >= 0.3 {
-            score += ratio * 0.45;
+        if ratio >= 0.25 {
+            score += ratio * 0.5;
             reasons.push(format!(
-                "{match_count}/{total} sampled values look like browser or HTTP client user agents"
+                "{match_count}/{total} sampled values look like browser, HTTP client, scanner, or administrative tool user agents"
             ));
         }
     }

@@ -1,8 +1,8 @@
-# log-parser
+# logparser-DFIR
 
-A fast, fully offline desktop viewer for large SIEM/EDR log exports (Excel
+A fast, fully offline desktop forensic log viewer and investigation workbench for large SIEM/EDR log exports (Excel
 and CSV) — built for DFIR examiners. Handles 100k+ row files, dynamic
-column detection, keyset-paginated filtering/search, AI-assisted evidence
+column detection, keyset-paginated filtering/search, multi-file correlation, AI-assisted evidence
 retrieval, optional MITRE ATT&CK enrichment, and multi-sheet report export.
 **No runtime network calls** — imported evidence and AI inference stay on
 your machine.
@@ -11,43 +11,20 @@ See the [wiki](../../wiki) for a full user guide.
 
 ## Features
 
-- Import large Excel (`.xlsx`/`.xls`) or CSV exports from tools like
-  Microsoft Sentinel, Secureworks Taegis, and Microsoft Defender.
+- **Multi-File Cross-Log Correlation**: Ingest multiple disparate logs (M365 UAL, Windows Event Logs, Sysmon, Firewall, VPN) simultaneously without forcing them into a flattened, sparse schema.
+- **Global Pivot Search**: Search entities (IPs, users, hashes, domains) across all open files in parallel with instant snippet previews.
+- **Shared Indicator (IOC) Co-occurrence Matrix**: Detect indicators that appear across 2 or more evidence files, with export to Excel, CSV, or JSON.
+- **Whole-Picture 1-Click Filter**: Isolate all correlated timeline events directly in the Evidence Grid with a single click.
+- **High-Entropy Correlation Entity Extraction**: Automatically extracts Device IDs, Session IDs / AADSessionIDs, App IDs, UniqueTokenIDs, Correlation IDs, Mailbox GUIDs, Message IDs, Hashes, and User-Agents.
 - Dynamic column detection — no per-source schema required.
-- Fast filtering, full-text search, sorting, and CSV/XLSX export, all
-  keyset-paginated for large files.
-- Automatic data mapping for timestamps and common evidence fields, with
-  optional manual overrides. Mapping is metadata for timelines and threat
-  enrichment; it never limits which raw rows the AI can search.
-- UTC timestamp normalization, with an explicit prompt when a timestamp's
-  timezone is ambiguous.
-- An offline, built-in MITRE ATT&CK-style keyword library, scanned via
-  Aho-Corasick pattern matching, extensible with your own custom
-  categories.
-- A local AI evidence search powered by embedded Qwen2.5-1.5B-Instruct and
-  all-MiniLM-L6-v2 models. Describe the evidence in plain language (for
-  example, *"show failed logins followed by PowerShell activity for alice,
-  chronologically"*). Qwen plans a validated, bounded lexical/structured
-  query over the complete raw table. MiniLM can supplement that plan with
-  semantically similar evidence. Neither path is restricted by data mappings
-  or rows found by the optional threat scan.
-- One-step AI search: submitting a request validates and executes its bounded
-  plan immediately, and asks for clarification only when a safe search cannot
-  be formed. Returned rows include a `Why matched` explanation. Generated
-  search values must be grounded in the examiner's request. The models cannot
-  execute SQL, read arbitrary files, launch processes, or access the network.
-- Resumable semantic preparation after import. Repeated log templates are
-  deduplicated, volatile IDs remain available to exact search, and balanced
-  per-column chunks keep later columns represented. Lexical/structured AI
-  search is available while this runs. Semantic document selection is
-  deliberately bounded and disclosed, while every raw row mapped to a
-  selected document remains included in count, pagination, and export. If an
-  exact-only search finishes while semantic preparation is still running, its
-  results refresh automatically when semantic matching becomes ready.
-- One-click multi-sheet XLSX report export: a case-summary sheet, a
-  chronological MITRE-mapped timeline, and one sheet per matched
-  technique category — every row traceable back to its original source
-  row.
+- Fast filtering, full-text search, sorting, and CSV/XLSX export, all keyset-paginated for large files.
+- Automatic data mapping for timestamps and common evidence fields, with optional manual overrides. Mapping is metadata for timelines and threat enrichment; it never limits which raw rows the AI can search.
+- UTC timestamp normalization, with an explicit prompt when a timestamp's timezone is ambiguous.
+- An offline, built-in MITRE ATT&CK-style keyword library, scanned via Aho-Corasick pattern matching, extensible with your own custom categories.
+- Local AI evidence search powered by embedded Qwen2.5-1.5B-Instruct and all-MiniLM-L6-v2 models. Describe the evidence in plain language (for example, *"show failed logins followed by PowerShell activity for alice, chronologically"*). Qwen plans a validated, bounded lexical/structured query over the complete raw table. MiniLM can supplement that plan with semantically similar evidence. Neither path is restricted by data mappings or rows found by the optional threat scan.
+- One-step AI search: submitting a request validates and executes its bounded plan immediately, and asks for clarification only when a safe search cannot be formed. Returned rows include a `Why matched` explanation. Generated search values must be grounded in the examiner's request. The models cannot execute SQL, read arbitrary files, launch processes, or access the network.
+- Interactive Threat Enrichment & Attack Chains: Clickable MITRE ATT&CK tactics, techniques, and correlated attack chains with 1-click drilldowns to filter the Evidence Grid.
+- One-click multi-sheet XLSX report export: a case-summary sheet, a chronological MITRE-mapped timeline, and one sheet per matched technique category — every row traceable back to its original source row.
 
 ## Try it
 
