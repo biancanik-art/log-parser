@@ -86,22 +86,22 @@ published on the [Releases](../../releases) page.
 
 **macOS note:** these builds are not yet code-signed/notarized with an
 Apple Developer ID, so Gatekeeper will refuse to open them with a
-"log-parser is damaged and should be moved to the Trash" message — the
+"logparser-DFIR is damaged and should be moved to the Trash" message — the
 app isn't actually damaged, this is just Gatekeeper blocking an
-unsigned/unnotarized download. After moving `log-parser.app` to
+unsigned/unnotarized download. After moving `logparser-DFIR.app` to
 `/Applications`, clear the quarantine flag once:
 
 ```sh
-xattr -cr /Applications/log-parser.app
+xattr -cr /Applications/logparser-DFIR.app
 ```
 
 Then it opens normally.
 
 ## Credits
 
-log-parser is a team effort: concept, requirements, and product direction
+logparser-DFIR is a team effort: concept, requirements, and product direction
 by [biancanik-art](https://github.com/biancanik-art); engineering by
-[Claude](https://www.anthropic.com/claude) (Anthropic) and
+[Gemini](https://deepmind.google/technologies/gemini/) (Google DeepMind) and
 [Codex](https://openai.com/index/introducing-codex/) (OpenAI), working as
 independent AI engineers/reviewers throughout the build — implementing
 features in parallel, cross-checking each other's work, and running live
