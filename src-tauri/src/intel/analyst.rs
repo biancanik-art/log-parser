@@ -8,7 +8,7 @@ use crate::intel::roles;
 use crate::intel::time;
 use anyhow::Result;
 use rusqlite::Connection;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
 const MAX_TOP_VALUES: usize = 3;
@@ -65,6 +65,20 @@ pub struct AnalystSection {
     pub lines: Vec<AnalystLine>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CorrelatedTimelineEvent {
+    pub file_name: String,
+    pub path: String,
+    pub row_num: i64,
+    pub epoch_ms: Option<i64>,
+    pub utc_text: Option<String>,
+    pub user: Option<String>,
+    pub host: Option<String>,
+    pub action: Option<String>,
+    pub mitre_tags: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AnalystAnswer {
@@ -77,6 +91,7 @@ pub struct AnalystAnswer {
     pub scan: Option<IntelScanSummary>,
     pub anomalies: Option<AnomalyScanSummary>,
     pub activity: Option<ActivityScanSummary>,
+    pub correlated_events: Option<Vec<CorrelatedTimelineEvent>>,
 }
 
 /// Classifies a free-text ask. Everything the analyst can answer itself runs the pipeline;
@@ -204,6 +219,7 @@ pub fn ask(
             scan: None,
             anomalies: None,
             activity: None,
+            correlated_events: None,
         });
     }
 
@@ -453,6 +469,7 @@ pub fn ask(
         scan: scan_summary,
         anomalies: anomaly_summary,
         activity: activity_summary,
+        correlated_events: None,
     })
 }
 
@@ -1890,29 +1907,11 @@ fn timeline_section(
     ))
 }
 
-pub fn multi_file_timeline(
+pub fn collect_events_across_files(
     targets: &[FileTarget],
-    ask_text: &str,
-) -> Result<AnalystAnswer> {
-    let keywords = extract_timeline_keywords(ask_text);
-    let kw_desc = if keywords.is_empty() {
-        "all notable events".to_string()
-    } else {
-        format!("'{}'", keywords.join("', '"))
-    };
-
-    struct CombinedTimelineRow {
-        row_num: i64,
-        file_name: String,
-        epoch_ms: Option<i64>,
-        utc_text: Option<String>,
-        user: Option<String>,
-        host: Option<String>,
-        action: Option<String>,
-        mitre_tags: Vec<String>,
-    }
-
-    let mut all_events: Vec<CombinedTimelineRow> = Vec::new();
+    keywords: &[String],
+) -> (Vec<CorrelatedTimelineEvent>, usize) {
+    let mut all_events: Vec<CorrelatedTimelineEvent> = Vec::new();
     let mut scanned_count = 0;
 
     for target in targets {
@@ -1956,7 +1955,7 @@ pub fn multi_file_timeline(
             let _ = time::normalize_timestamp_column_with_options(&mut conn, &columns, None, None);
         }
 
-        let row_ids = match find_matching_timeline_rows(&conn, &keywords, &columns) {
+        let row_ids = match find_matching_timeline_rows(&conn, keywords, &columns) {
             Ok(ids) => ids,
             Err(_) => continue,
         };
@@ -2145,9 +2144,10 @@ pub fn multi_file_timeline(
                     for r in rows.flatten() {
                         let row_num = r.0;
                         let tags = intel_map.get(&row_num).cloned().unwrap_or_default();
-                        all_events.push(CombinedTimelineRow {
+                        all_events.push(CorrelatedTimelineEvent {
                             row_num,
                             file_name: file_name.clone(),
+                            path: target.path.clone(),
                             epoch_ms: r.1,
                             utc_text: r.2,
                             user: r.3,
@@ -2160,6 +2160,45 @@ pub fn multi_file_timeline(
             }
         }
     }
+
+    // Sort all events chronologically across all files
+    all_events.sort_by(|a, b| {
+        match (a.epoch_ms, b.epoch_ms) {
+            (Some(ea), Some(eb)) => ea.cmp(&eb),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => a.file_name.cmp(&b.file_name).then(a.row_num.cmp(&b.row_num)),
+        }
+    });
+
+    (all_events, scanned_count)
+}
+
+pub fn extract_unified_events_for_ioc(
+    targets: &[FileTarget],
+    ioc_value: &str,
+) -> Vec<CorrelatedTimelineEvent> {
+    let clean = ioc_value.trim();
+    if clean.is_empty() {
+        return Vec::new();
+    }
+    let keywords = vec![clean.to_string()];
+    let (events, _) = collect_events_across_files(targets, &keywords);
+    events
+}
+
+pub fn multi_file_timeline(
+    targets: &[FileTarget],
+    ask_text: &str,
+) -> Result<AnalystAnswer> {
+    let keywords = extract_timeline_keywords(ask_text);
+    let kw_desc = if keywords.is_empty() {
+        "all notable events".to_string()
+    } else {
+        format!("'{}'", keywords.join("', '"))
+    };
+
+    let (all_events, scanned_count) = collect_events_across_files(targets, &keywords);
 
     if all_events.is_empty() {
         return Ok(AnalystAnswer {
@@ -2182,18 +2221,9 @@ pub fn multi_file_timeline(
             scan: None,
             anomalies: None,
             activity: None,
+            correlated_events: Some(Vec::new()),
         });
     }
-
-    // Sort all events chronologically across all files
-    all_events.sort_by(|a, b| {
-        match (a.epoch_ms, b.epoch_ms) {
-            (Some(ea), Some(eb)) => ea.cmp(&eb),
-            (Some(_), None) => std::cmp::Ordering::Less,
-            (None, Some(_)) => std::cmp::Ordering::Greater,
-            (None, None) => a.file_name.cmp(&b.file_name).then(a.row_num.cmp(&b.row_num)),
-        }
-    });
 
     let mut first_epoch: Option<i64> = None;
     let mut last_epoch: Option<i64> = None;
@@ -2347,6 +2377,7 @@ pub fn multi_file_timeline(
         scan: None,
         anomalies: None,
         activity: None,
+        correlated_events: Some(all_events),
     })
 }
 
@@ -2727,6 +2758,7 @@ pub fn multi_file_hunt(
             scan: None,
             anomalies: None,
             activity: None,
+            correlated_events: Some(Vec::new()),
         });
     }
 
@@ -2841,6 +2873,30 @@ pub fn multi_file_hunt(
         lines: tl_lines,
     };
 
+    let hunt_correlated_events: Vec<CorrelatedTimelineEvent> = all_events
+        .iter()
+        .map(|e| CorrelatedTimelineEvent {
+            file_name: e.file_name.clone(),
+            path: targets
+                .iter()
+                .find(|t| {
+                    std::path::Path::new(&t.path)
+                        .file_name()
+                        .map(|n| n.to_string_lossy() == e.file_name)
+                        .unwrap_or(false)
+                })
+                .map(|t| t.path.clone())
+                .unwrap_or_default(),
+            row_num: e.row_num,
+            epoch_ms: e.epoch_ms,
+            utc_text: e.utc_text.clone(),
+            user: e.user.clone(),
+            host: e.host.clone(),
+            action: e.action.clone(),
+            mitre_tags: e.mitre_tags.clone(),
+        })
+        .collect();
+
     Ok(AnalystAnswer {
         intent: "hunt".to_string(),
         headline: format!("Investigative Hunt: {total_events} event(s) identified for '{topic_name}' across {} file(s).", file_match_counts.len()),
@@ -2855,6 +2911,7 @@ pub fn multi_file_hunt(
         scan: None,
         anomalies: None,
         activity: None,
+        correlated_events: Some(hunt_correlated_events),
     })
 }
 

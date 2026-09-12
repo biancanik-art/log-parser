@@ -164,6 +164,12 @@
   let crossIocActiveType = "all"; // "all", "ip", "domain", "url", "email", "user_agent"
   let crossSearchResultsData = null;
 
+  // Unified Correlated Grid state
+  let isUnifiedCorrelatedMode = false;
+  let unifiedCorrelatedRows = [];
+  let unifiedCorrelatedLabel = "";
+
+
   // IOC filtering state
   let currentIocCategory = "all";
   let currentIocFilterText = "";
@@ -1097,6 +1103,274 @@
     }
     updateTableSortVisuals();
     return page;
+  }
+
+  function renderUnifiedCorrelatedGrid(events, label) {
+    if (!events || events.length === 0) {
+      alert("No correlated events found to display.");
+      return;
+    }
+
+    isUnifiedCorrelatedMode = true;
+    unifiedCorrelatedRows = events;
+    unifiedCorrelatedLabel = label || "Cross-File Unified Correlation";
+
+    switchTab("tab-grid");
+
+    const uniqueFiles = new Set(events.map((e) => e.fileName || (e.path ? e.path.split(/[\\/]/).pop() : "File")));
+    const fileCount = uniqueFiles.size;
+
+    const tableData = events.map((ev, idx) => ({
+      _unifiedIndex: idx + 1,
+      row_num: ev.rowNum,
+      fileName: ev.fileName || (ev.path ? ev.path.split(/[\\/]/).pop() : "File"),
+      path: ev.path,
+      epochMs: ev.epochMs,
+      utcText: ev.utcText || "—",
+      user: ev.user || "—",
+      host: ev.host || "—",
+      action: ev.action || "—",
+      mitreTags: Array.isArray(ev.mitreTags) ? ev.mitreTags : [],
+    }));
+
+    const unifiedColumns = [
+      {
+        title: "#",
+        field: "_unifiedIndex",
+        width: 65,
+        headerSort: true,
+        frozen: true,
+        sorter: "number",
+      },
+      {
+        title: "📄 Source File",
+        field: "fileName",
+        width: 190,
+        minWidth: 140,
+        frozen: true,
+        headerSort: true,
+        formatter(cell) {
+          const val = cell.getValue() || "";
+          return `<span class="unified-file-badge" title="${escapeHtml(cell.getRow().getData().path || val)}">📄 ${escapeHtml(val)}</span>`;
+        },
+      },
+      {
+        title: "🕒 Timestamp (UTC)",
+        field: "utcText",
+        width: 190,
+        minWidth: 150,
+        frozen: true,
+        headerSort: true,
+        sorter(a, b, aRow, bRow) {
+          const ea = aRow.getData().epochMs || 0;
+          const eb = bRow.getData().epochMs || 0;
+          return ea - eb;
+        },
+      },
+      {
+        title: "👤 User / Identity",
+        field: "user",
+        width: 180,
+        minWidth: 130,
+        headerSort: true,
+        formatter(cell) {
+          const val = cell.getValue();
+          return val && val !== "—" ? `<span style="font-weight:600;">${escapeHtml(val)}</span>` : `<span style="color:var(--text-muted);">—</span>`;
+        },
+      },
+      {
+        title: "💻 Host / IP",
+        field: "host",
+        width: 160,
+        minWidth: 120,
+        headerSort: true,
+        formatter(cell) {
+          const val = cell.getValue();
+          return val && val !== "—" ? `<code>${escapeHtml(val)}</code>` : `<span style="color:var(--text-muted);">—</span>`;
+        },
+      },
+      {
+        title: "⚡ Operation / Action",
+        field: "action",
+        minWidth: 260,
+        headerSort: true,
+        formatter(cell) {
+          const val = cell.getValue();
+          return `<span>${escapeHtml(val || "—")}</span>`;
+        },
+      },
+      {
+        title: "🛡️ MITRE / Tags",
+        field: "mitreTags",
+        minWidth: 170,
+        headerSort: false,
+        formatter(cell) {
+          const tags = cell.getValue();
+          if (!Array.isArray(tags) || tags.length === 0) return "";
+          return tags
+            .map((t) => `<span class="cross-ioc-meta-tag" style="background:rgba(239,68,68,0.15);color:#ef4444;border-color:rgba(239,68,68,0.3);margin-right:4px;">${escapeHtml(t)}</span>`)
+            .join("");
+        },
+      },
+      {
+        title: "Action",
+        width: 110,
+        hozAlign: "center",
+        headerSort: false,
+        formatter() {
+          return `<button type="button" class="btn-unified-jump" title="Switch to this file and view row">🔍 Jump to File</button>`;
+        },
+        cellClick(e, cell) {
+          const row = cell.getRow().getData();
+          jumpToNativeFileRow(row.path, row.row_num);
+        },
+      },
+    ];
+
+    if (table) {
+      table.setColumns(unifiedColumns);
+      table.replaceData(tableData);
+    } else {
+      table = new Tabulator("#grid", {
+        data: tableData,
+        columns: unifiedColumns,
+        layout: "fitDataFill",
+        height: "100%",
+        placeholder: "No matching rows",
+      });
+    }
+
+    if (firstPageBtn) firstPageBtn.disabled = true;
+    if (prevPageBtn) prevPageBtn.disabled = true;
+    if (nextPageBtn) nextPageBtn.disabled = true;
+    if (pageSizeSelect) pageSizeSelect.disabled = true;
+
+    if (rowCountLabel) {
+      rowCountLabel.textContent = `${events.length.toLocaleString()} correlated events (Unified View across ${fileCount} files)`;
+    }
+    if (pageLabel) {
+      pageLabel.textContent = "All rows displayed";
+    }
+
+    if (gridActiveFilterBar && gridActiveFilterLabel) {
+      gridActiveFilterLabel.textContent = `🌐 Unified View: ${label} (${events.length.toLocaleString()} events across ${fileCount} files)`;
+      gridActiveFilterBar.classList.remove("hidden");
+    }
+    if (guidedResetBtn) {
+      guidedResetBtn.classList.remove("hidden");
+      guidedResetBtn.textContent = "✕ Exit Unified View";
+    }
+    if (aiSearchAvailability) {
+      aiSearchAvailability.textContent = `Unified timeline: ${events.length.toLocaleString()} events across ${fileCount} files.`;
+      aiSearchAvailability.classList.add("ready");
+    }
+  }
+
+  async function exitUnifiedCorrelatedGrid() {
+    if (!isUnifiedCorrelatedMode) return;
+    isUnifiedCorrelatedMode = false;
+    unifiedCorrelatedRows = [];
+    unifiedCorrelatedLabel = "";
+    gridFilterDescription = null;
+
+    if (pageSizeSelect) pageSizeSelect.disabled = !controlsEnabled;
+    resetPagination();
+
+    if (table && columns.length > 0) {
+      await table.setColumns(buildTabulatorColumns());
+      await refreshData();
+      refreshCount();
+    }
+    updateGridActiveFilterBar();
+  }
+
+  async function jumpToNativeFileRow(targetPath, rowNum) {
+    isUnifiedCorrelatedMode = false;
+    unifiedCorrelatedRows = [];
+    unifiedCorrelatedLabel = "";
+
+    const targetIdx = loadedFiles.findIndex(
+      (f) => f.path === targetPath || f.name === targetPath || (targetPath && targetPath.endsWith(f.name))
+    );
+
+    if (targetIdx !== -1 && targetIdx !== activeFileIndex) {
+      await switchLoadedFile(targetIdx);
+    } else if (table && columns.length > 0) {
+      await table.setColumns(buildTabulatorColumns());
+      await refreshData();
+      refreshCount();
+    }
+
+    if (rowNum) {
+      filterGridByIntel("rows", [rowNum], `Row ${rowNum} (Jumped from Unified View)`);
+    }
+  }
+
+  async function exportUnifiedCorrelatedData(format) {
+    if (!unifiedCorrelatedRows || unifiedCorrelatedRows.length === 0) {
+      alert("No unified correlated events to export.");
+      return;
+    }
+    const ext = format === "csv" ? "csv" : "xlsx";
+    const destPath = await invoke("plugin:dialog|save", {
+      options: {
+        filters: [{ name: format.toUpperCase(), extensions: [ext] }],
+        defaultPath: `correlated-timeline-unified.${ext}`,
+      },
+    });
+    if (!destPath) return;
+
+    showProgress(`Exporting unified events to ${ext.toUpperCase()}…`, 0.5);
+    try {
+      const headers = [
+        "Index",
+        "Source File",
+        "File Path",
+        "Source Row",
+        "Timestamp (UTC)",
+        "Epoch (ms)",
+        "User / Identity",
+        "Host / IP",
+        "Operation / Action",
+        "MITRE / Threat Tags",
+      ];
+      const escapeCsvField = (f) => {
+        const str = String(f ?? "");
+        if (str.includes('"') || str.includes(',') || str.includes('\n') || str.includes('\r')) {
+          return `"${str.replace(/"/g, '""')}"`;
+        }
+        return str;
+      };
+
+      const lines = [headers.join(",")];
+      unifiedCorrelatedRows.forEach((ev, i) => {
+        const rowVals = [
+          i + 1,
+          ev.fileName || "",
+          ev.path || "",
+          ev.rowNum || "",
+          ev.utcText || "",
+          ev.epochMs ?? "",
+          ev.user || "",
+          ev.host || "",
+          ev.action || "",
+          Array.isArray(ev.mitreTags) ? ev.mitreTags.join("; ") : "",
+        ];
+        lines.push(rowVals.map(escapeCsvField).join(","));
+      });
+      const csvContent = lines.join("\r\n");
+
+      await invoke("export_text_file", {
+        destPath,
+        content: csvContent,
+      });
+      hideProgress();
+      alert(`Unified export complete!\n\nSuccessfully exported ${unifiedCorrelatedRows.length} events to:\n${destPath}`);
+    } catch (err) {
+      hideProgress();
+      console.error("exportUnifiedCorrelatedData failed", err);
+      alert(`Unified export failed: ${err}`);
+    }
   }
 
   function renderScanSummary(summary) {
@@ -2518,6 +2792,10 @@
   }
 
   function clearAllTableFilters() {
+    if (isUnifiedCorrelatedMode) {
+      exitUnifiedCorrelatedGrid();
+      return;
+    }
     gridFilterDescription = null;
     searchBox.value = "";
     filterList.innerHTML = "";
@@ -2555,6 +2833,25 @@
     cancelSearchDebounce();
     if (sheetLoadInFlight || tableTransitionInFlight()) return null;
 
+    if (isUnifiedCorrelatedMode && table) {
+      const term = (searchBox.value || "").trim().toLowerCase();
+      if (!term) {
+        table.clearFilter();
+      } else {
+        table.setFilter((data) => {
+          return (
+            (data.fileName && data.fileName.toLowerCase().includes(term)) ||
+            (data.utcText && data.utcText.toLowerCase().includes(term)) ||
+            (data.user && data.user.toLowerCase().includes(term)) ||
+            (data.host && data.host.toLowerCase().includes(term)) ||
+            (data.action && data.action.toLowerCase().includes(term)) ||
+            (Array.isArray(data.mitreTags) && data.mitreTags.some((t) => t.toLowerCase().includes(term)))
+          );
+        });
+      }
+      return null;
+    }
+
     const hasActiveAiFilter =
       (queryMode === "querySpec" || queryMode === "guided") &&
       activeEvidenceQuery?.querySpec;
@@ -2576,27 +2873,24 @@
       spec.cursor = null;
       spec.limit = pageSize;
     } else {
-      discardGuidedPlanForTableAction();
       queryMode = "normal";
+      gridFilterDescription = null;
       activeEvidenceQuery = null;
+      spec.expression = null;
       setAiMatchColumnVisible(false);
       guidedResetBtn.classList.add("hidden");
       spec.search = searchBox.value.trim() || null;
       spec.filters = currentFilterValues();
-      spec.expression = null;
-      gridFilterDescription = null;
+      spec.sort = sortColumn.value ? { column: sortColumn.value, direction: sortDirection.value } : null;
+      spec.cursor = null;
+      spec.limit = pageSize;
     }
 
-    spec.sort = sortColumn.value
-      ? { column: sortColumn.value, direction: sortDirection.value }
-      : (preservingAiFilter ? activeEvidenceQuery?.querySpec?.sort || null : null);
-
     resetPagination();
-    const page = refreshData();
+    refreshData();
     refreshCount();
     updateGridActiveFilterBar();
     updateTableSortVisuals();
-    return page;
   }
 
   let searchDebounceHandle = null;
@@ -2609,6 +2903,26 @@
     cancelSearchDebounce();
     pendingSemanticSearch = null;
     if (sheetLoadInFlight || tableTransitionInFlight()) return;
+
+    if (isUnifiedCorrelatedMode && table) {
+      const term = (searchBox.value || "").trim().toLowerCase();
+      if (!term) {
+        table.clearFilter();
+      } else {
+        table.setFilter((data) => {
+          return (
+            (data.fileName && data.fileName.toLowerCase().includes(term)) ||
+            (data.utcText && data.utcText.toLowerCase().includes(term)) ||
+            (data.user && data.user.toLowerCase().includes(term)) ||
+            (data.host && data.host.toLowerCase().includes(term)) ||
+            (data.action && data.action.toLowerCase().includes(term)) ||
+            (Array.isArray(data.mitreTags) && data.mitreTags.some((t) => t.toLowerCase().includes(term)))
+          );
+        });
+      }
+      return;
+    }
+
     const request = {
       contextRevision: guidedContextRevision,
       path: currentPath,
@@ -4018,6 +4332,10 @@
   }
 
   function onImportComplete(summary, importedPath, importedSheet) {
+    isUnifiedCorrelatedMode = false;
+    unifiedCorrelatedRows = [];
+    unifiedCorrelatedLabel = "";
+
     currentPath = importedPath;
     currentSheet = importedSheet;
     columns = summary.columns;
@@ -4169,6 +4487,9 @@
       table.destroy();
       table = null;
     }
+    isUnifiedCorrelatedMode = false;
+    unifiedCorrelatedRows = [];
+    unifiedCorrelatedLabel = "";
     columns = [];
     lockedColumnFields = new Set();
     currentPath = null;
@@ -4198,6 +4519,9 @@
   // -- export flow --------------------------------------------------------------
 
   async function doExport(format) {
+    if (isUnifiedCorrelatedMode) {
+      return exportUnifiedCorrelatedData(format);
+    }
     if (sheetLoadInFlight || !controlsEnabled || tableTransitionInFlight()) return;
     if (
       format === "csv" &&
@@ -4593,21 +4917,64 @@
       card.innerHTML = `
         <div class="cross-ioc-left">
           <span class="${typeClass}">${escapeHtml(typeLabel)}</span>
-          <span class="cross-ioc-val clickable" title="Click to filter currently loaded table for this value">${escapeHtml(item.value)}</span>
+          <span class="cross-ioc-val clickable" title="Click to view all correlated events in Unified Evidence Grid">${escapeHtml(item.value)}</span>
           ${metaTagsHtml}
           ${item.fileCount >= 2 ? `<span class="correlation-count-badge">Found in ${item.fileCount} files (${item.totalCount} total hits)</span>` : ""}
+          ${item.fileCount >= 2 ? `<button type="button" class="cross-ioc-unified-btn" title="View all ${item.totalCount} hits across ${item.fileCount} files in Unified Grid">🌐 View All ${item.totalCount} in Grid</button>` : ""}
         </div>
         <div class="cross-ioc-files-breakdown">
           ${fileChipsHtml}
         </div>
       `;
 
+      const openUnified = async () => {
+        showProgress(`Loading unified cross-file events for ${item.value}...`, 0.5);
+        try {
+          const filesPayload = loadedFiles.map((f) => ({
+            path: f.path,
+            sheet: f.sheet || null,
+            cacheDbPath: f.summary?.cacheDbPath || null,
+          }));
+          const evts = await invoke("get_unified_ioc_events", {
+            files: filesPayload,
+            iocValue: item.value,
+          });
+          hideProgress();
+          if (evts && evts.length > 0) {
+            renderUnifiedCorrelatedGrid(evts, `${typeLabel}: ${item.value}`);
+          } else {
+            alert(`No matching events found across files for ${item.value}`);
+          }
+        } catch (err) {
+          hideProgress();
+          console.error("Failed to load unified IOC events", err);
+          alert(`Error loading unified events: ${err}`);
+        }
+      };
+
+      const unifiedBtn = card.querySelector(".cross-ioc-unified-btn");
+      if (unifiedBtn) {
+        unifiedBtn.addEventListener("click", openUnified);
+      }
+
       const valEl = card.querySelector(".cross-ioc-val");
       if (valEl) {
-        valEl.addEventListener("click", () => {
-          searchBox.value = item.value;
-          switchTab("tab-grid");
-          applyControlsAndReload();
+        valEl.addEventListener("click", async () => {
+          if (item.fileCount >= 2) {
+            await openUnified();
+          } else {
+            const firstOcc = item.occurrences[0];
+            const targetIdx = firstOcc ? loadedFiles.findIndex((f) => f.path === firstOcc.path) : -1;
+            if (isUnifiedCorrelatedMode) {
+              await exitUnifiedCorrelatedGrid();
+            }
+            if (targetIdx >= 0 && targetIdx !== activeFileIndex) {
+              await switchLoadedFile(targetIdx);
+            }
+            switchTab("tab-grid");
+            searchBox.value = item.value;
+            applyControlsAndReload();
+          }
         });
       }
 
@@ -4615,7 +4982,10 @@
         chip.addEventListener("click", async () => {
           const idx = parseInt(chip.dataset.fileIdx, 10);
           const val = chip.dataset.val;
-          if (idx >= 0) {
+          if (isUnifiedCorrelatedMode) {
+            await exitUnifiedCorrelatedGrid();
+          }
+          if (idx >= 0 && idx !== activeFileIndex) {
             await switchLoadedFile(idx);
           }
           switchTab("tab-grid");
@@ -4775,42 +5145,83 @@
     let totalRowsCount = 0;
     fileRowMap.forEach((set) => { totalRowsCount += set.size; });
 
-    if (totalRowsCount > 1) {
+    const correlatedEvents = answer.correlatedEvents || [];
+    const hasCorrelatedEvents = correlatedEvents.length > 0;
+    const isMultiFile = fileRowMap.size > 1 || (hasCorrelatedEvents && new Set(correlatedEvents.map((e) => e.fileName)).size > 1);
+
+    if (totalRowsCount > 1 || hasCorrelatedEvents) {
       const wholePicBar = document.createElement("div");
       wholePicBar.className = "analyst-whole-picture-bar";
 
-      const barLabel = document.createElement("span");
-      barLabel.className = "analyst-whole-picture-label";
-      barLabel.innerHTML = `<span>🌐 Whole-Picture Filter:</span>`;
-      wholePicBar.appendChild(barLabel);
+      if (hasCorrelatedEvents || isMultiFile) {
+        const unifiedBtn = document.createElement("button");
+        unifiedBtn.type = "button";
+        unifiedBtn.className = "btn btn-unified-primary";
+        const displayCount = hasCorrelatedEvents ? correlatedEvents.length : totalRowsCount;
+        unifiedBtn.innerHTML = `🌐 View All ${displayCount.toLocaleString()} Correlated Events in Unified Grid`;
+        unifiedBtn.title = `View all ${displayCount.toLocaleString()} events across all loaded files in one unified chronological table`;
 
-      fileRowMap.forEach((set, fname) => {
-        const rowNums = Array.from(set).sort((a, b) => a - b);
-        if (rowNums.length === 0) return;
-
-        const filterBtn = document.createElement("button");
-        filterBtn.type = "button";
-        filterBtn.className = "btn btn-filter-whole-picture";
-        const fileBadge = (fileRowMap.size > 1 || (loadedFiles && loadedFiles.length > 1))
-          ? ` [${fname}]`
-          : "";
-        filterBtn.innerHTML = `🔍 Filter Evidence Grid to ALL ${rowNums.length.toLocaleString()} Correlated Events${fileBadge}`;
-        filterBtn.title = `Filter Evidence grid to all ${rowNums.length.toLocaleString()} correlated rows in ${fname}`;
-
-        filterBtn.addEventListener("click", async () => {
-          if (loadedFiles && loadedFiles.length > 1) {
-            const targetIdx = loadedFiles.findIndex(
-              (f) => f.name === fname || f.path.endsWith(fname)
-            );
-            if (targetIdx !== -1 && loadedFiles[targetIdx].path !== currentPath) {
-              await switchLoadedFile(targetIdx);
+        unifiedBtn.addEventListener("click", async () => {
+          if (hasCorrelatedEvents) {
+            renderUnifiedCorrelatedGrid(correlatedEvents, answer.headline || "Cross-File Correlated Timeline");
+          } else {
+            const filesPayload = loadedFiles.map((f) => ({
+              path: f.path,
+              sheet: f.sheet || null,
+              cacheDbPath: f.summary?.cacheDbPath || null,
+            }));
+            const q = guidedSearchBox.value.trim();
+            showProgress("Loading unified cross-file events...", 0.5);
+            try {
+              const evts = await invoke("get_unified_ioc_events", {
+                files: filesPayload,
+                iocValue: q,
+              });
+              hideProgress();
+              if (evts && evts.length > 0) {
+                renderUnifiedCorrelatedGrid(evts, `Correlation: ${q}`);
+              } else {
+                alert("No correlated timeline rows found across files.");
+              }
+            } catch (err) {
+              hideProgress();
+              console.error("Failed to load unified events", err);
             }
           }
-          filterGridByIntel("rows", rowNums, `Correlated Events (${rowNums.length} rows)${fileBadge}`);
         });
+        wholePicBar.appendChild(unifiedBtn);
 
+        // Clean breakdown text instead of dozens of buttons
+        const breakdown = document.createElement("span");
+        breakdown.className = "analyst-breakdown-text";
+        const parts = [];
+        if (hasCorrelatedEvents) {
+          const fileCountMap = new Map();
+          correlatedEvents.forEach((e) => {
+            fileCountMap.set(e.fileName, (fileCountMap.get(e.fileName) || 0) + 1);
+          });
+          fileCountMap.forEach((cnt, fn) => parts.push(`${escapeHtml(fn)} (${cnt})`));
+        } else {
+          fileRowMap.forEach((set, fn) => parts.push(`${escapeHtml(fn)} (${set.size})`));
+        }
+        breakdown.innerHTML = `Across ${parts.length} files: <strong>${parts.join(" &bull; ")}</strong>`;
+        wholePicBar.appendChild(breakdown);
+      } else {
+        const onlySet = fileRowMap.values().next().value || unscopedRows;
+        const rowNums = Array.from(onlySet).sort((a, b) => a - b);
+        const filterBtn = document.createElement("button");
+        filterBtn.type = "button";
+        filterBtn.className = "btn btn-unified-primary";
+        filterBtn.innerHTML = `🔍 View All ${rowNums.length.toLocaleString()} Events in Evidence Grid`;
+        filterBtn.title = `Filter Evidence Grid to all ${rowNums.length.toLocaleString()} matching rows`;
+        filterBtn.addEventListener("click", () => {
+          if (isUnifiedCorrelatedMode) {
+            exitUnifiedCorrelatedGrid();
+          }
+          filterGridByIntel("rows", rowNums, `Evidence (${rowNums.length} rows)`);
+        });
         wholePicBar.appendChild(filterBtn);
-      });
+      }
 
       analystSections.appendChild(wholePicBar);
     }
@@ -4825,7 +5236,6 @@
         paragraph.className = "analyst-line";
         paragraph.appendChild(document.createTextNode(line.text + " "));
 
-        // Extract MITRE technique ID if present (e.g. T1048 or T1114.003)
         const techMatch = line.text.match(/\b(T\d{4}(?:\.\d{3})?)\b/);
         const hasRows = Array.isArray(line.rows) && line.rows.length > 0;
         const isTimelineSection = section.heading.toLowerCase().includes("timeline");
@@ -4850,15 +5260,13 @@
             filterGridByIntel("technique", techId, `${techId} ${techName}`);
           });
           actionsContainer.appendChild(filterBtn);
-        } else if (hasRows && line.rows.length > 1) {
+        } else if (hasRows && line.rows.length > 1 && !isTimelineSection) {
           const filterBtn = document.createElement("button");
           filterBtn.type = "button";
           filterBtn.className = "btn btn-small btn-analyst-filter";
           filterBtn.innerHTML = `🔍 View in Table (${line.rows.length} rows)`;
           filterBtn.title = `Filter Evidence grid to these ${line.rows.length} affected rows`;
-          const filterLabel = isTimelineSection
-            ? `Timeline (${line.rows.length} events)`
-            : `AI Finding (${line.rows.length} rows)`;
+          const filterLabel = `AI Finding (${line.rows.length} rows)`;
           const fileMatch = line.text.match(/\[([^\]]+\.[a-zA-Z0-9]+)\]/);
           const targetFileName = fileMatch ? fileMatch[1] : null;
           filterBtn.addEventListener("click", async () => {
@@ -4894,34 +5302,49 @@
           paragraph.appendChild(actionsContainer);
         }
 
-        // Only render individual row chip when there is exactly 1 row.
-        // When there are multiple rows (e.g. 252 rows), the View in Table button above
-        // handles it cleanly, preventing walls of hundreds of individual row chips.
         if (line.rows && line.rows.length === 1) {
           const rowNum = line.rows[0];
-          const chip = document.createElement("button");
-          chip.type = "button";
-          chip.className = "analyst-row-chip";
-          chip.textContent = `row ${rowNum}`;
-          chip.title = `Filter Evidence grid to row #${rowNum} and highlight it`;
-
-          // Check if line text references a specific file from multi-file timeline, e.g. [audit.csv]
           const fileMatch = line.text.match(/\[([^\]]+\.[a-zA-Z0-9]+)\]/);
           const targetFileName = fileMatch ? fileMatch[1] : null;
 
-          chip.addEventListener("click", async () => {
-            if (targetFileName && loadedFiles && loadedFiles.length > 1) {
-              const targetIdx = loadedFiles.findIndex(
-                (f) => f.name === targetFileName || f.path.endsWith(targetFileName)
-              );
-              if (targetIdx !== -1 && loadedFiles[targetIdx].path !== currentPath) {
-                await switchLoadedFile(targetIdx);
+          if (isTimelineSection) {
+            const rowLink = document.createElement("span");
+            rowLink.className = "timeline-row-link";
+            rowLink.textContent = `#${rowNum}`;
+            rowLink.title = `Click to view row #${rowNum} in native file`;
+            rowLink.addEventListener("click", async () => {
+              if (targetFileName && loadedFiles && loadedFiles.length > 1) {
+                const targetIdx = loadedFiles.findIndex(
+                  (f) => f.name === targetFileName || f.path.endsWith(targetFileName)
+                );
+                if (targetIdx !== -1 && loadedFiles[targetIdx].path !== currentPath) {
+                  await switchLoadedFile(targetIdx);
+                }
               }
-            }
-            await filterGridByIntel("rows", [rowNum], `Row #${rowNum}`);
-            scrollGridToRow(rowNum);
-          });
-          paragraph.appendChild(chip);
+              await filterGridByIntel("rows", [rowNum], `Row #${rowNum}`);
+              scrollGridToRow(rowNum);
+            });
+            paragraph.appendChild(rowLink);
+          } else {
+            const chip = document.createElement("button");
+            chip.type = "button";
+            chip.className = "analyst-row-chip";
+            chip.textContent = `row ${rowNum}`;
+            chip.title = `Filter Evidence grid to row #${rowNum} and highlight it`;
+            chip.addEventListener("click", async () => {
+              if (targetFileName && loadedFiles && loadedFiles.length > 1) {
+                const targetIdx = loadedFiles.findIndex(
+                  (f) => f.name === targetFileName || f.path.endsWith(targetFileName)
+                );
+                if (targetIdx !== -1 && loadedFiles[targetIdx].path !== currentPath) {
+                  await switchLoadedFile(targetIdx);
+                }
+              }
+              await filterGridByIntel("rows", [rowNum], `Row #${rowNum}`);
+              scrollGridToRow(rowNum);
+            });
+            paragraph.appendChild(chip);
+          }
         }
         analystSections.appendChild(paragraph);
       });
@@ -5915,6 +6338,18 @@
     },
     getCrossSearchResultsForTest() {
       return crossSearchResultsData;
+    },
+    renderUnifiedCorrelatedGridForTest(events, label) {
+      return renderUnifiedCorrelatedGrid(events, label);
+    },
+    exitUnifiedCorrelatedGridForTest() {
+      return exitUnifiedCorrelatedGrid();
+    },
+    isUnifiedCorrelatedModeForTest() {
+      return isUnifiedCorrelatedMode;
+    },
+    getUnifiedCorrelatedRowsForTest() {
+      return unifiedCorrelatedRows;
     },
   });
 })();

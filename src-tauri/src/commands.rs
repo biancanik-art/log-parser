@@ -2482,6 +2482,18 @@ pub async fn export_text_file(dest_path: String, content: String) -> Result<(), 
     .map_err(|e| format!("export text file task join error: {e}"))?
 }
 
+#[tauri::command]
+pub async fn get_unified_ioc_events(
+    files: Vec<FileTarget>,
+    ioc_value: String,
+) -> Result<Vec<analyst::CorrelatedTimelineEvent>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        Ok(analyst::extract_unified_events_for_ioc(&files, &ioc_value))
+    })
+    .await
+    .map_err(|e| format!("get_unified_ioc_events join error: {e}"))?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

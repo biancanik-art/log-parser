@@ -26,3 +26,7 @@ __pycache__/
 # Debug temporary logs
 src-tauri/debug_*.txt
 
+# Local desktop shortcuts & runner scripts
+*.lnk
+run.bat
+

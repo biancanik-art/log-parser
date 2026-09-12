@@ -1444,3 +1444,55 @@ test("active filter bar appears on filter and clearAllTableFilters resets all qu
   assert.equal(app.document.getElementById("search-box").value, "");
 });
 
+test("unified correlated grid displays events across multiple files and exits cleanly", async () => {
+  const app = bootApp();
+  await loadFixture(app);
+
+  const filterBar = app.document.getElementById("grid-active-filter-bar");
+  const filterLabel = app.document.getElementById("grid-active-filter-label");
+  const rowCount = app.document.getElementById("row-count-label");
+
+  assert.equal(app.debug.isUnifiedCorrelatedModeForTest(), false);
+
+  const mockEvents = [
+    {
+      fileName: "activity_log_a.xlsx",
+      path: "/data/activity_log_a.xlsx",
+      rowNum: 10,
+      epochMs: 1773055300000,
+      utcText: "2026-03-09 11:21:40 UTC",
+      user: "user_a@domain.local",
+      host: "10.0.0.5",
+      action: "UserLoggedIn",
+      mitreTags: ["T1078 Valid Accounts"],
+    },
+    {
+      fileName: "activity_log_b.csv",
+      path: "/data/activity_log_b.csv",
+      rowNum: 25,
+      epochMs: 1773055400000,
+      utcText: "2026-03-09 11:23:20 UTC",
+      user: "user_a@domain.local",
+      host: "192.168.1.100",
+      action: "New-InboxRule",
+      mitreTags: ["T1114.003 Email Forwarding Rule"],
+    },
+  ];
+
+  app.debug.renderUnifiedCorrelatedGridForTest(mockEvents, "Correlation: SESSION-123");
+  await settleFrontend();
+
+  assert.equal(app.debug.isUnifiedCorrelatedModeForTest(), true);
+  assert.equal(app.debug.getUnifiedCorrelatedRowsForTest().length, 2);
+  assert.equal(filterBar.classList.contains("hidden"), false);
+  assert.ok(filterLabel.textContent.includes("SESSION-123"));
+  assert.ok(rowCount.textContent.includes("2 correlated events (Unified View across 2 files)"));
+
+  // Exiting unified mode restores normal state
+  await app.debug.exitUnifiedCorrelatedGridForTest();
+  await settleFrontend();
+
+  assert.equal(app.debug.isUnifiedCorrelatedModeForTest(), false);
+  assert.equal(app.debug.getUnifiedCorrelatedRowsForTest().length, 0);
+});
+
