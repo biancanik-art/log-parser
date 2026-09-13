@@ -2491,7 +2491,7 @@ fn sql_string_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
-fn unique_sheet_name(raw: &str, used_lowercase: &mut HashSet<String>) -> String {
+pub(crate) fn unique_sheet_name(raw: &str, used_lowercase: &mut HashSet<String>) -> String {
     let base = sanitize_sheet_name(raw);
     for idx in 1.. {
         let candidate = if idx == 1 {
@@ -2508,7 +2508,7 @@ fn unique_sheet_name(raw: &str, used_lowercase: &mut HashSet<String>) -> String 
     unreachable!("unbounded sheet-name collision loop should always return");
 }
 
-fn sanitize_sheet_name(raw: &str) -> String {
+pub(crate) fn sanitize_sheet_name(raw: &str) -> String {
     let mut out = String::new();
     for ch in raw.chars() {
         if matches!(ch, ':' | '\\' | '/' | '?' | '*' | '[' | ']') {
@@ -2539,7 +2539,7 @@ fn write_cell_string(worksheet: &mut Worksheet, row: u32, col: u16, value: &str)
     Ok(())
 }
 
-fn excel_safe_string(value: &str) -> Cow<'_, str> {
+pub(crate) fn excel_safe_string(value: &str) -> Cow<'_, str> {
     if value.len() <= EXCEL_STRING_LIMIT {
         return Cow::Borrowed(value);
     }

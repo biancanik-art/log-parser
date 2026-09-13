@@ -1320,7 +1320,43 @@
     });
     if (!destPath) return;
 
-    showProgress(`Exporting unified events to ${ext.toUpperCase()}…`, 0.5);
+    let rowsToExport = unifiedCorrelatedRows;
+    if (table && typeof table.getData === "function") {
+      try {
+        const activeRows = table.getData("active");
+        if (activeRows && activeRows.length > 0) {
+          rowsToExport = activeRows;
+        }
+      } catch (_) {}
+    }
+
+    if (format === "xlsx") {
+      showProgress("Generating multi-sheet forensic Excel workbook…", 0.3);
+      try {
+        const fileTargets = (loadedFiles || []).map((f) => ({
+          path: f.path,
+          sheet: f.sheet || null,
+          cacheDbPath: f.cacheDbPath || null,
+        }));
+        const summary = await invoke("export_unified_multisheet_xlsx", {
+          files: fileTargets,
+          events: rowsToExport,
+          destPath,
+        });
+        hideProgress();
+        const sheetsList = (summary.sheetsWritten || []).join(", ");
+        alert(
+          `Unified multi-sheet export complete!\n\nSuccessfully exported ${summary.totalEvents} event(s) across ${summary.sheetsWritten.length} sheet(s):\n[${sheetsList}]\n\nPreserved full raw columns for each file.\nDestination:\n${destPath}`
+        );
+      } catch (err) {
+        hideProgress();
+        console.error("export_unified_multisheet_xlsx failed", err);
+        alert(`Unified multi-sheet Excel export failed: ${err}`);
+      }
+      return;
+    }
+
+    showProgress(`Exporting unified timeline to CSV…`, 0.5);
     try {
       const headers = [
         "Index",
@@ -1343,7 +1379,7 @@
       };
 
       const lines = [headers.join(",")];
-      unifiedCorrelatedRows.forEach((ev, i) => {
+      rowsToExport.forEach((ev, i) => {
         const rowVals = [
           i + 1,
           ev.fileName || "",
@@ -1365,7 +1401,7 @@
         content: csvContent,
       });
       hideProgress();
-      alert(`Unified export complete!\n\nSuccessfully exported ${unifiedCorrelatedRows.length} events to:\n${destPath}`);
+      alert(`Unified export complete!\n\nSuccessfully exported ${rowsToExport.length} events to:\n${destPath}`);
     } catch (err) {
       hideProgress();
       console.error("exportUnifiedCorrelatedData failed", err);
@@ -6350,6 +6386,9 @@
     },
     getUnifiedCorrelatedRowsForTest() {
       return unifiedCorrelatedRows;
+    },
+    exportUnifiedCorrelatedDataForTest(format) {
+      return exportUnifiedCorrelatedData(format);
     },
   });
 })();

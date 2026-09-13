@@ -436,6 +436,13 @@ function bootApp({ commandHandlers = {} } = {}) {
     accept_guided_query: async () => null,
     run_guided_query: async () => page([EVIDENCE_ROW]),
     set_guided_parse_decision: async () => null,
+    "plugin:dialog|save": async () => "C:\\exports\\unified_multisheet.xlsx",
+    export_unified_multisheet_xlsx: async () => ({
+      sheetsWritten: ["Unified Timeline", "activity_log_a", "activity_log_b"],
+      totalEvents: 2,
+      destPath: "C:\\exports\\unified_multisheet.xlsx",
+    }),
+    export_text_file: async () => true,
   };
 
   const invoke = async (command, args = {}) => {
@@ -1494,5 +1501,46 @@ test("unified correlated grid displays events across multiple files and exits cl
 
   assert.equal(app.debug.isUnifiedCorrelatedModeForTest(), false);
   assert.equal(app.debug.getUnifiedCorrelatedRowsForTest().length, 0);
+});
+
+test("unified correlated grid export calls export_unified_multisheet_xlsx for xlsx", async () => {
+  const app = bootApp();
+  await loadFixture(app);
+
+  const mockEvents = [
+    {
+      fileName: "activity_log_a.xlsx",
+      path: "/data/activity_log_a.xlsx",
+      rowNum: 10,
+      epochMs: 1773055300000,
+      utcText: "2026-03-09 11:21:40 UTC",
+      user: "user_a@domain.local",
+      host: "10.0.0.5",
+      action: "UserLoggedIn",
+      mitreTags: ["T1078 Valid Accounts"],
+    },
+    {
+      fileName: "activity_log_b.csv",
+      path: "/data/activity_log_b.csv",
+      rowNum: 25,
+      epochMs: 1773055400000,
+      utcText: "2026-03-09 11:23:20 UTC",
+      user: "user_a@domain.local",
+      host: "192.168.1.100",
+      action: "New-InboxRule",
+      mitreTags: ["T1114.003 Email Forwarding Rule"],
+    },
+  ];
+
+  app.debug.renderUnifiedCorrelatedGridForTest(mockEvents, "Correlation: TEST-SESSION");
+  await settleFrontend();
+
+  await app.debug.exportUnifiedCorrelatedDataForTest("xlsx");
+  await settleFrontend();
+
+  const exportCall = app.calls.find((c) => c.command === "export_unified_multisheet_xlsx");
+  assert.ok(exportCall, "export_unified_multisheet_xlsx must be invoked");
+  assert.equal(exportCall.args.events.length, 2);
+  assert.equal(exportCall.args.destPath, "C:\\exports\\unified_multisheet.xlsx");
 });
 

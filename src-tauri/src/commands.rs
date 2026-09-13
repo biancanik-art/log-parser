@@ -2494,6 +2494,21 @@ pub async fn get_unified_ioc_events(
     .map_err(|e| format!("get_unified_ioc_events join error: {e}"))?
 }
 
+#[tauri::command]
+pub async fn export_unified_multisheet_xlsx(
+    files: Vec<FileTarget>,
+    events: Vec<analyst::CorrelatedTimelineEvent>,
+    dest_path: String,
+) -> Result<export::UnifiedExportSummary, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let path = std::path::PathBuf::from(&dest_path);
+        export::export_unified_multisheet_xlsx(&files, &events, &path)
+            .map_err(|e| format!("export_unified_multisheet_xlsx error: {e}"))
+    })
+    .await
+    .map_err(|e| format!("export_unified_multisheet_xlsx join error: {e}"))?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

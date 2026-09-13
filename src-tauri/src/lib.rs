@@ -65,6 +65,7 @@ pub fn run() {
             commands::export_ioc_overlap_file,
             commands::export_text_file,
             commands::get_unified_ioc_events,
+            commands::export_unified_multisheet_xlsx,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
